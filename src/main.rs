@@ -57,20 +57,30 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+        Some(url) if url.starts_with("http://") || url.starts_with("https://") =>
+        {
             let url = url.to_string();
-            let filename = extract_auto_filename(&url);
-            let output = Some(cfg.resolve_output_path(&filename));
+            let (output, connections) = parse_download_args(&args[2..]);
+            let connections = connections.unwrap_or(cfg.connections);
 
-            tokio::runtime::Builder::new_multi_thread().enable_all().build()?
-                .block_on(async {
-                    let cancel = CancellationToken::new();
-                    let sh = signal::spawn_signal_handler(cancel.clone());
-                    let result = cli::run_download(url, output, cfg.connections, cancel).await;
-                    sh.abort();
-                    result
-                })
-        }
+            let output = {
+                let filename = match output {
+    Some(o) => o,
+    None => extract_auto_filename(&url),
+};
+                Some(cfg.resolve_output_path(&filename))
+            };
+
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+        .block_on(async {
+            let cancel = CancellationToken::new();
+            let sh = signal::spawn_signal_handler(cancel.clone());
+            let result = cli::run_download(url, output, connections, cancel).await;
+            sh.abort();
+            result
+        })
+}
+
 
         _ => {
             eprintln!("RDM — Rust Download Manager");
