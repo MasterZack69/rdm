@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::chunk::Chunk;
 use crate::inspect;
 use crate::parallel;
+use crate::resume::ResumeMetadata;
 use crate::retry::RetryConfig;
 
 pub async fn run_download(
@@ -14,10 +16,17 @@ pub async fn run_download(
     cancel: CancellationToken,
 ) -> Result<()> {
     let output_path = resolve_output_path(&url, output.as_deref());
+    let output_path = match resolve_existing_output(&output_path, &url).await? {
+        Some(p) => p,
+        None => {
+            eprintln!("  Download cancelled.");
+            return Ok(());
+        }
+    };
     let connections = connections.max(1);
 
     let client = reqwest::Client::builder()
-        .user_agent("rdm/0.1.0")
+        .user_agent("rdm/0.1.3")
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         .build()
@@ -72,6 +81,128 @@ pub async fn run_download(
             Err(e)
         }
     }
+}
+
+/// Check if output file already exists and prompt user for action.
+/// Returns:
+///   Ok(Some(path)) — proceed with this path
+///   Ok(None)       — user cancelled
+///   Err            — I/O failure
+
+pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<String>> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    // No conflict — file doesn't exist
+    if !std::path::Path::new(path).exists() {
+        return Ok(Some(path.to_string()));
+    }
+
+    // .part file exists → resume in progress, not a conflict
+    let part_path = format!("{}.part", path);
+    if std::path::Path::new(&part_path).exists() {
+        return Ok(Some(path.to_string()));
+    }
+
+    // Resume metadata exists → validate using resume module APIs
+    let meta_path = crate::resume::ResumeMetadata::meta_path(path);
+    if let Ok(meta) = crate::resume::load(&meta_path).await {
+        let chunks: Vec<crate::chunk::Chunk> = meta.chunks.iter().map(|c| {
+            crate::chunk::Chunk { id: c.id, start: c.start, end: c.end }
+        }).collect();
+        if crate::resume::validate_against(&meta, url, meta.file_size, &chunks) {
+            return Ok(Some(path.to_string()));
+        }
+    }
+
+    // Non-interactive stdin — cannot prompt
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "File already exists: {}\n  Use -o to specify a different output path.",
+            path
+        );
+    }
+
+    // Real conflict — interactive prompt
+    let parent = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new(""));
+
+    eprintln!("  ⚠ File already exists: {}", path);
+    eprintln!();
+    eprintln!("  1) Overwrite");
+    eprintln!("  2) Rename");
+    eprintln!("  3) Cancel");
+
+    loop {
+        eprint!("  Choice [1/2/3]: ");
+        std::io::stderr().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().lock().read_line(&mut input)?;
+
+        match input.trim() {
+            "1" => {
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(&part_path);
+                let _ = std::fs::remove_file(&meta_path);
+                return Ok(Some(path.to_string()));
+            }
+            "2" => {
+                loop {
+                    eprint!("  New filename: ");
+                    std::io::stderr().flush()?;
+                    let mut name = String::new();
+                    std::io::stdin().lock().read_line(&mut name)?;
+                    let trimmed = name.trim();
+                    if trimmed.is_empty() {
+                        eprintln!("  Filename cannot be empty.");
+                        continue;
+                    }
+                    let new_path = if parent.as_os_str().is_empty() {
+                        trimmed.to_string()
+                    } else {
+                        parent.join(trimmed).to_string_lossy().to_string()
+                    };
+                    return Ok(Some(new_path));
+                }
+            }
+            "3" => return Ok(None),
+            _ => eprintln!("  Invalid choice. Enter 1, 2, or 3."),
+        }
+    }
+}
+
+
+/// Prompt user for a new filename. Returns None if input was empty.
+fn prompt_rename(original_path: &str) -> Result<Option<String>> {
+    use std::path::Path;
+
+    eprint!("  Enter new filename: ");
+    io::stderr().flush().ok();
+
+    let mut input = String::new();
+    io::stdin().lock().read_line(&mut input)
+        .context("Failed to read input")?;
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    // If user gave just a filename (no directory), preserve original directory
+    let new_path = if Path::new(trimmed).parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true) {
+        match Path::new(original_path).parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => {
+                dir.join(trimmed).to_string_lossy().to_string()
+            }
+            _ => trimmed.to_string(),
+        }
+    } else {
+        trimmed.to_string()
+    };
+
+    eprintln!("  Output changed to: {}", new_path);
+    Ok(Some(new_path))
 }
 
 fn resolve_output_path(url: &str, output: Option<&str>) -> String {
