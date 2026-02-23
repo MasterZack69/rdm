@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+use tokio::io::BufWriter;
 
 use crate::retry::{is_transient_status, TransientError};
 
@@ -76,12 +77,14 @@ pub async fn download_range(
 
     validate_content_range(response.headers(), effective_start, end)?;
 
-    let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(file_path)
         .await
         .with_context(|| format!("Failed to open file: {}", file_path))?;
+
+    let mut file = BufWriter::with_capacity(256 * 1024, file);
 
     file.seek(SeekFrom::Start(effective_start))
         .await
@@ -108,6 +111,8 @@ pub async fn download_range(
                         let data_len = data.len() as u64;
 
                         if bytes_written + data_len > expected_len {
+                            file.flush().await.ok();
+                            chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
                             drop(stream);
                             anyhow::bail!(
                                 "Server sent excess data for range {}: expected {} bytes, got at least {}",
@@ -123,7 +128,7 @@ pub async fn download_range(
 
                         bytes_written += data_len;
 
-                        chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
+                        chunk_progress.store(resume_from + bytes_written, Ordering::Relaxed);
                         if let Some(ref gp) = global_progress {
                             gp.fetch_add(data_len, Ordering::Relaxed);
                         }
@@ -144,6 +149,7 @@ pub async fn download_range(
     }
 
     file.flush().await.context("Failed to flush file after range write")?;
+
 
     if bytes_written != expected_len {
         chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
