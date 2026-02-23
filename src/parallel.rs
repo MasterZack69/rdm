@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet}; // FIX 2: added JoinSet
 use tokio_util::sync::CancellationToken;
 
 use crate::chunk::Chunk;
@@ -72,15 +72,15 @@ where
     use std::sync::atomic::AtomicUsize;
 
     let meta = load_or_create_metadata(
-    meta_path,
-    url,
-    file_size,
-    chunks,
-).await?;
+        meta_path,
+        url,
+        file_size,
+        chunks,
+    ).await?;
 
-let chunks = chunks_from_metadata(&meta);
+    let chunks = chunks_from_metadata(&meta);
 
-ensure_file_allocated(temp_path, file_size).await?;
+    ensure_file_allocated(temp_path, file_size).await?;
 
     let shared_meta = Arc::new(Mutex::new(meta));
 
@@ -127,11 +127,12 @@ ensure_file_allocated(temp_path, file_size).await?;
     );
 
     let mut active_workers = chunks.len().max(1);
-    let mut handles: Vec<JoinHandle<Result<u64>>> = Vec::new();
-    let mut total_bytes: u64 = 0;
+    let mut join_set: JoinSet<Result<u64>> = JoinSet::new();
+    // FIX: Initialize from initial_completed so resumed bytes are included in total
+    let mut total_bytes: u64 = initial_completed;
 
-    while !queue.is_empty() || !handles.is_empty() {
-        while handles.len() < active_workers && !queue.is_empty() {
+    while !queue.is_empty() || !join_set.is_empty() {
+        while join_set.len() < active_workers && !queue.is_empty() {
             let chunk = queue.pop_front().unwrap();
 
             let client = client.clone();
@@ -149,7 +150,7 @@ ensure_file_allocated(temp_path, file_size).await?;
 
             let pressure = retry_pressure.clone();
 
-            handles.push(tokio::spawn(async move {
+            join_set.spawn(async move {
                 match download_chunk_with_retry(
                     &client,
                     &url,
@@ -170,10 +171,11 @@ ensure_file_allocated(temp_path, file_size).await?;
                         Err(e)
                     }
                 }
-            }));
+            });
         }
 
-        if retry_pressure.load(Ordering::Relaxed) >= chunks.len() * 2 && active_workers > 1 {
+        // FIX: Use active_workers instead of chunks.len() for pressure threshold
+        if retry_pressure.load(Ordering::Relaxed) >= active_workers * 2 && active_workers > 1 {
             let new = (active_workers / 2).max(1);
             eprintln!(
                 "  ⚠ Server overloaded — reducing parallel connections: {} → {}",
@@ -183,12 +185,11 @@ ensure_file_allocated(temp_path, file_size).await?;
             retry_pressure.store(0, Ordering::Relaxed);
         }
 
-        if let Some(handle) = handles.pop() {
-            match handle.await {
-                Ok(Ok(bytes)) => total_bytes += bytes,
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(anyhow::anyhow!("Worker panic: {}", e)),
-            }
+        match join_set.join_next().await {
+            Some(Ok(Ok(bytes))) => total_bytes += bytes,
+            Some(Ok(Err(e))) => return Err(e),
+            Some(Err(e)) => return Err(anyhow::anyhow!("Worker panic: {}", e)),
+            None => break,
         }
     }
 
@@ -216,20 +217,17 @@ async fn load_or_create_metadata(
     chunks: &[Chunk],
 ) -> Result<ResumeMetadata> {
 
-    // Try to load existing resume metadata
     if let Ok(existing) = resume::load(meta_path).await {
 
-        // Validate only URL + size, NOT chunk layout
-        if existing.url == url && existing.file_size == file_size {
+        if resume::validate_against(&existing, url, file_size, chunks) {
             eprintln!("  [Resume] Using existing chunk layout ({} chunks)", existing.chunks.len());
             return Ok(existing);
         }
 
-        // Otherwise incompatible → delete
+        // Incompatible → delete and start fresh
         let _ = resume::delete(meta_path).await;
     }
 
-    // Fresh download: create metadata from planned chunks
     let meta = resume::create_new(url.to_string(), file_size, chunks);
 
     resume::save_atomic(meta_path, &meta).await?;
@@ -283,6 +281,8 @@ async fn download_chunk_with_retry(
     chunk_progress: Arc<AtomicU64>, global_progress: Arc<AtomicU64>, cancel: CancellationToken,
 ) -> Result<u64> {
     let full_chunk_size = chunk.end - chunk.start + 1;
+    // FIX 3: Capture starting progress so we only report newly written bytes
+    let initial_completed = chunk_progress.load(Ordering::SeqCst);
 
     for attempt in 0..=config.max_retries {
         if cancel.is_cancelled() {
@@ -291,13 +291,17 @@ async fn download_chunk_with_retry(
         }
 
         let resume_from = chunk_progress.load(Ordering::SeqCst);
-        if resume_from >= full_chunk_size { return Ok(full_chunk_size); }
+        // FIX 3: Already-complete chunk reports only newly written bytes (zero if nothing new)
+        if resume_from >= full_chunk_size { return Ok(full_chunk_size - initial_completed); }
 
         match range_download::download_range(
             client, url, file_path, chunk.start, chunk.end, resume_from,
             Arc::clone(&chunk_progress), Some(Arc::clone(&global_progress)), cancel.clone(),
         ).await {
-            Ok(DownloadStatus::Complete { bytes_written }) => return Ok(resume_from + bytes_written),
+            // FIX 3: Report only bytes written during this invocation
+            Ok(DownloadStatus::Complete { bytes_written: _ }) => {
+                return Ok(chunk_progress.load(Ordering::SeqCst) - initial_completed);
+            }
 
             Ok(DownloadStatus::Cancelled { .. }) => {
                 let written = chunk_progress.load(Ordering::SeqCst);
@@ -308,10 +312,12 @@ async fn download_chunk_with_retry(
                 let written = chunk_progress.load(Ordering::SeqCst);
                 let delay = config.delay_for_attempt(attempt);
                 eprintln!(
-                    "   ⚠ Chunk #{}: attempt {}/{} failed ({}/{} bytes), retrying in {:.1}s — {}",
-                    chunk.id, attempt + 1, config.max_retries + 1, written, full_chunk_size,
-                    delay.as_secs_f64(), single_line_error(&e),
+    "   ⚠ Chunk #{}: {}/{} failed, retry in {:.1}s — {}",
+                    chunk.id, attempt + 1, config.max_retries + 1,
+                    delay.as_secs_f64(),
+                    short_error(&e),
                 );
+
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => { anyhow::bail!("Chunk #{} cancelled during retry backoff", chunk.id); }
@@ -335,8 +341,16 @@ async fn download_chunk_with_retry(
     anyhow::bail!("Chunk #{}: exhausted {} retries ({}/{} bytes on disk)", chunk.id, config.max_retries, written, full_chunk_size)
 }
 
-fn single_line_error(err: &anyhow::Error) -> String {
-    format!("{:#}", err).replace('\n', " | ")
+fn short_error(err: &anyhow::Error) -> String {
+    // Walk to the innermost cause — that's the actual error
+    let root = err.chain().last().unwrap_or(err.chain().next().unwrap());
+    let msg = root.to_string();
+    // Cap length for terminal readability
+    if msg.len() > 80 {
+        format!("{}…", &msg[..77])
+    } else {
+        msg
+    }
 }
 
 fn spawn_progress_monitor<F>(callback: Option<F>, counter: Arc<AtomicU64>, done: Arc<AtomicBool>, total: u64) -> Option<JoinHandle<()>>
