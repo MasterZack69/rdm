@@ -14,6 +14,7 @@ const NUM_CHUNKS: u32 = 8;
 ///   handle a streaming (non-chunked) download.
 /// - If range requests are supported and file size is known, split into 8 chunks.
 /// - Otherwise, return a single chunk covering the entire file.
+
 pub fn plan_chunks(size: Option<u64>, supports_range: bool) -> Option<Vec<Chunk>> {
     let file_size = size?;
 
@@ -49,7 +50,6 @@ pub fn plan_chunks(size: Option<u64>, supports_range: bool) -> Option<Vec<Chunk>
 
     Some(chunks)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

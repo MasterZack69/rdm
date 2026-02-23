@@ -44,6 +44,16 @@ where
     }
 }
 
+fn chunks_from_metadata(meta: &ResumeMetadata) -> Vec<Chunk> {
+    meta.chunks.iter().map(|c| {
+        Chunk {
+            id: c.id,
+            start: c.start,
+            end: c.end,
+        }
+    }).collect()
+}
+
 async fn parallel_inner<F>(
     client: &Client,
     url: &str,
@@ -58,106 +68,172 @@ async fn parallel_inner<F>(
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
-    let meta = load_or_create_metadata(meta_path, url, file_size, chunks).await?;
-    ensure_file_allocated(temp_path, file_size).await?;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+
+    let meta = load_or_create_metadata(
+    meta_path,
+    url,
+    file_size,
+    chunks,
+).await?;
+
+let chunks = chunks_from_metadata(&meta);
+
+ensure_file_allocated(temp_path, file_size).await?;
 
     let shared_meta = Arc::new(Mutex::new(meta));
 
+    let mut queue: VecDeque<Chunk> = chunks.iter().cloned().collect();
+
     let chunk_counters: Vec<(u32, Arc<AtomicU64>)> = {
         let meta_guard = shared_meta.lock().await;
-        chunks.iter().map(|c| {
-            let completed = meta_guard.chunks.iter().find(|s| s.id == c.id).map(|s| s.completed).unwrap_or(0);
-            (c.id, Arc::new(AtomicU64::new(completed)))
-        }).collect()
+        chunks
+            .iter()
+            .map(|c| {
+                let completed = meta_guard
+                    .chunks
+                    .iter()
+                    .find(|s| s.id == c.id)
+                    .map(|s| s.completed)
+                    .unwrap_or(0);
+                (c.id, Arc::new(AtomicU64::new(completed)))
+            })
+            .collect()
     };
 
-    let initial_completed: u64 = chunk_counters.iter().map(|(_, c)| c.load(Ordering::Relaxed)).sum();
+    let initial_completed: u64 =
+        chunk_counters.iter().map(|(_, c)| c.load(Ordering::Relaxed)).sum();
+
     let global_progress = Arc::new(AtomicU64::new(initial_completed));
+    let retry_pressure = Arc::new(AtomicUsize::new(0));
     let done_flag = Arc::new(AtomicBool::new(false));
 
     let autosave_handle = spawn_autosave(
-        meta_path.to_string(), Arc::clone(&shared_meta),
-        chunk_counters.iter().map(|(id, c)| (*id, Arc::clone(c))).collect(),
+        meta_path.to_string(),
+        Arc::clone(&shared_meta),
+        chunk_counters
+            .iter()
+            .map(|(id, c)| (*id, Arc::clone(c)))
+            .collect(),
         Arc::clone(&done_flag),
     );
 
     let monitor_handle = spawn_progress_monitor(
-        progress_callback, Arc::clone(&global_progress), Arc::clone(&done_flag), file_size,
+        progress_callback,
+        Arc::clone(&global_progress),
+        Arc::clone(&done_flag),
+        file_size,
     );
 
-    let handles: Vec<(u32, JoinHandle<Result<u64>>)> = chunks.iter().enumerate().map(|(i, chunk)| {
-        let client = client.clone();
-        let url = url.to_string();
-        let path = temp_path.to_string();
-        let gp = Arc::clone(&global_progress);
-        let cancel = cancel.clone();
-        let config = retry_config.clone();
-        let chunk = chunk.clone();
-        let chunk_progress = Arc::clone(&chunk_counters[i].1);
-
-        let id = chunk.id;
-        let handle = tokio::spawn(async move {
-    download_chunk_with_retry(
-        &client,
-        &url,
-        &path,
-        &chunk,
-        &config,
-        chunk_progress,
-        gp,
-        cancel,
-    ).await
-});
-
-        (id, handle)
-    }).collect();
-
+    let mut active_workers = chunks.len().max(1);
+    let mut handles: Vec<JoinHandle<Result<u64>>> = Vec::new();
     let mut total_bytes: u64 = 0;
-    let mut errors: Vec<String> = Vec::new();
 
-    for (id, handle) in handles {
-        match handle.await {
-            Ok(Ok(bytes)) => total_bytes += bytes,
-            Ok(Err(e)) => errors.push(format!("Chunk #{}: {:#}", id, e)),
-            Err(join_err) => {
-                if join_err.is_panic() { errors.push(format!("Chunk #{}: task panicked", id)); }
-                else { errors.push(format!("Chunk #{}: task aborted", id)); }
+    while !queue.is_empty() || !handles.is_empty() {
+        while handles.len() < active_workers && !queue.is_empty() {
+            let chunk = queue.pop_front().unwrap();
+
+            let client = client.clone();
+            let url = url.to_string();
+            let path = temp_path.to_string();
+            let gp = Arc::clone(&global_progress);
+            let cancel = cancel.clone();
+            let config = retry_config.clone();
+            let chunk_progress = chunk_counters
+                .iter()
+                .find(|(id, _)| *id == chunk.id)
+                .unwrap()
+                .1
+                .clone();
+
+            let pressure = retry_pressure.clone();
+
+            handles.push(tokio::spawn(async move {
+                match download_chunk_with_retry(
+                    &client,
+                    &url,
+                    &path,
+                    &chunk,
+                    &config,
+                    chunk_progress,
+                    gp,
+                    cancel,
+                )
+                .await
+                {
+                    Ok(b) => Ok(b),
+                    Err(e) => {
+                        if retry::is_retryable(&e) {
+                            pressure.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e)
+                    }
+                }
+            }));
+        }
+
+        if retry_pressure.load(Ordering::Relaxed) >= chunks.len() * 2 && active_workers > 1 {
+            let new = (active_workers / 2).max(1);
+            eprintln!(
+                "  ⚠ Server overloaded — reducing parallel connections: {} → {}",
+                active_workers, new
+            );
+            active_workers = new;
+            retry_pressure.store(0, Ordering::Relaxed);
+        }
+
+        if let Some(handle) = handles.pop() {
+            match handle.await {
+                Ok(Ok(bytes)) => total_bytes += bytes,
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(anyhow::anyhow!("Worker panic: {}", e)),
             }
         }
     }
 
     done_flag.store(true, Ordering::Relaxed);
-    if let Some(h) = monitor_handle { let _ = h.await; }
+    if let Some(h) = monitor_handle {
+        let _ = h.await;
+    }
     let _ = autosave_handle.await;
 
-    let snapshot = {
-        let mut meta_guard = shared_meta.lock().await;
-        for (id, counter) in &chunk_counters {
-            resume::update_progress(&mut meta_guard, *id, counter.load(Ordering::SeqCst));
-        }
-        meta_guard.clone()
-    };
-    let _ = resume::save_atomic(meta_path, &snapshot).await;
-
-    if !errors.is_empty() {
-        let report = errors.join("\n  • ");
-        anyhow::bail!("{} of {} chunk(s) failed:\n  • {}", errors.len(), chunks.len(), report);
-    }
-
     if total_bytes != file_size {
-        anyhow::bail!("Total bytes mismatch: expected {} but downloaded {}", file_size, total_bytes);
+        anyhow::bail!(
+            "Total bytes mismatch: expected {} but downloaded {}",
+            file_size,
+            total_bytes
+        );
     }
 
     Ok(total_bytes)
 }
 
-async fn load_or_create_metadata(meta_path: &str, url: &str, file_size: u64, chunks: &[Chunk]) -> Result<ResumeMetadata> {
+async fn load_or_create_metadata(
+    meta_path: &str,
+    url: &str,
+    file_size: u64,
+    chunks: &[Chunk],
+) -> Result<ResumeMetadata> {
+
+    // Try to load existing resume metadata
     if let Ok(existing) = resume::load(meta_path).await {
-        if resume::validate_against(&existing, url, file_size, chunks) { return Ok(existing); }
+
+        // Validate only URL + size, NOT chunk layout
+        if existing.url == url && existing.file_size == file_size {
+            eprintln!("  [Resume] Using existing chunk layout ({} chunks)", existing.chunks.len());
+            return Ok(existing);
+        }
+
+        // Otherwise incompatible → delete
         let _ = resume::delete(meta_path).await;
     }
+
+    // Fresh download: create metadata from planned chunks
     let meta = resume::create_new(url.to_string(), file_size, chunks);
+
     resume::save_atomic(meta_path, &meta).await?;
+
     Ok(meta)
 }
 

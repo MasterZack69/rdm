@@ -1,7 +1,6 @@
 mod chunk;
 mod cli;
 mod config;
-mod download;
 mod inspect;
 mod parallel;
 mod priority_queue;
@@ -126,10 +125,10 @@ async fn run_queue(
     let had_restored = q.pending_count() + q.paused_count() > 0;
 
     for url in &urls {
-        let filename = extract_auto_filename(url);
-        let output = cfg.resolve_output_path(&filename);
-        q.add_with_priority(url.clone(), output, connections, priority);
-    }
+    let filename = extract_auto_filename(url);
+    let output = cfg.resolve_output_path(&filename);
+    q.add_with_priority(url.clone(), output, connections, priority);
+}
 
     if !has_new && !had_restored {
         eprintln!("RDM — Queue Mode");

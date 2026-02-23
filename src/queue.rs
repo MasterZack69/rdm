@@ -201,8 +201,15 @@ impl DownloadQueue {
         }
         for (_, active) in &self.active {
             let j = &active.job;
-            jobs.push(PersistedJob { id: j.id, url: j.url.clone(), output_path: j.output_path.clone(), connections: j.connections, priority: j.priority, state: JobState::Active });
-        }
+            jobs.push(PersistedJob {
+                id: j.id,
+                url: j.url.clone(),
+                output_path: j.output_path.clone(),
+                connections: j.connections,
+                priority: j.priority,
+                state: JobState::Pending,
+    });
+}
         jobs.sort_by_key(|j| (j.priority as u8, j.id));
         QueueSnapshot { next_id: self.next_id, max_concurrent: self.max_concurrent, jobs }
     }
@@ -236,19 +243,40 @@ impl DownloadQueue {
                 if spawned { self.autosave().await; }
             }
 
-            if self.active.is_empty() && (self.pending.is_empty() || shutting_down) { break; }
+            if self.active.is_empty() && (self.pending.is_empty() || shutting_down) {
+                break;
+            }
 
             tokio::select! {
                 biased;
 
-                _ = cancel.cancelled(), if !shutting_down => {
-                    shutting_down = true;
-                    eprintln!("  [Queue] Cancelling {} active, {} pending", self.active.len(), self.pending.len());
-                    for job in self.pending.drain() {
-                        results.push(JobResult { id: job.id, url: job.url, output_path: job.output_path, priority: job.priority, outcome: JobOutcome::Cancelled });
-                    }
-                    self.autosave().await;
-                }
+            _ = cancel.cancelled(), if !shutting_down => {
+    shutting_down = true;
+
+    eprintln!(
+        "  [Queue] Cancelling {} active, {} pending",
+        self.active.len(),
+        self.pending.len()
+    );
+
+    // cancel all active workers immediately
+    for active in self.active.values() {
+        active.token.cancel();
+    }
+
+    // mark pending jobs cancelled
+    for job in self.pending.drain() {
+        results.push(JobResult {
+            id: job.id,
+            url: job.url,
+            output_path: job.output_path,
+            priority: job.priority,
+            outcome: JobOutcome::Cancelled,
+        });
+    }
+
+    self.autosave().await;
+}
 
                 cmd = cmd_rx.recv() => {
                     if let Some(c) = cmd {
