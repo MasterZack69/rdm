@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::chunk::Chunk;
 use crate::inspect;
@@ -52,9 +53,15 @@ pub async fn run_download(
     eprintln!();
 
     let start_time = Instant::now();
+    let session_start = AtomicU64::new(u64::MAX);
 
     let progress_callback = move |downloaded: u64, total: u64| {
-        print_progress_bar(downloaded, total, start_time);
+        session_start
+            .compare_exchange(u64::MAX, downloaded, Ordering::Relaxed, Ordering::Relaxed)
+            .ok();
+        let base = session_start.load(Ordering::Relaxed);
+        let session_bytes = downloaded.saturating_sub(base);
+        print_progress_bar(downloaded, total, session_bytes, start_time);
     };
 
     let retry_config = RetryConfig::default();
@@ -258,10 +265,10 @@ fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
     chunks
 }
 
-fn print_progress_bar(downloaded: u64, total: u64, start: Instant) {
+fn print_progress_bar(downloaded: u64, total: u64, session_bytes: u64, start: Instant) {
     if total == 0 { return; }
     let pct = (downloaded as f64 / total as f64 * 100.0).min(100.0);
-    let speed = format_speed(downloaded, start.elapsed());
+    let speed = format_speed(session_bytes, start.elapsed());
     let bar_width = 25;
     let filled = (pct / 100.0 * bar_width as f64) as usize;
     let empty = bar_width - filled;
