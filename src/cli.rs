@@ -226,7 +226,7 @@ fn extract_filename_from_url(url: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn percent_decode(input: &str) -> String {
+pub fn percent_decode(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.bytes();
     while let Some(b) = chars.next() {

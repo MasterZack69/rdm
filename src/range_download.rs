@@ -60,9 +60,19 @@ pub async fn download_range(
     }
 };
 
-    let status = response.status();
+        let status = response.status();
 
-    if status != StatusCode::PARTIAL_CONTENT {
+    if status == StatusCode::OK && effective_start == 0 {
+        // Server doesn't support ranges but we're downloading from the start.
+        // Accept the full response — no Content-Range to validate.
+    } else if status == StatusCode::OK && effective_start > 0 {
+        // Server ignored our Range header but we need to resume mid-file.
+        // Can't resume without range support.
+        anyhow::bail!(
+            "Server does not support range requests — cannot resume from byte {}",
+            effective_start,
+        );
+    } else if status != StatusCode::PARTIAL_CONTENT {
         if is_transient_status(status) {
             return Err(anyhow::Error::new(TransientError {
                 message: format!("Transient HTTP {} for range {}", status.as_u16(), range_value),
@@ -73,9 +83,9 @@ pub async fn download_range(
             range_value, status.as_u16(),
             status.canonical_reason().unwrap_or("Unknown"),
         );
+    } else {
+        validate_content_range(response.headers(), effective_start, end)?;
     }
-
-    validate_content_range(response.headers(), effective_start, end)?;
 
         let file = OpenOptions::new()
         .read(true)

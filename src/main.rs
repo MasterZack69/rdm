@@ -101,11 +101,11 @@ fn main() -> Result<()> {
 }
 
 fn extract_auto_filename(url: &str) -> String {
-    url.split('?').next()
+    let raw = url.split('?').next()
         .and_then(|p| p.rsplit('/').next())
         .filter(|s| !s.is_empty())
-        .unwrap_or("download.bin")
-        .to_string()
+        .unwrap_or("download.bin");
+    cli::percent_decode(raw)
 }
 
 fn parse_download_args(args: &[String]) -> (Option<String>, Option<usize>) {
