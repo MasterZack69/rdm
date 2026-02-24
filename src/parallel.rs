@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Mutex;
-use tokio::task::{JoinHandle, JoinSet}; // FIX 2: added JoinSet
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::chunk::Chunk;
@@ -281,7 +281,6 @@ async fn download_chunk_with_retry(
     chunk_progress: Arc<AtomicU64>, global_progress: Arc<AtomicU64>, cancel: CancellationToken,
 ) -> Result<u64> {
     let full_chunk_size = chunk.end - chunk.start + 1;
-    // FIX 3: Capture starting progress so we only report newly written bytes
     let initial_completed = chunk_progress.load(Ordering::SeqCst);
 
     for attempt in 0..=config.max_retries {
@@ -291,7 +290,6 @@ async fn download_chunk_with_retry(
         }
 
         let resume_from = chunk_progress.load(Ordering::SeqCst);
-        // FIX 3: Already-complete chunk reports only newly written bytes (zero if nothing new)
         if resume_from >= full_chunk_size { return Ok(full_chunk_size - initial_completed); }
 
         match range_download::download_range(

@@ -106,21 +106,13 @@ pub async fn run_download(
     }
 }
 
-/// Check if output file already exists and prompt user for action.
-/// Returns:
-///   Ok(Some(path)) — proceed with this path
-///   Ok(None)       — user cancelled
-///   Err            — I/O failure
-
 pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<String>> {
     use std::io::{BufRead, IsTerminal, Write};
 
-    // No conflict — file doesn't exist
     if !std::path::Path::new(path).exists() {
         return Ok(Some(path.to_string()));
     }
 
-    // .part file exists → resume in progress, not a conflict
     let part_path = format!("{}.part", path);
     if std::path::Path::new(&part_path).exists() {
         return Ok(Some(path.to_string()));
@@ -137,7 +129,6 @@ pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<Str
         }
     }
 
-    // Non-interactive stdin — cannot prompt
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(
             "File already exists: {}\n  Use -o to specify a different output path.",
@@ -145,7 +136,6 @@ pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<Str
         );
     }
 
-    // Real conflict — interactive prompt
     let parent = std::path::Path::new(path)
         .parent()
         .unwrap_or(std::path::Path::new(""));

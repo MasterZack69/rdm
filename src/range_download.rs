@@ -64,10 +64,7 @@ pub async fn download_range(
 
     if status == StatusCode::OK && effective_start == 0 {
         // Server doesn't support ranges but we're downloading from the start.
-        // Accept the full response — no Content-Range to validate.
-    } else if status == StatusCode::OK && effective_start > 0 {
-        // Server ignored our Range header but we need to resume mid-file.
-        // Can't resume without range support.
+    } else if status == StatusCode::OK && effective_start > 0 { 
         anyhow::bail!(
             "Server does not support range requests — cannot resume from byte {}",
             effective_start,

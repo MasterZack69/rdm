@@ -8,13 +8,6 @@ pub struct Chunk {
 
 const NUM_CHUNKS: u32 = 8;
 
-/// Plan download chunks based on file size and range support.
-///
-/// - If file size is unknown (`None`), returns `None` — the caller must
-///   handle a streaming (non-chunked) download.
-/// - If range requests are supported and file size is known, split into 8 chunks.
-/// - Otherwise, return a single chunk covering the entire file.
-
 pub fn plan_chunks(size: Option<u64>, supports_range: bool) -> Option<Vec<Chunk>> {
     let file_size = size?;
 

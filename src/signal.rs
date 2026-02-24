@@ -1,7 +1,6 @@
 use tokio_util::sync::CancellationToken;
 
 
-// FIX 6: Wait for either SIGINT (Ctrl+C) or SIGTERM
 async fn wait_for_signal() -> std::io::Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
     match signal(SignalKind::terminate()) {
@@ -12,7 +11,6 @@ async fn wait_for_signal() -> std::io::Result<()> {
             }
         }
         Err(_) => {
-            // SIGTERM registration failed — fall back to SIGINT only
             tokio::signal::ctrl_c().await
         }
     }
@@ -24,7 +22,7 @@ pub async fn wait_for_ctrl_c(cancel: CancellationToken) {
         return;
     }
 
-    eprintln!("\n  ⚠ Cancelling download... (press Ctrl+C again to force quit)");
+    eprintln!("\n  ⚠ Cancelling download...");
     cancel.cancel();
 
     let second = tokio::signal::ctrl_c().await;
