@@ -48,6 +48,13 @@ pub async fn run_download(
         vec![Chunk { id: 1, start: 0, end: file_size - 1 }]
     };
 
+        if !info.supports_range {
+        let meta_path = crate::resume::ResumeMetadata::meta_path(&output_path);
+        let part_path = format!("{}.part", &output_path);
+        let _ = std::fs::remove_file(&meta_path);
+        let _ = std::fs::remove_file(&part_path);
+    }
+
     eprintln!("  Chunks    : {}", chunks.len());
     eprintln!();
 

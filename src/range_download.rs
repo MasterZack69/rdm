@@ -99,6 +99,7 @@ pub async fn download_range(
 
     let mut stream = response.bytes_stream();
     let mut bytes_written: u64 = 0;
+    let mut bytes_since_flush: u64 = 0;
 
     loop {
         tokio::select! {
@@ -134,6 +135,15 @@ pub async fn download_range(
                             })?;
 
                         bytes_written += data_len;
+                        bytes_since_flush += data_len;
+
+                        // Flush every 1MB to limit data loss on hard kill
+                        if bytes_since_flush >= 1024 * 1024 {
+                            file.flush().await.with_context(|| {
+                                format!("Periodic flush failed at offset {}", effective_start + bytes_written)
+                            })?;
+                            bytes_since_flush = 0;
+                        }
 
                         chunk_progress.store(resume_from + bytes_written, Ordering::Relaxed);
                         if let Some(ref gp) = global_progress {

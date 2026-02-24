@@ -306,6 +306,18 @@ async fn download_chunk_with_retry(
                 anyhow::bail!("Chunk #{} cancelled after {} of {} bytes", chunk.id, written, full_chunk_size);
             }
 
+            Err(e) if e.root_cause().to_string().contains("does not support range requests")
+                    && attempt < config.max_retries =>
+                {
+                    let old = chunk_progress.swap(0, Ordering::SeqCst);
+                    global_progress.fetch_sub(old, Ordering::Relaxed);
+                    eprintln!(
+                        "   ⚠ Chunk #{}: range not supported, restarting from byte 0",
+                        chunk.id,
+                    );
+                    continue;
+                }
+
             Err(e) if retry::is_retryable(&e) && attempt < config.max_retries => {
                 let written = chunk_progress.load(Ordering::SeqCst);
                 let delay = config.delay_for_attempt(attempt);
