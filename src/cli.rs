@@ -243,25 +243,26 @@ fn extract_filename_from_url(url: &str) -> Option<String> {
 }
 
 pub fn percent_decode(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
+    let mut bytes = Vec::with_capacity(input.len());
     let mut chars = input.bytes();
     while let Some(b) = chars.next() {
         if b == b'%' {
             let hi = chars.next();
             let lo = chars.next();
             if let (Some(h), Some(l)) = (hi, lo) {
-                let hex = [h, l];
-                if let Ok(s) = std::str::from_utf8(&hex) {
-                    if let Ok(byte) = u8::from_str_radix(s, 16) {
-                        result.push(byte as char);
+                if let Ok(s) = std::str::from_utf8(&[h, l]) {
+                    if let Ok(decoded) = u8::from_str_radix(s, 16) {
+                        bytes.push(decoded);
                         continue;
                     }
                 }
             }
-            result.push('%');
-        } else { result.push(b as char); }
+            bytes.push(b'%');
+        } else {
+            bytes.push(b);
+        }
     }
-    result
+    String::from_utf8(bytes).unwrap_or_else(|_| input.to_string())
 }
 
 fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {

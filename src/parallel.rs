@@ -342,12 +342,13 @@ async fn download_chunk_with_retry(
 }
 
 fn short_error(err: &anyhow::Error) -> String {
-    // Walk to the innermost cause — that's the actual error
-    let root = err.chain().last().unwrap_or(err.chain().next().unwrap());
-    let msg = root.to_string();
-    // Cap length for terminal readability
+    let msg = err.chain().last().map(|e| e.to_string()).unwrap_or_else(|| err.to_string());
     if msg.len() > 80 {
-        format!("{}…", &msg[..77])
+        let mut end = 77;
+        while end > 0 && !msg.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &msg[..end])
     } else {
         msg
     }

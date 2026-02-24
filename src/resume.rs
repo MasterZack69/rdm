@@ -107,9 +107,9 @@ pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
     }
     .await;
 
-    if let Err(e) = &write_result {
+        if let Err(e) = write_result {
         let _ = fs::remove_file(&tmp_path).await;
-        return Err(anyhow::anyhow!("{:#}", e));
+        return Err(e);
     }
 
     Ok(())
