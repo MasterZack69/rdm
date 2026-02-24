@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::chunk::Chunk;
 use crate::inspect;
@@ -53,15 +52,30 @@ pub async fn run_download(
     eprintln!();
 
     let start_time = Instant::now();
-    let session_start = AtomicU64::new(u64::MAX);
+    let speed_samples: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
 
     let progress_callback = move |downloaded: u64, total: u64| {
-        session_start
-            .compare_exchange(u64::MAX, downloaded, Ordering::Relaxed, Ordering::Relaxed)
-            .ok();
-        let base = session_start.load(Ordering::Relaxed);
-        let session_bytes = downloaded.saturating_sub(base);
-        print_progress_bar(downloaded, total, session_bytes, start_time);
+        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+        let mut samples = speed_samples.lock().unwrap();
+        samples.push_back((elapsed_ms, downloaded));
+
+        // Keep 3 second window
+        while samples.len() > 1 && elapsed_ms - samples.front().unwrap().0 > 3000 {
+            samples.pop_front();
+        }
+
+    let speed_bps = if samples.len() >= 2 {
+            let oldest = samples.front().unwrap();
+            let dt = (elapsed_ms - oldest.0) as f64 / 1000.0;
+            let db = downloaded.saturating_sub(oldest.1) as f64;
+            if dt > 0.1 { (db / dt) as u64 } else { 0 }
+        } else {
+            0
+        };
+
+        drop(samples);
+        print_progress_bar(downloaded, total, speed_bps);
     };
 
     let retry_config = RetryConfig::default();
@@ -74,14 +88,16 @@ pub async fn run_download(
     eprint!("\r\x1b[2K");
 
     match download_result {
-        Ok(bytes) => {
+                Ok(bytes) => {
+            let secs = start_time.elapsed().as_secs_f64();
+            let avg = if secs > 0.1 { (bytes as f64 / secs) as u64 } else { 0 };
             eprintln!("  ✅ Download complete: {}", output_path);
             eprintln!("  {} in {:.1}s ({})",
-                format_bytes(bytes), start_time.elapsed().as_secs_f64(),
-                format_speed(bytes, start_time.elapsed()),
+                format_bytes(bytes), secs, format_speed(avg),
             );
             Ok(())
         }
+
         Err(e) => {
             eprintln!("  ❌ Download failed.");
             eprintln!("  Progress saved. Resume by running the same command again.");
@@ -265,23 +281,38 @@ fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
     chunks
 }
 
-fn print_progress_bar(downloaded: u64, total: u64, session_bytes: u64, start: Instant) {
+fn print_progress_bar(downloaded: u64, total: u64, speed_bps: u64) {
     if total == 0 { return; }
     let pct = (downloaded as f64 / total as f64 * 100.0).min(100.0);
-    let speed = format_speed(session_bytes, start.elapsed());
+    let remaining = total.saturating_sub(downloaded);
+    let speed = format_speed(speed_bps);
+    let eta = format_eta(speed_bps, remaining);
     let bar_width = 25;
     let filled = (pct / 100.0 * bar_width as f64) as usize;
     let empty = bar_width - filled;
-    eprint!("\r\x1b[2K  {:>5.1}% [{}{}] {} / {} | {}",
+    eprint!("\r\x1b[2K  {:>5.1}% [{}{}] {} / {} | {} | {}",
         pct, "█".repeat(filled), "░".repeat(empty),
-        format_bytes_compact(downloaded), format_bytes_compact(total), speed,
+        format_bytes_compact(downloaded), format_bytes_compact(total), speed, eta,
     );
 }
 
-fn format_speed(bytes: u64, elapsed: Duration) -> String {
-    let secs = elapsed.as_secs_f64();
-    if secs < 0.1 { return "-- MB/s".to_string(); }
-    format!("{}/s", format_bytes_compact((bytes as f64 / secs) as u64))
+fn format_speed(bytes_per_sec: u64) -> String {
+    if bytes_per_sec == 0 { return "-- MB/s".to_string(); }
+    format!("{}/s", format_bytes_compact(bytes_per_sec))
+}
+
+fn format_eta(speed_bps: u64, remaining: u64) -> String {
+    if speed_bps == 0 {
+        return "ETA --:--".to_string();
+    }
+    let eta_secs = remaining / speed_bps;
+    if eta_secs >= 3600 {
+        format!("ETA {}h {:02}m", eta_secs / 3600, (eta_secs % 3600) / 60)
+    } else if eta_secs >= 60 {
+        format!("ETA {}m {:02}s", eta_secs / 60, eta_secs % 60)
+    } else {
+        format!("ETA {}s", eta_secs)
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
