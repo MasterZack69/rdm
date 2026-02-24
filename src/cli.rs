@@ -26,7 +26,7 @@ pub async fn run_download(
     let connections = connections.max(1);
 
     let client = reqwest::Client::builder()
-        .user_agent("rdm/0.1.3")
+        .user_agent("rdm/0.1.9")
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         .build()
