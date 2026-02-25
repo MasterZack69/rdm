@@ -1,6 +1,6 @@
 [package]
 name = "rdm"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 
 [dependencies]
@@ -12,3 +12,11 @@ tokio-util = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.0.3+spec-1.1.0"
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "s"
