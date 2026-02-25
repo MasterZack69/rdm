@@ -7,6 +7,7 @@ mod range_download;
 mod resume;
 mod retry;
 mod signal;
+mod queue;
 
 use anyhow::Result;
 use config::Config;
@@ -57,6 +58,132 @@ fn main() -> Result<()> {
             Ok(())
         }
 
+                Some("queue") | Some("q") => {
+            match args.get(2).map(|s| s.as_str()) {
+                Some("add") | Some("a") => {
+                    let url = args.get(3)
+                        .ok_or_else(|| anyhow::anyhow!("Usage: rdm queue add <URL> [-o name] [-c N]"))?
+                        .clone();
+                    let (output, connections) = parse_download_args(&args[4..]);
+                    let id = queue::Queue::locked(|q| {
+                        Ok(q.add(url.clone(), output, connections))
+                    })?;
+                    let q = queue::Queue::load_readonly();
+                    eprintln!("  ✅ Added #{}: {}", id, cli::percent_decode(&url));
+                    eprintln!("  {} item(s) pending.", q.pending_count());
+                    Ok(())
+                }
+
+                Some("list") | Some("ls") | Some("l") => {
+                    queue::Queue::load_readonly().print_list();
+                    Ok(())
+                }
+
+                Some("start") | Some("run") | Some("s") => {
+                    tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+                        .block_on(async {
+                            let cancel = CancellationToken::new();
+                            let sh = signal::spawn_signal_handler(cancel.clone());
+                            let result = queue::start(&cfg, cancel).await;
+                            sh.abort();
+                            result
+                        })
+                }
+
+                Some("stop") => {
+                    queue::send_signal("stop")?;
+                    eprintln!("  ⏹  Stop signal sent. Queue will stop after current download.");
+                    Ok(())
+                }
+
+                Some("skip") | Some("next") | Some("n") => {
+                    queue::send_signal("skip")?;
+                    eprintln!("  ⏭  Skip signal sent.");
+                    Ok(())
+                }
+
+                Some("remove") | Some("rm") => {
+                    let id: u64 = args.get(3)
+                        .ok_or_else(|| anyhow::anyhow!("Usage: rdm queue remove <ID>"))?
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("Invalid ID — must be a number"))?;
+                    let removed = queue::Queue::locked(|q| Ok(q.remove(id)))?;
+                    if removed {
+                        eprintln!("  Removed #{}", id);
+                    } else {
+                        eprintln!("  No item with ID #{}", id);
+                    }
+                    Ok(())
+                }
+
+                Some("retry") | Some("r") => {
+                    match args.get(3).map(|s| s.as_str()) {
+                        Some("failed") | Some("f") => {
+                            let n = queue::Queue::locked(|q| Ok(q.retry_failed()))?;
+                            eprintln!("  Requeued {} failed item(s).", n);
+                            Ok(())
+                        }
+                        Some("skipped") | Some("s") => {
+                            let n = queue::Queue::locked(|q| Ok(q.retry_skipped()))?;
+                            eprintln!("  Requeued {} skipped item(s).", n);
+                            Ok(())
+                        }
+                        Some(id_str) => {
+                            let id: u64 = id_str.parse()
+                                .map_err(|_| anyhow::anyhow!("Usage: rdm queue retry <ID|failed|skipped>"))?;
+                            let ok = queue::Queue::locked(|q| Ok(q.retry_item(id)))?;
+                            if ok {
+                                eprintln!("  ✅ #{} requeued.", id);
+                            } else {
+                                eprintln!("  #{} is not failed or skipped.", id);
+                            }
+                            Ok(())
+                        }
+                        None => {
+                            // Retry all failed + skipped
+                            let n = queue::Queue::locked(|q| {
+                                Ok(q.retry_failed() + q.retry_skipped())
+                            })?;
+                            eprintln!("  Requeued {} item(s).", n);
+                            Ok(())
+                        }
+                    }
+                }
+
+                Some("clear") => {
+                    match args.get(3).map(|s| s.as_str()) {
+                        Some("done") | Some("finished") => {
+                            let n = queue::Queue::locked(|q| Ok(q.clear_finished()))?;
+                            eprintln!("  Cleared {} finished item(s).", n);
+                            Ok(())
+                        }
+                        _ => {
+                            let n = queue::Queue::locked(|q| Ok(q.clear_pending()))?;
+                            eprintln!("  Cleared {} pending item(s).", n);
+                            Ok(())
+                        }
+                    }
+                }
+
+                _ => {
+                    eprintln!("RDM — Queue");
+                    eprintln!();
+                    eprintln!("Usage:");
+                    eprintln!("  rdm queue add <URL> [-o name] [-c N]   Add download");
+                    eprintln!("  rdm queue list                         Show queue");
+                    eprintln!("  rdm queue start                        Start processing");
+                    eprintln!("  rdm queue stop                         Stop after current");
+                    eprintln!("  rdm queue skip                         Skip current download");
+                    eprintln!("  rdm queue remove <ID>                  Remove item");
+                    eprintln!("  rdm queue retry [ID|failed|skipped]    Requeue items");
+                    eprintln!("  rdm queue clear [done]                 Clear pending or finished");
+                    eprintln!();
+                    eprintln!("Shortcuts: q, a, ls, s, n, rm, r");
+                    Ok(())
+                }
+            }
+        }
+
         Some(url) if url.starts_with("http://") || url.starts_with("https://") =>
         {
             let url = url.to_string();
@@ -81,14 +208,20 @@ fn main() -> Result<()> {
         })
 }
 
-
-        _ => {
+                _ => {
             eprintln!("RDM — Rust Download Manager");
             eprintln!();
             eprintln!("Usage:");
             eprintln!("  rdm <URL>                              Quick download");
             eprintln!("  rdm download <URL> [output] [-c N]     Download with options");
+            eprintln!("  rdm queue <command>                     Manage download queue");
             eprintln!("  rdm config                             Show configuration");
+            eprintln!();
+            eprintln!("Queue commands:");
+            eprintln!("  rdm queue add <URL> [-o name] [-c N]   Add to queue");
+            eprintln!("  rdm queue list                         Show queue");
+            eprintln!("  rdm queue start                        Start processing");
+            eprintln!("  rdm queue stop / skip                  Live control");
             eprintln!();
             eprintln!("Options:");
             eprintln!("  -c, --connections N   Connections per file (default: {})", cfg.connections);
