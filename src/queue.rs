@@ -241,6 +241,13 @@ impl Queue {
         len - self.items.len()
     }
 
+    pub fn clear_all(&mut self) -> usize {
+        let len = self.items.len();
+        self.items.clear();
+        self.next_id = 1;
+        len
+    }
+
     pub fn retry_failed(&mut self) -> usize {
         let mut count = 0;
         for item in &mut self.items {
@@ -446,9 +453,9 @@ pub async fn start(cfg: &Config, cancel: CancellationToken) -> Result<()> {
             }
         });
 
-        let output = {
-            let filename = match &next.output {
-                Some(o) => o.clone(),
+            let output = {
+            let raw_path = match &next.output {
+                Some(o) => cli::percent_decode(o),
                 None => {
                     let raw = next.url.split('?').next()
                         .and_then(|p| p.rsplit('/').next())
@@ -457,7 +464,16 @@ pub async fn start(cfg: &Config, cancel: CancellationToken) -> Result<()> {
                     cli::percent_decode(raw)
                 }
             };
-            Some(cfg.resolve_output_path(&filename))
+
+            let full_path = cfg.resolve_output_path(&raw_path);
+
+            if let Some(parent) = std::path::Path::new(&full_path).parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+            }
+
+            Some(full_path)
         };
 
         let result = cli::run_download(
@@ -466,7 +482,6 @@ pub async fn start(cfg: &Config, cancel: CancellationToken) -> Result<()> {
             next.connections.unwrap_or(cfg.connections),
             child.clone(),
         ).await;
-
 
         watcher.abort();
 

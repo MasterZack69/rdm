@@ -6,6 +6,7 @@ mod parallel;
 mod range_download;
 mod resume;
 mod retry;
+mod scrape;
 mod signal;
 mod queue;
 
@@ -60,18 +61,48 @@ fn main() -> Result<()> {
 
                 Some("queue") | Some("q") => {
             match args.get(2).map(|s| s.as_str()) {
-                Some("add") | Some("a") => {
+
+                                Some("add") | Some("a") => {
                     let url = args.get(3)
                         .ok_or_else(|| anyhow::anyhow!("Usage: rdm queue add <URL> [-o name] [-c N]"))?
                         .clone();
                     let (output, connections) = parse_download_args(&args[4..]);
-                    let id = queue::Queue::locked(|q| {
-                        Ok(q.add(url.clone(), output, connections))
-                    })?;
-                    let q = queue::Queue::load_readonly();
-                    eprintln!("  ✅ Added #{}: {}", id, cli::percent_decode(&url));
-                    eprintln!("  {} item(s) pending.", q.pending_count());
-                    Ok(())
+
+                    let files = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?
+                        .block_on(scrape::discover_files(&url));
+
+                    match files {
+                        Ok(Some(urls)) => {
+                            let count = urls.len();
+                            queue::Queue::locked(|q| {
+                                for f in &urls {
+                                    q.add(f.url.clone(), Some(f.relative_path.clone()), connections);
+                                }
+                                Ok(())
+                            })?;
+
+                            eprintln!("  📁 Found {} file(s):", count);
+                            eprintln!();
+                            for f in &urls {
+                                eprintln!("     + {}", cli::percent_decode(&f.relative_path));
+                            }
+                            let q = queue::Queue::load_readonly();
+                            eprintln!();
+                            eprintln!("  {} item(s) pending.", q.pending_count());
+                            Ok(())
+                        }
+                        _ => {
+                            let id = queue::Queue::locked(|q| {
+                                Ok(q.add(url.clone(), output, connections))
+                            })?;
+                            let q = queue::Queue::load_readonly();
+                            eprintln!("  ✅ Added #{}: {}", id, cli::percent_decode(&url));
+                            eprintln!("  {} item(s) pending.", q.pending_count());
+                            Ok(())
+                        }
+                    }
                 }
 
                 Some("list") | Some("ls") | Some("l") => {
@@ -150,16 +181,21 @@ fn main() -> Result<()> {
                     }
                 }
 
-                Some("clear") => {
+                                Some("clear") | Some("c") => {
                     match args.get(3).map(|s| s.as_str()) {
-                        Some("done") | Some("finished") => {
+                        Some("pending") | Some("p") => {
+                            let n = queue::Queue::locked(|q| Ok(q.clear_pending()))?;
+                            eprintln!("  Cleared {} pending item(s).", n);
+                            Ok(())
+                        }
+                        Some("done") | Some("finished") | Some("d") => {
                             let n = queue::Queue::locked(|q| Ok(q.clear_finished()))?;
                             eprintln!("  Cleared {} finished item(s).", n);
                             Ok(())
                         }
                         _ => {
-                            let n = queue::Queue::locked(|q| Ok(q.clear_pending()))?;
-                            eprintln!("  Cleared {} pending item(s).", n);
+                            let n = queue::Queue::locked(|q| Ok(q.clear_all()))?;
+                            eprintln!("  Cleared {} item(s). Queue is empty.", n);
                             Ok(())
                         }
                     }
@@ -176,37 +212,63 @@ fn main() -> Result<()> {
                     eprintln!("  rdm queue skip                         Skip current download");
                     eprintln!("  rdm queue remove <ID>                  Remove item");
                     eprintln!("  rdm queue retry [ID|failed|skipped]    Requeue items");
-                    eprintln!("  rdm queue clear [done]                 Clear pending or finished");
+                    eprintln!("  rdm queue clear [pending|done]                 Clear pending or finished");
                     eprintln!();
-                    eprintln!("Shortcuts: q, a, ls, s, n, rm, r");
+                    eprintln!("Shortcuts: q, a, ls, s, n, rm, r, c");
                     Ok(())
                 }
             }
         }
 
-        Some(url) if url.starts_with("http://") || url.starts_with("https://") =>
-        {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
             let url = url.to_string();
             let (output, connections) = parse_download_args(&args[2..]);
             let connections = connections.unwrap_or(cfg.connections);
 
-            let output = {
-                let filename = match output {
-    Some(o) => o,
-    None => extract_auto_filename(&url),
-};
-                Some(cfg.resolve_output_path(&filename))
-            };
+            tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+                .block_on(async {
+                    let cancel = CancellationToken::new();
+                    let sh = signal::spawn_signal_handler(cancel.clone());
 
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?
-        .block_on(async {
-            let cancel = CancellationToken::new();
-            let sh = signal::spawn_signal_handler(cancel.clone());
-            let result = cli::run_download(url, output, connections, cancel).await;
-            sh.abort();
-            result
-        })
-}
+                                        // Check if URL is a directory listing
+                    if output.is_none() {
+                        if let Ok(Some(files)) = scrape::discover_files(&url).await {
+                            eprintln!("  📁 Found {} file(s):", files.len());
+                            eprintln!();
+                            for f in &files {
+                                eprintln!("     + {}", cli::percent_decode(&f.relative_path));
+                            }
+                            eprintln!();
+
+                            queue::Queue::locked(|q| {
+                                for f in &files {
+                                    q.add(f.url.clone(), Some(f.relative_path.clone()), Some(connections));
+                                }
+                                Ok(())
+                            })?;
+
+                            let result = queue::start(&cfg, cancel).await;
+                            sh.abort();
+                            return result;
+                        }
+                    }
+
+                    let output_filename = output.unwrap_or_else(|| {
+                        let raw = url.split('?').next()
+                            .and_then(|p| p.rsplit('/').next())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("download.bin");
+                        cli::percent_decode(raw)
+                    });
+                    let output_path = cfg.resolve_output_path(&output_filename);
+
+                    let result = cli::run_download(
+                        url, Some(output_path), connections, cancel.clone()
+                    ).await;
+                    sh.abort();
+                    result
+                })
+        }
 
                 _ => {
             eprintln!("RDM — Rust Download Manager");
