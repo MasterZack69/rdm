@@ -2,6 +2,7 @@
 - A "usable" download manager. Emphasis on usable.
 - Resume support on most connections like other download managers.
 - Written in rust so it must be cool. Emphasis on must.
+- Linux only.
 
 # Example Config File
 
