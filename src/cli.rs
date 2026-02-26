@@ -31,12 +31,6 @@ pub async fn run_download(
     let client = reqwest::Client::builder()
         .user_agent("rdm")
         .connect_timeout(Duration::from_secs(10))
-        .gzip(false)
-        .brotli(false)
-        .deflate(false)
-        .zstd(false)
-        .no_proxy()
-        .tcp_nodelay(true)
         .build()
         .context("Failed to build HTTP client")?;
 
@@ -45,34 +39,19 @@ pub async fn run_download(
     }
     let info = inspect::inspect_url(&client, &url).await?;
 
-    let file_size = info
-        .size
-        .context("Server did not report file size. Cannot use parallel download.")?;
-    if file_size == 0 {
-        anyhow::bail!("Cannot download empty file (Content-Length: 0)");
-    }
+    let file_size = info.size.context("Server did not report file size. Cannot use parallel download.")?;
+    if file_size == 0 { anyhow::bail!("Cannot download empty file (Content-Length: 0)"); }
 
     if !quiet {
         eprintln!("  File size : {}", format_bytes(file_size));
-        eprintln!(
-            "  Range     : {}",
-            if info.supports_range {
-                "supported"
-            } else {
-                "not supported"
-            }
-        );
+        eprintln!("  Range     : {}", if info.supports_range { "supported" } else { "not supported" });
         eprintln!("  Output    : {}", output_path);
     }
 
     let chunks = if info.supports_range && connections > 1 {
         plan_chunks_with_count(file_size, connections as u32)
     } else {
-        vec![Chunk {
-            id: 1,
-            start: 0,
-            end: file_size - 1,
-        }]
+        vec![Chunk { id: 1, start: 0, end: file_size - 1 }]
     };
 
     if !info.supports_range {
@@ -92,9 +71,7 @@ pub async fn run_download(
         std::sync::Mutex::new(std::collections::VecDeque::new());
 
     let progress_callback = move |downloaded: u64, total: u64| {
-        if quiet {
-            return;
-        }
+        if quiet { return; }
 
         let elapsed_ms = start_time.elapsed().as_millis() as u64;
         let mut samples = speed_samples.lock().unwrap();
@@ -121,16 +98,9 @@ pub async fn run_download(
     let retry_config = RetryConfig::default();
 
     let download_result = parallel::download_parallel(
-        &client,
-        &url,
-        &output_path,
-        file_size,
-        &chunks,
-        &retry_config,
-        Some(progress_callback),
-        cancel,
-    )
-    .await;
+        &client, &url, &output_path, file_size, &chunks,
+        &retry_config, Some(progress_callback), cancel,
+    ).await;
 
     if !quiet {
         eprint!("\r\x1b[2K");
@@ -140,17 +110,10 @@ pub async fn run_download(
         Ok(bytes) => {
             if !quiet {
                 let secs = start_time.elapsed().as_secs_f64();
-                let avg = if secs > 0.1 {
-                    (bytes as f64 / secs) as u64
-                } else {
-                    0
-                };
+                let avg = if secs > 0.1 { (bytes as f64 / secs) as u64 } else { 0 };
                 eprintln!("  ✅ Download complete: {}", output_path);
-                eprintln!(
-                    "  {} in {:.1}s ({})",
-                    format_bytes(bytes),
-                    secs,
-                    format_speed(avg),
+                eprintln!("  {} in {:.1}s ({})",
+                    format_bytes(bytes), secs, format_speed(avg),
                 );
             }
             Ok(())
@@ -181,15 +144,9 @@ pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<Str
     // Resume metadata exists → validate using resume module APIs
     let meta_path = crate::resume::ResumeMetadata::meta_path(path);
     if let Ok(meta) = crate::resume::load(&meta_path).await {
-        let chunks: Vec<crate::chunk::Chunk> = meta
-            .chunks
-            .iter()
-            .map(|c| crate::chunk::Chunk {
-                id: c.id,
-                start: c.start,
-                end: c.end,
-            })
-            .collect();
+        let chunks: Vec<crate::chunk::Chunk> = meta.chunks.iter().map(|c| {
+            crate::chunk::Chunk { id: c.id, start: c.start, end: c.end }
+        }).collect();
         if crate::resume::validate_against(&meta, url, meta.file_size, &chunks) {
             return Ok(Some(path.to_string()));
         }
@@ -226,28 +183,31 @@ pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<Str
                 let _ = std::fs::remove_file(&meta_path);
                 return Ok(Some(path.to_string()));
             }
-            "2" => loop {
-                eprint!("  New filename: ");
-                std::io::stderr().flush()?;
-                let mut name = String::new();
-                std::io::stdin().lock().read_line(&mut name)?;
-                let trimmed = name.trim();
-                if trimmed.is_empty() {
-                    eprintln!("  Filename cannot be empty.");
-                    continue;
+            "2" => {
+                loop {
+                    eprint!("  New filename: ");
+                    std::io::stderr().flush()?;
+                    let mut name = String::new();
+                    std::io::stdin().lock().read_line(&mut name)?;
+                    let trimmed = name.trim();
+                    if trimmed.is_empty() {
+                        eprintln!("  Filename cannot be empty.");
+                        continue;
+                    }
+                    let new_path = if parent.as_os_str().is_empty() {
+                        trimmed.to_string()
+                    } else {
+                        parent.join(trimmed).to_string_lossy().to_string()
+                    };
+                    return Ok(Some(new_path));
                 }
-                let new_path = if parent.as_os_str().is_empty() {
-                    trimmed.to_string()
-                } else {
-                    parent.join(trimmed).to_string_lossy().to_string()
-                };
-                return Ok(Some(new_path));
-            },
+            }
             "3" => return Ok(None),
             _ => eprintln!("  Invalid choice. Enter 1, 2, or 3."),
         }
     }
 }
+
 
 /// Prompt user for a new filename. Returns None if input was empty.
 fn prompt_rename(original_path: &str) -> Result<Option<String>> {
@@ -257,9 +217,7 @@ fn prompt_rename(original_path: &str) -> Result<Option<String>> {
     io::stderr().flush().ok();
 
     let mut input = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut input)
+    io::stdin().lock().read_line(&mut input)
         .context("Failed to read input")?;
 
     let trimmed = input.trim();
@@ -268,11 +226,7 @@ fn prompt_rename(original_path: &str) -> Result<Option<String>> {
     }
 
     // If user gave just a filename (no directory), preserve original directory
-    let new_path = if Path::new(trimmed)
-        .parent()
-        .map(|p| p.as_os_str().is_empty())
-        .unwrap_or(true)
-    {
+    let new_path = if Path::new(trimmed).parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true) {
         match Path::new(original_path).parent() {
             Some(dir) if !dir.as_os_str().is_empty() => {
                 dir.join(trimmed).to_string_lossy().to_string()
@@ -288,9 +242,7 @@ fn prompt_rename(original_path: &str) -> Result<Option<String>> {
 }
 
 fn resolve_output_path(url: &str, output: Option<&str>) -> String {
-    if let Some(provided) = output {
-        return provided.to_string();
-    }
+    if let Some(provided) = output { return provided.to_string(); }
     extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
 }
 
@@ -299,9 +251,7 @@ fn extract_filename_from_url(url: &str) -> Option<String> {
     let segment = path.rsplit('/').next()?;
     let decoded = percent_decode(segment);
     let trimmed = decoded.trim();
-    if trimmed.is_empty() || trimmed == "/" {
-        return None;
-    }
+    if trimmed.is_empty() || trimmed == "/" { return None; }
     Some(trimmed.to_string())
 }
 
@@ -339,20 +289,14 @@ fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
         let size = chunk_size + extra;
         let start = offset;
         let end = start + size - 1;
-        chunks.push(Chunk {
-            id: i + 1,
-            start,
-            end,
-        });
+        chunks.push(Chunk { id: i + 1, start, end });
         offset = end + 1;
     }
     chunks
 }
 
 fn print_progress_bar(downloaded: u64, total: u64, speed_bps: u64) {
-    if total == 0 {
-        return;
-    }
+    if total == 0 { return; }
     let pct = (downloaded as f64 / total as f64 * 100.0).min(100.0);
     let remaining = total.saturating_sub(downloaded);
     let speed = format_speed(speed_bps);
@@ -360,22 +304,14 @@ fn print_progress_bar(downloaded: u64, total: u64, speed_bps: u64) {
     let bar_width = 25;
     let filled = (pct / 100.0 * bar_width as f64) as usize;
     let empty = bar_width - filled;
-    eprint!(
-        "\r\x1b[2K  {:>5.1}% [{}{}] {} / {} | {} | {}",
-        pct,
-        "█".repeat(filled),
-        "░".repeat(empty),
-        format_bytes_compact(downloaded),
-        format_bytes_compact(total),
-        speed,
-        eta,
+    eprint!("\r\x1b[2K  {:>5.1}% [{}{}] {} / {} | {} | {}",
+        pct, "█".repeat(filled), "░".repeat(empty),
+        format_bytes_compact(downloaded), format_bytes_compact(total), speed, eta,
     );
 }
 
 fn format_speed(bytes_per_sec: u64) -> String {
-    if bytes_per_sec == 0 {
-        return "-- MB/s".to_string();
-    }
+    if bytes_per_sec == 0 { return "-- MB/s".to_string(); }
     format!("{}/s", format_bytes_compact(bytes_per_sec))
 }
 
@@ -394,86 +330,33 @@ fn format_eta(speed_bps: u64, remaining: u64) -> String {
 }
 
 fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    if bytes >= GIB {
-        format!("{:.2} GiB ({} bytes)", bytes as f64 / GIB as f64, bytes)
-    } else if bytes >= MIB {
-        format!("{:.2} MiB ({} bytes)", bytes as f64 / MIB as f64, bytes)
-    } else if bytes >= KIB {
-        format!("{:.2} KiB ({} bytes)", bytes as f64 / KIB as f64, bytes)
-    } else {
-        format!("{} bytes", bytes)
-    }
+    const KIB: u64 = 1024; const MIB: u64 = KIB * 1024; const GIB: u64 = MIB * 1024;
+    if bytes >= GIB { format!("{:.2} GiB ({} bytes)", bytes as f64 / GIB as f64, bytes) }
+    else if bytes >= MIB { format!("{:.2} MiB ({} bytes)", bytes as f64 / MIB as f64, bytes) }
+    else if bytes >= KIB { format!("{:.2} KiB ({} bytes)", bytes as f64 / KIB as f64, bytes) }
+    else { format!("{} bytes", bytes) }
 }
 
 fn format_bytes_compact(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
+    const KIB: f64 = 1024.0; const MIB: f64 = KIB * 1024.0; const GIB: f64 = MIB * 1024.0;
     let b = bytes as f64;
-    if b >= GIB {
-        format!("{:.2} GiB", b / GIB)
-    } else if b >= MIB {
-        format!("{:.1} MiB", b / MIB)
-    } else if b >= KIB {
-        format!("{:.1} KiB", b / KIB)
-    } else {
-        format!("{} B", bytes)
-    }
+    if b >= GIB { format!("{:.2} GiB", b / GIB) }
+    else if b >= MIB { format!("{:.1} MiB", b / MIB) }
+    else if b >= KIB { format!("{:.1} KiB", b / KIB) }
+    else { format!("{} B", bytes) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_extract_filename_simple() {
-        assert_eq!(
-            extract_filename_from_url("https://example.com/path/file.zip"),
-            Some("file.zip".into())
-        );
-    }
-    #[test]
-    fn test_extract_filename_query() {
-        assert_eq!(
-            extract_filename_from_url("https://example.com/file.tar.gz?t=1"),
-            Some("file.tar.gz".into())
-        );
-    }
-    #[test]
-    fn test_extract_filename_percent() {
-        assert_eq!(
-            extract_filename_from_url("https://example.com/my%20file.zip"),
-            Some("my file.zip".into())
-        );
-    }
-    #[test]
-    fn test_extract_filename_trailing() {
-        assert_eq!(extract_filename_from_url("https://example.com/"), None);
-    }
-    #[test]
-    fn test_resolve_explicit() {
-        assert_eq!(
-            resolve_output_path("https://example.com/f.zip", Some("out.zip")),
-            "out.zip"
-        );
-    }
-    #[test]
-    fn test_resolve_from_url() {
-        assert_eq!(
-            resolve_output_path("https://example.com/data.tar.gz", None),
-            "data.tar.gz"
-        );
-    }
-    #[test]
-    fn test_resolve_fallback() {
-        assert_eq!(
-            resolve_output_path("https://example.com/", None),
-            "download.bin"
-        );
-    }
+    #[test] fn test_extract_filename_simple() { assert_eq!(extract_filename_from_url("https://example.com/path/file.zip"), Some("file.zip".into())); }
+    #[test] fn test_extract_filename_query() { assert_eq!(extract_filename_from_url("https://example.com/file.tar.gz?t=1"), Some("file.tar.gz".into())); }
+    #[test] fn test_extract_filename_percent() { assert_eq!(extract_filename_from_url("https://example.com/my%20file.zip"), Some("my file.zip".into())); }
+    #[test] fn test_extract_filename_trailing() { assert_eq!(extract_filename_from_url("https://example.com/"), None); }
+    #[test] fn test_resolve_explicit() { assert_eq!(resolve_output_path("https://example.com/f.zip", Some("out.zip")), "out.zip"); }
+    #[test] fn test_resolve_from_url() { assert_eq!(resolve_output_path("https://example.com/data.tar.gz", None), "data.tar.gz"); }
+    #[test] fn test_resolve_fallback() { assert_eq!(resolve_output_path("https://example.com/", None), "download.bin"); }
 
     #[test]
     fn test_plan_chunks_even() {
@@ -488,8 +371,6 @@ mod tests {
         let chunks = plan_chunks_with_count(1003, 4);
         let total: u64 = chunks.iter().map(|c| c.end - c.start + 1).sum();
         assert_eq!(total, 1003);
-        for i in 1..chunks.len() {
-            assert_eq!(chunks[i].start, chunks[i - 1].end + 1);
-        }
+        for i in 1..chunks.len() { assert_eq!(chunks[i].start, chunks[i-1].end + 1); }
     }
 }

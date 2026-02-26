@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode, header};
+use reqwest::{header, Client, StatusCode};
 use std::io::SeekFrom;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::fs::OpenOptions;
-use tokio::io::BufWriter;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+use tokio::io::BufWriter;
 
-use crate::retry::{TransientError, is_transient_status};
+use crate::retry::{is_transient_status, TransientError};
 
 #[derive(Debug)]
 pub enum DownloadStatus {
@@ -43,28 +43,28 @@ pub async fn download_range(
     let range_value = format!("bytes={}-{}", effective_start, end);
 
     let response = tokio::select! {
-        biased;
+    biased;
 
-        _ = cancel.cancelled() => {
-            return Ok(DownloadStatus::Cancelled {
-                bytes_on_disk: resume_from
-            });
-        }
+    _ = cancel.cancelled() => {
+        return Ok(DownloadStatus::Cancelled {
+            bytes_on_disk: resume_from
+        });
+    }
 
-        result = client
-            .get(url)
-            .header(header::RANGE, &range_value)
-            .send() =>
-        {
-            result.with_context(|| format!("Range GET failed for {}", range_value))?
-        }
-    };
+    result = client
+        .get(url)
+        .header(header::RANGE, &range_value)
+        .send() =>
+    {
+        result.with_context(|| format!("Range GET failed for {}", range_value))?
+    }
+};
 
-    let status = response.status();
+        let status = response.status();
 
     if status == StatusCode::OK && effective_start == 0 {
         // Server doesn't support ranges but we're downloading from the start.
-    } else if status == StatusCode::OK && effective_start > 0 {
+    } else if status == StatusCode::OK && effective_start > 0 { 
         anyhow::bail!(
             "Server does not support range requests — cannot resume from byte {}",
             effective_start,
@@ -72,24 +72,19 @@ pub async fn download_range(
     } else if status != StatusCode::PARTIAL_CONTENT {
         if is_transient_status(status) {
             return Err(anyhow::Error::new(TransientError {
-                message: format!(
-                    "Transient HTTP {} for range {}",
-                    status.as_u16(),
-                    range_value
-                ),
+                message: format!("Transient HTTP {} for range {}", status.as_u16(), range_value),
             }));
         }
         anyhow::bail!(
             "Permanent HTTP error for range {}: {} {}",
-            range_value,
-            status.as_u16(),
+            range_value, status.as_u16(),
             status.canonical_reason().unwrap_or("Unknown"),
         );
     } else {
         validate_content_range(response.headers(), effective_start, end)?;
     }
 
-    let file = OpenOptions::new()
+        let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(file_path)
@@ -105,9 +100,6 @@ pub async fn download_range(
     let mut stream = response.bytes_stream();
     let mut bytes_written: u64 = 0;
     let mut bytes_since_flush: u64 = 0;
-    let mut pending_progress_bytes: u64 = 0;
-    const PROGRESS_SYNC_INTERVAL: u64 = 256 * 1024;
-    const FLUSH_INTERVAL: u64 = 8 * 1024 * 1024;
 
     loop {
         tokio::select! {
@@ -115,12 +107,6 @@ pub async fn download_range(
 
             _ = cancel.cancelled() => {
                 file.flush().await.ok();
-                if pending_progress_bytes > 0 {
-                    if let Some(ref gp) = global_progress {
-                        gp.fetch_add(pending_progress_bytes, Ordering::Relaxed);
-                    }
-                    pending_progress_bytes = 0;
-                }
                 chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
                 return Ok(DownloadStatus::Cancelled {
                     bytes_on_disk: resume_from + bytes_written,
@@ -150,33 +136,23 @@ pub async fn download_range(
 
                         bytes_written += data_len;
                         bytes_since_flush += data_len;
-                        pending_progress_bytes += data_len;
 
-                        // Flush periodically to limit data loss on hard kill while reducing syscall pressure.
-                        if bytes_since_flush >= FLUSH_INTERVAL {
+                        // Flush every 1MB to limit data loss on hard kill
+                        if bytes_since_flush >= 1024 * 1024 {
                             file.flush().await.with_context(|| {
                                 format!("Periodic flush failed at offset {}", effective_start + bytes_written)
                             })?;
                             bytes_since_flush = 0;
                         }
 
-                        if pending_progress_bytes >= PROGRESS_SYNC_INTERVAL {
-                            if let Some(ref gp) = global_progress {
-                                gp.fetch_add(pending_progress_bytes, Ordering::Relaxed);
-                            }
-                            chunk_progress.store(resume_from + bytes_written, Ordering::Relaxed);
-                            pending_progress_bytes = 0;
+                        chunk_progress.store(resume_from + bytes_written, Ordering::Relaxed);
+                        if let Some(ref gp) = global_progress {
+                            gp.fetch_add(data_len, Ordering::Relaxed);
                         }
                     }
 
                     Some(Err(e)) => {
                         file.flush().await.ok();
-                        if pending_progress_bytes > 0 {
-                            if let Some(ref gp) = global_progress {
-                                gp.fetch_add(pending_progress_bytes, Ordering::Relaxed);
-                            }
-                            pending_progress_bytes = 0;
-                        }
                         chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
                         return Err(e).context(format!(
                             "Stream error at byte {} of range {}", bytes_written, range_value,
@@ -189,23 +165,13 @@ pub async fn download_range(
         }
     }
 
-    file.flush()
-        .await
-        .context("Failed to flush file after range write")?;
+    file.flush().await.context("Failed to flush file after range write")?;
 
-    if pending_progress_bytes > 0 {
-        if let Some(ref gp) = global_progress {
-            gp.fetch_add(pending_progress_bytes, Ordering::Relaxed);
-        }
-    }
 
     if bytes_written != expected_len {
         chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
         anyhow::bail!(
-            "Truncated range {}: expected {} bytes, wrote {}",
-            range_value,
-            expected_len,
-            bytes_written,
+            "Truncated range {}: expected {} bytes, wrote {}", range_value, expected_len, bytes_written,
         );
     }
 
@@ -213,43 +179,25 @@ pub async fn download_range(
     Ok(DownloadStatus::Complete { bytes_written })
 }
 
-fn validate_content_range(
-    headers: &header::HeaderMap,
-    expected_start: u64,
-    expected_end: u64,
-) -> Result<()> {
-    let value = headers
-        .get(header::CONTENT_RANGE)
-        .context("Server returned 206 without Content-Range")?
-        .to_str()
-        .context("Content-Range is not valid UTF-8")?;
+fn validate_content_range(headers: &header::HeaderMap, expected_start: u64, expected_end: u64) -> Result<()> {
+    let value = headers.get(header::CONTENT_RANGE).context("Server returned 206 without Content-Range")?
+        .to_str().context("Content-Range is not valid UTF-8")?;
 
-    let rest = value
-        .strip_prefix("bytes ")
+    let rest = value.strip_prefix("bytes ")
         .with_context(|| format!("Unexpected Content-Range format: '{}'", value))?;
 
-    let (range_part, _) = rest
-        .split_once('/')
-        .with_context(|| format!("Content-Range missing '/': '{}'", value))?;
+    let (range_part, _) = rest.split_once('/')
+    .with_context(|| format!("Content-Range missing '/': '{}'", value))?;
 
-    let dash = range_part
-        .find('-')
-        .with_context(|| format!("Content-Range missing '-': '{}'", value))?;
+    let dash = range_part.find('-').with_context(|| format!("Content-Range missing '-': '{}'", value))?;
 
-    let actual_start: u64 = range_part[..dash]
-        .parse()
+    let actual_start: u64 = range_part[..dash].parse()
         .with_context(|| format!("Invalid start in Content-Range: '{}'", value))?;
-    let actual_end: u64 = range_part[dash + 1..]
-        .parse()
+    let actual_end: u64 = range_part[dash + 1..].parse()
         .with_context(|| format!("Invalid end in Content-Range: '{}'", value))?;
 
     if actual_start != expected_start || actual_end != expected_end {
-        anyhow::bail!(
-            "Content-Range mismatch: requested {}-{}, got '{}'",
-            expected_start,
-            expected_end,
-            value
-        );
+        anyhow::bail!("Content-Range mismatch: requested {}-{}, got '{}'", expected_start, expected_end, value);
     }
 
     Ok(())
@@ -263,40 +211,28 @@ mod tests {
     #[test]
     fn test_valid_content_range() {
         let mut h = HeaderMap::new();
-        h.insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_static("bytes 0-999/8000"),
-        );
+        h.insert(header::CONTENT_RANGE, HeaderValue::from_static("bytes 0-999/8000"));
         assert!(validate_content_range(&h, 0, 999).is_ok());
     }
 
     #[test]
     fn test_resumed_content_range() {
         let mut h = HeaderMap::new();
-        h.insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_static("bytes 500-999/8000"),
-        );
+        h.insert(header::CONTENT_RANGE, HeaderValue::from_static("bytes 500-999/8000"));
         assert!(validate_content_range(&h, 500, 999).is_ok());
     }
 
     #[test]
     fn test_content_range_mismatch() {
         let mut h = HeaderMap::new();
-        h.insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_static("bytes 0-499/8000"),
-        );
+        h.insert(header::CONTENT_RANGE, HeaderValue::from_static("bytes 0-499/8000"));
         assert!(validate_content_range(&h, 0, 999).is_err());
     }
 
     #[test]
     fn test_content_range_wildcard() {
         let mut h = HeaderMap::new();
-        h.insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_static("bytes 100-199/*"),
-        );
+        h.insert(header::CONTENT_RANGE, HeaderValue::from_static("bytes 100-199/*"));
         assert!(validate_content_range(&h, 100, 199).is_ok());
     }
 
@@ -308,10 +244,8 @@ mod tests {
     #[test]
     fn test_content_range_bad_prefix() {
         let mut h = HeaderMap::new();
-        h.insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_static("octets 0-99/100"),
-        );
+        h.insert(header::CONTENT_RANGE, HeaderValue::from_static("octets 0-99/100"));
         assert!(validate_content_range(&h, 0, 99).is_err());
     }
 }
+
