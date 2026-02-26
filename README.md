@@ -32,5 +32,5 @@ cargo build --release
 
 Credits
 - MasterZack69 - Of course I am getting the Credits
-- Claude 4.6 Opus - Wrote the code, found the bugs
+- Claude 4.6 Opus - Wrote the code, fixed the bugs
 - GPT 5.2 - Asked “what if it races?” one too many times
