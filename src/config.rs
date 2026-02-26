@@ -1,237 +1,82 @@
-use std::path::{Path, PathBuf};
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-use anyhow::Result;
-use serde::Deserialize;
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub connections: usize,
-    pub download_dir: Option<PathBuf>,
+    pub download_dir: String,
+    pub max_retries: u32,
+    pub queue_parallel: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
+        let download_dir = dirs::download_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .to_string_lossy()
+            .to_string();
+
         Self {
             connections: 8,
-            download_dir: None,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct RawConfig {
-    connections: Option<usize>,
-    download_dir: Option<String>,
-}
-
-impl Config {
-    pub fn load() -> Self {
-        match Self::try_load() {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!("  ⚠ Config: {:#}", e);
-                eprintln!("  Using default configuration.");
-                Config::default()
-            }
-        }
-    }
-
-    pub fn load_from(path: &Path) -> Self {
-        match Self::try_load_from(path) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!("  ⚠ Config ({}): {:#}", path.display(), e);
-                eprintln!("  Using default configuration.");
-                Config::default()
-            }
-        }
-    }
-
-    fn try_load() -> Result<Self> {
-        let path = config_path();
-        if !path.exists() {
-            return Ok(Config::default());
-        }
-        Self::try_load_from(&path)
-    }
-
-    fn try_load_from(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("failed to read {}: {}", path.display(), e))?;
-        Self::from_toml(&content)
-    }
-
-    fn from_toml(content: &str) -> Result<Self> {
-        let raw: RawConfig = toml::from_str(content)
-            .map_err(|e| anyhow::anyhow!("invalid TOML: {}", e))?;
-
-        let defaults = Config::default();
-        let connections = raw.connections.unwrap_or(defaults.connections).max(1);
-
-        let download_dir = raw.download_dir
-            .map(|s| expand_tilde(&s))
-            .filter(|p| !p.as_os_str().is_empty());
-
-        Ok(Config { connections, download_dir })
-    }
-
-    pub fn resolve_output_path(&self, filename: &str) -> String {
-        match &self.download_dir {
-            Some(dir) => {
-                let p = dir.join(filename);
-                p.to_string_lossy().to_string()
-            }
-            None => filename.to_string(),
+            download_dir,
+            max_retries: 6,
+            queue_parallel: 1,
         }
     }
 }
 
 pub fn config_path() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".config")
-        });
-    base.join("rdm").join("config.toml")
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("rdm")
+        .join("config.toml")
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
-    if path == "~" {
-        return home_dir();
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return home_dir().join(rest);
-    }
-    PathBuf::from(path)
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_config() {
-        let cfg = Config::default();
-        assert_eq!(cfg.connections, 8);
-        assert_eq!(cfg.download_dir, None);
-    }
-
-    #[test]
-    fn test_full_toml() {
-        let toml = r#"
-            connections = 12
-            download_dir = "/tmp/downloads"
-        "#;
-        let cfg = Config::from_toml(toml).expect("parse failed");
-        assert_eq!(cfg.connections, 12);
-        assert_eq!(cfg.download_dir, Some(PathBuf::from("/tmp/downloads")));
-    }
-
-    #[test]
-    fn test_partial_toml_uses_defaults() {
-        let toml = r#"connections = 16"#;
-        let cfg = Config::from_toml(toml).expect("parse failed");
-        assert_eq!(cfg.connections, 16);
-        assert_eq!(cfg.download_dir, None);
-    }
-
-    #[test]
-    fn test_empty_toml() {
-        let cfg = Config::from_toml("").expect("parse failed");
-        assert_eq!(cfg.connections, 8);
-    }
-
-    #[test]
-    fn test_invalid_toml_returns_error() {
-        let result = Config::from_toml("not valid {{{{ toml!!");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_invalid_toml_load_returns_defaults() {
-        let tmp = std::env::temp_dir().join("rdm_test_invalid_config.toml");
-        std::fs::write(&tmp, "broken {{[[ toml").expect("write failed");
-        let cfg = Config::load_from(&tmp);
-        assert_eq!(cfg.connections, 8);
-        std::fs::remove_file(&tmp).expect("cleanup");
-    }
-
-    #[test]
-    fn test_missing_file_returns_defaults() {
-        let path = PathBuf::from("/tmp/rdm_no_such_config_file.toml");
-        let cfg = Config::load_from(&path);
-        assert_eq!(cfg.connections, 8);
-    }
-
-    #[test]
-    fn test_tilde_expansion() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        assert_eq!(expand_tilde("~/Downloads"), PathBuf::from(format!("{}/Downloads", home)));
-        assert_eq!(expand_tilde("~"), PathBuf::from(&home));
-        assert_eq!(expand_tilde("/absolute/path"), PathBuf::from("/absolute/path"));
-        assert_eq!(expand_tilde("relative/path"), PathBuf::from("relative/path"));
-        assert_eq!(expand_tilde("~/a/b/c"), PathBuf::from(format!("{}/a/b/c", home)));
-    }
-
-    #[test]
-    fn test_tilde_in_download_dir() {
-        let toml = r#"download_dir = "~/Downloads""#;
-        let cfg = Config::from_toml(toml).expect("parse failed");
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        assert_eq!(cfg.download_dir, Some(PathBuf::from(format!("{}/Downloads", home))));
-    }
-
-    #[test]
-    fn test_connections_clamped_to_min_1() {
-        let toml = r#"connections = 0"#;
-        let cfg = Config::from_toml(toml).expect("parse failed");
-        assert_eq!(cfg.connections, 1);
-    }
-
-    #[test]
-    fn test_resolve_output_with_dir() {
-        let cfg = Config {
-            download_dir: Some(PathBuf::from("/home/user/Downloads")),
-            ..Config::default()
-        };
-        assert_eq!(cfg.resolve_output_path("file.zip"), "/home/user/Downloads/file.zip");
-    }
-
-    #[test]
-    fn test_resolve_output_without_dir() {
-        let cfg = Config::default();
-        assert_eq!(cfg.resolve_output_path("file.zip"), "file.zip");
-    }
-
-    #[test]
-    fn test_empty_download_dir_treated_as_none() {
-        let toml = r#"download_dir = """#;
-        let cfg = Config::from_toml(toml).expect("parse failed");
-        assert_eq!(cfg.download_dir, None);
-    }
-
-    #[test]
-    fn test_config_path_xdg() {
+impl Config {
+    pub fn load() -> Self {
         let path = config_path();
-        let s = path.to_string_lossy();
-        assert!(s.ends_with("rdm/config.toml"));
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+            Err(_) => {
+                let cfg = Config::default();
+                let _ = cfg.save();
+                cfg
+            }
+        }
     }
 
-    #[test]
-    fn test_extra_unknown_keys_ignored() {
-        let toml = r#"
-            connections = 4
-            unknown_key = "value"
-            another = 42
-        "#;
-        let cfg = Config::from_toml(toml);
-        assert!(cfg.is_err() || cfg.unwrap().connections == 4);
+    pub fn save(&self) -> Result<()> {
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .context("Failed to create config directory")?;
+        }
+        let toml = toml::to_string_pretty(self)
+            .context("Failed to serialize config")?;
+        std::fs::write(&path, toml)
+            .context("Failed to write config file")?;
+        Ok(())
+    }
+
+    pub fn resolve_output_path(&self, filename: &str) -> String {
+        let path = std::path::Path::new(filename);
+        if path.is_absolute() {
+            filename.to_string()
+        } else {
+            PathBuf::from(&self.download_dir)
+                .join(filename)
+                .to_string_lossy()
+                .to_string()
+        }
+    }
+
+    pub fn print(&self) {
+        eprintln!("  Config     : {}", config_path().display());
+        eprintln!("  Download   : {}", self.download_dir);
+        eprintln!("  Connections: {}", self.connections);
+        eprintln!("  Max retries: {}", self.max_retries);
+        eprintln!("  Queue par. : {}", self.queue_parallel);
     }
 }

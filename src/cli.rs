@@ -14,12 +14,15 @@ pub async fn run_download(
     output: Option<String>,
     connections: usize,
     cancel: CancellationToken,
+    quiet: bool,
 ) -> Result<()> {
     let output_path = resolve_output_path(&url, output.as_deref());
     let output_path = match resolve_existing_output(&output_path, &url).await? {
         Some(p) => p,
         None => {
-            eprintln!("  Download cancelled.");
+            if !quiet {
+                eprintln!("  Download cancelled.");
+            }
             return Ok(());
         }
     };
@@ -32,15 +35,19 @@ pub async fn run_download(
         .build()
         .context("Failed to build HTTP client")?;
 
-    eprintln!("  Inspecting: {}", url);
+    if !quiet {
+        eprintln!("  Inspecting: {}", url);
+    }
     let info = inspect::inspect_url(&client, &url).await?;
 
     let file_size = info.size.context("Server did not report file size. Cannot use parallel download.")?;
     if file_size == 0 { anyhow::bail!("Cannot download empty file (Content-Length: 0)"); }
 
-    eprintln!("  File size : {}", format_bytes(file_size));
-    eprintln!("  Range     : {}", if info.supports_range { "supported" } else { "not supported" });
-    eprintln!("  Output    : {}", output_path);
+    if !quiet {
+        eprintln!("  File size : {}", format_bytes(file_size));
+        eprintln!("  Range     : {}", if info.supports_range { "supported" } else { "not supported" });
+        eprintln!("  Output    : {}", output_path);
+    }
 
     let chunks = if info.supports_range && connections > 1 {
         plan_chunks_with_count(file_size, connections as u32)
@@ -48,21 +55,25 @@ pub async fn run_download(
         vec![Chunk { id: 1, start: 0, end: file_size - 1 }]
     };
 
-        if !info.supports_range {
+    if !info.supports_range {
         let meta_path = crate::resume::ResumeMetadata::meta_path(&output_path);
         let part_path = format!("{}.part", &output_path);
         let _ = std::fs::remove_file(&meta_path);
         let _ = std::fs::remove_file(&part_path);
     }
 
-    eprintln!("  Chunks    : {}", chunks.len());
-    eprintln!();
+    if !quiet {
+        eprintln!("  Chunks    : {}", chunks.len());
+        eprintln!();
+    }
 
     let start_time = Instant::now();
     let speed_samples: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> =
         std::sync::Mutex::new(std::collections::VecDeque::new());
 
     let progress_callback = move |downloaded: u64, total: u64| {
+        if quiet { return; }
+
         let elapsed_ms = start_time.elapsed().as_millis() as u64;
         let mut samples = speed_samples.lock().unwrap();
         samples.push_back((elapsed_ms, downloaded));
@@ -72,7 +83,7 @@ pub async fn run_download(
             samples.pop_front();
         }
 
-    let speed_bps = if samples.len() >= 2 {
+        let speed_bps = if samples.len() >= 2 {
             let oldest = samples.front().unwrap();
             let dt = (elapsed_ms - oldest.0) as f64 / 1000.0;
             let db = downloaded.saturating_sub(oldest.1) as f64;
@@ -92,22 +103,28 @@ pub async fn run_download(
         &retry_config, Some(progress_callback), cancel,
     ).await;
 
-    eprint!("\r\x1b[2K");
+    if !quiet {
+        eprint!("\r\x1b[2K");
+    }
 
     match download_result {
-                Ok(bytes) => {
-            let secs = start_time.elapsed().as_secs_f64();
-            let avg = if secs > 0.1 { (bytes as f64 / secs) as u64 } else { 0 };
-            eprintln!("  ✅ Download complete: {}", output_path);
-            eprintln!("  {} in {:.1}s ({})",
-                format_bytes(bytes), secs, format_speed(avg),
-            );
+        Ok(bytes) => {
+            if !quiet {
+                let secs = start_time.elapsed().as_secs_f64();
+                let avg = if secs > 0.1 { (bytes as f64 / secs) as u64 } else { 0 };
+                eprintln!("  ✅ Download complete: {}", output_path);
+                eprintln!("  {} in {:.1}s ({})",
+                    format_bytes(bytes), secs, format_speed(avg),
+                );
+            }
             Ok(())
         }
 
         Err(e) => {
-            eprintln!("  ❌ Download failed.");
-            eprintln!("  Progress saved. Resume by running the same command again.");
+            if !quiet {
+                eprintln!("  ❌ Download failed.");
+                eprintln!("  Progress saved. Resume by running the same command again.");
+            }
             Err(e)
         }
     }

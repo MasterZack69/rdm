@@ -3,11 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli;
 use crate::config::Config;
+
+// ── Types ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Status {
@@ -35,10 +40,14 @@ pub struct Queue {
 
 impl Default for Queue {
     fn default() -> Self {
-        Self { next_id: 1, items: Vec::new() }
+        Self {
+            next_id: 1,
+            items: Vec::new(),
+        }
     }
 }
 
+// ── Paths ──────────────────────────────────────────────────────────
 
 fn dir() -> PathBuf {
     crate::config::config_path()
@@ -47,11 +56,20 @@ fn dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn queue_file() -> PathBuf { dir().join("queue.json") }
-fn queue_lock_file() -> PathBuf { dir().join("queue.lock") }
-fn processor_lock_file() -> PathBuf { dir().join("processor.lock") }
-fn signal_file() -> PathBuf { dir().join("queue.signal") }
+fn queue_file() -> PathBuf {
+    dir().join("queue.json")
+}
+fn queue_lock_file() -> PathBuf {
+    dir().join("queue.lock")
+}
+fn processor_lock_file() -> PathBuf {
+    dir().join("processor.lock")
+}
+fn signal_file() -> PathBuf {
+    dir().join("queue.signal")
+}
 
+// ── PID Helpers ────────────────────────────────────────────────────
 
 fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
@@ -70,12 +88,13 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
-
 fn read_lock_pid(path: &PathBuf) -> Option<u32> {
     fs::read_to_string(path)
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
+
+// ── File Lock ──────────────────────────────────────────────────────
 
 pub struct FileLock {
     path: PathBuf,
@@ -100,25 +119,21 @@ impl FileLock {
                     return Ok(Self { path });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Only attempt stale removal a few times
                     if stale_removals < MAX_STALE_REMOVALS {
                         let is_stale = match read_lock_pid(&path) {
                             Some(pid) => !pid_alive(pid),
-                            None => {
-                                // Can't read PID — check age as last resort
-                                fs::metadata(&path)
-                                    .ok()
-                                    .and_then(|m| m.modified().ok())
-                                    .and_then(|t| t.elapsed().ok())
-                                    .map(|age| age > Duration::from_secs(86400))
-                                    .unwrap_or(false)
-                            }
+                            None => fs::metadata(&path)
+                                .ok()
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.elapsed().ok())
+                                .map(|age| age > Duration::from_secs(86400))
+                                .unwrap_or(false),
                         };
 
                         if is_stale {
                             let _ = fs::remove_file(&path);
                             stale_removals += 1;
-                            continue; // retry immediately
+                            continue;
                         }
                     }
 
@@ -126,7 +141,10 @@ impl FileLock {
                         std::thread::sleep(Duration::from_millis(100));
                     }
                 }
-                Err(e) => return Err(e).context(format!("Failed to acquire lock: {}", path.display())),
+                Err(e) => {
+                    return Err(e)
+                        .context(format!("Failed to acquire lock: {}", path.display()))
+                }
             }
         }
 
@@ -134,7 +152,9 @@ impl FileLock {
             "Could not acquire lock {} after {}ms — another rdm instance is running (PID: {})",
             path.display(),
             timeout_ms,
-            read_lock_pid(&path).map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+            read_lock_pid(&path)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".into()),
         )
     }
 
@@ -153,17 +173,17 @@ impl Drop for FileLock {
     }
 }
 
+// ── Atomic Write ───────────────────────────────────────────────────
+
 fn atomic_write(path: &PathBuf, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
 
     let mut f = fs::File::create(&tmp)
         .with_context(|| format!("Failed to create temp file: {}", tmp.display()))?;
 
-    f.write_all(data)
-        .context("Failed to write temp file")?;
+    f.write_all(data).context("Failed to write temp file")?;
 
-    f.sync_all()
-        .context("Failed to sync temp file")?;
+    f.sync_all().context("Failed to sync temp file")?;
 
     fs::rename(&tmp, path)
         .with_context(|| format!("Failed to rename {} → {}", tmp.display(), path.display()))?;
@@ -177,7 +197,7 @@ fn atomic_write(path: &PathBuf, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-// zack here, saying hi to readers.
+// ── Queue State ────────────────────────────────────────────────────
 
 impl Queue {
     fn load_inner() -> Self {
@@ -188,10 +208,8 @@ impl Queue {
     }
 
     fn save_inner(&self) -> Result<()> {
-        fs::create_dir_all(dir())
-            .context("Failed to create config directory")?;
-        let json = serde_json::to_string_pretty(self)
-            .context("Failed to serialize queue")?;
+        fs::create_dir_all(dir()).context("Failed to create config directory")?;
+        let json = serde_json::to_string_pretty(self).context("Failed to serialize queue")?;
         atomic_write(&queue_file(), json.as_bytes())
     }
 
@@ -229,9 +247,17 @@ impl Queue {
         self.items.len() < len
     }
 
+    pub fn clear_all(&mut self) -> usize {
+        let len = self.items.len();
+        self.items.clear();
+        self.next_id = 1;
+        len
+    }
+
     pub fn clear_finished(&mut self) -> usize {
         let len = self.items.len();
-        self.items.retain(|i| matches!(i.status, Status::Pending | Status::Downloading));
+        self.items
+            .retain(|i| matches!(i.status, Status::Pending | Status::Downloading));
         len - self.items.len()
     }
 
@@ -239,13 +265,6 @@ impl Queue {
         let len = self.items.len();
         self.items.retain(|i| i.status != Status::Pending);
         len - self.items.len()
-    }
-
-    pub fn clear_all(&mut self) -> usize {
-        let len = self.items.len();
-        self.items.clear();
-        self.next_id = 1;
-        len
     }
 
     pub fn retry_failed(&mut self) -> usize {
@@ -295,7 +314,10 @@ impl Queue {
     }
 
     pub fn pending_count(&self) -> usize {
-        self.items.iter().filter(|i| i.status == Status::Pending).count()
+        self.items
+            .iter()
+            .filter(|i| i.status == Status::Pending)
+            .count()
     }
 
     pub fn print_list(&self) {
@@ -306,16 +328,20 @@ impl Queue {
 
         eprintln!();
         eprintln!("  {:>4}  {:<16}  {}", "ID", "Status", "URL");
-        eprintln!("  {}  {}  {}",
-            "────", "────────────────", "───────────────────────────────────────────");
+        eprintln!(
+            "  {}  {}  {}",
+            "────",
+            "────────────────",
+            "───────────────────────────────────────────"
+        );
 
         for item in &self.items {
             let status = match &item.status {
-                Status::Pending          => "⏳ pending".to_string(),
-                Status::Downloading      => "⬇  downloading".to_string(),
-                Status::Complete         => "✅ complete".to_string(),
-                Status::Failed { .. }    => "❌ failed".to_string(),
-                Status::Skipped          => "⏭  skipped".to_string(),
+                Status::Pending => "⏳ pending".to_string(),
+                Status::Downloading => "⬇  downloading".to_string(),
+                Status::Complete => "✅ complete".to_string(),
+                Status::Failed { .. } => "❌ failed".to_string(),
+                Status::Skipped => "⏭  skipped".to_string(),
             };
 
             let url = if item.url.len() > 55 {
@@ -333,8 +359,13 @@ impl Queue {
             if let Some(ref o) = item.output {
                 eprintln!("                        → {}", o);
             }
-            if let Status::Failed { ref reason, attempts } = item.status {
-                eprintln!("                        error ({} attempt{}): {}",
+            if let Status::Failed {
+                ref reason,
+                attempts,
+            } = item.status
+            {
+                eprintln!(
+                    "                        error ({} attempt{}): {}",
                     attempts,
                     if attempts == 1 { "" } else { "s" },
                     reason,
@@ -343,15 +374,35 @@ impl Queue {
         }
 
         let pending = self.pending_count();
-        let complete = self.items.iter().filter(|i| i.status == Status::Complete).count();
-        let failed = self.items.iter().filter(|i| matches!(i.status, Status::Failed { .. })).count();
-        let skipped = self.items.iter().filter(|i| i.status == Status::Skipped).count();
+        let complete = self
+            .items
+            .iter()
+            .filter(|i| i.status == Status::Complete)
+            .count();
+        let failed = self
+            .items
+            .iter()
+            .filter(|i| matches!(i.status, Status::Failed { .. }))
+            .count();
+        let skipped = self
+            .items
+            .iter()
+            .filter(|i| i.status == Status::Skipped)
+            .count();
 
         eprintln!();
-        eprintln!("  {} total | {} pending | {} complete | {} failed | {} skipped",
-            self.items.len(), pending, complete, failed, skipped);
+        eprintln!(
+            "  {} total | {} pending | {} complete | {} failed | {} skipped",
+            self.items.len(),
+            pending,
+            complete,
+            failed,
+            skipped
+        );
     }
 }
+
+// ── Signals ────────────────────────────────────────────────────────
 
 pub fn send_signal(sig: &str) -> Result<()> {
     fs::create_dir_all(dir())?;
@@ -369,12 +420,15 @@ fn clear_signal() {
     let _ = fs::remove_file(signal_file());
 }
 
-pub async fn start(cfg: &Config, cancel: CancellationToken) -> Result<()> {
-    let _processor_lock = FileLock::processor()
-        .context("Another `rdm queue start` is already running")?;
+// ── Queue Processor ────────────────────────────────────────────────
+
+pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> Result<()> {
+    let _processor_lock =
+        FileLock::processor().context("Another `rdm queue start` is already running")?;
 
     clear_signal();
 
+    // Reset stale Downloading items from a previous crash
     Queue::locked(|q| {
         for item in &mut q.items {
             if item.status == Status::Downloading {
@@ -385,31 +439,96 @@ pub async fn start(cfg: &Config, cancel: CancellationToken) -> Result<()> {
     })?;
 
     let pending = Queue::load_readonly().pending_count();
-
     if pending == 0 {
         eprintln!("  Queue is empty — nothing to do.");
         return Ok(());
     }
 
-    eprintln!("  🚀 Queue started — {} item(s) pending", pending);
+    let parallel = parallel.max(1);
+    let quiet = parallel > 1;
+
+    if parallel > 1 {
+        eprintln!(
+            "  🚀 Queue started — {} item(s) pending, {} parallel",
+            pending, parallel
+        );
+    } else {
+        eprintln!("  🚀 Queue started — {} item(s) pending", pending);
+    }
     eprintln!();
 
-    let mut completed = 0u32;
-    let mut failed = 0u32;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel));
+    let completed = Arc::new(AtomicU32::new(0));
+    let failed = Arc::new(AtomicU32::new(0));
+    let position = Arc::new(AtomicU32::new(0));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let active_children: Arc<Mutex<Vec<(u64, CancellationToken)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    // Signal watcher — polls for skip/stop from another terminal
+    let watcher_cancel = cancel.clone();
+    let watcher_children = Arc::clone(&active_children);
+    let watcher_stop = Arc::clone(&stop_flag);
+    let watcher = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if watcher_cancel.is_cancelled() {
+                break;
+            }
+
+            match read_signal() {
+                Some(ref s) if s == "skip" => {
+                    clear_signal();
+                    let children = watcher_children.lock().await;
+                    for (id, token) in children.iter() {
+                        eprintln!("  ⏭  Skipping #{}", id);
+                        token.cancel();
+                    }
+                }
+                Some(ref s) if s == "stop" => {
+                    clear_signal();
+                    watcher_stop.store(true, Ordering::SeqCst);
+                    eprintln!("  ⏹  Stop signal — finishing active downloads...");
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     loop {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || stop_flag.load(Ordering::SeqCst) {
             break;
         }
 
-        if let Some(ref sig) = read_signal() {
-            if sig == "stop" {
-                clear_signal();
-                eprintln!("  ⏹  Stop signal received.");
+        // Clean up finished tasks
+        handles.retain(|h| !h.is_finished());
+
+        // Check for pending items
+        if Queue::load_readonly().pending_count() == 0 {
+            if handles.is_empty() {
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
         }
 
+        // Wait for a download slot
+        let permit = tokio::select! {
+            p = semaphore.clone().acquire_owned() => match p {
+                Ok(p) => p,
+                Err(_) => break,
+            },
+            _ = cancel.cancelled() => break,
+        };
+
+        if cancel.is_cancelled() || stop_flag.load(Ordering::SeqCst) {
+            drop(permit);
+            break;
+        }
+
+        // Atomically grab next pending + mark as Downloading
         let next = Queue::locked(|q| {
             match q.next_pending().cloned() {
                 Some(item) => {
@@ -422,128 +541,163 @@ pub async fn start(cfg: &Config, cancel: CancellationToken) -> Result<()> {
 
         let next = match next {
             Some(item) => item,
-            None => break,
+            None => {
+                drop(permit);
+                continue;
+            }
         };
 
-        let remaining = Queue::load_readonly().pending_count();
-        let position = completed + failed + 1;
-        let total = position + remaining as u32;
-
-        eprintln!("  ▶ [{}/{}] #{}: {}",
-            position,
-            total,
-            next.id,
-            cli::percent_decode(&next.url),
-        );
-
+        // Create child cancel token for this download
         let child = cancel.child_token();
+        {
+            let mut children = active_children.lock().await;
+            children.push((next.id, child.clone()));
+        }
 
-        let watcher_token = child.clone();
-        let watcher = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if watcher_token.is_cancelled() { break; }
-                match read_signal() {
-                    Some(ref s) if s == "skip" || s == "stop" => {
-                        watcher_token.cancel();
-                        break;
+        let cfg = cfg.clone();
+        let completed = Arc::clone(&completed);
+        let failed = Arc::clone(&failed);
+        let position = Arc::clone(&position);
+        let active_children = Arc::clone(&active_children);
+        let cancel_main = cancel.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = permit; // held until task completes
+            let item_id = next.id;
+
+            let pos = position.fetch_add(1, Ordering::Relaxed) + 1;
+            let name = next.url.rsplit('/').next().unwrap_or(&next.url);
+            eprintln!("  ▶ [{}] #{}: {}",
+                pos, item_id, cli::percent_decode(name));
+
+            // Resolve output path
+            let output = {
+                let raw_path = match &next.output {
+                    Some(o) => cli::percent_decode(o),
+                    None => {
+                        let raw = next.url
+                            .split('?')
+                            .next()
+                            .and_then(|p| p.rsplit('/').next())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("download.bin");
+                        cli::percent_decode(raw)
                     }
-                    _ => {}
+                };
+                let full_path = cfg.resolve_output_path(&raw_path);
+
+                if let Some(parent) = std::path::Path::new(&full_path).parent() {
+                    if !parent.exists() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                }
+
+                Some(full_path)
+            };
+
+            let result = cli::run_download(
+                next.url.clone(),
+                output,
+                next.connections.unwrap_or(cfg.connections),
+                child.clone(),
+                quiet,
+            )
+            .await;
+
+            // Remove from active children
+            {
+                let mut children = active_children.lock().await;
+                children.retain(|(id, _)| *id != item_id);
+            }
+
+            // Determine skip vs cancel
+            let was_skipped = child.is_cancelled() && !cancel_main.is_cancelled();
+
+            // Always write final status — even during Ctrl+C
+            let _ = Queue::locked(|q| {
+                if cancel_main.is_cancelled() {
+                    match &result {
+                        Ok(_) => q.set_status(item_id, Status::Complete),
+                        _ => q.set_status(item_id, Status::Pending),
+                    }
+                } else if was_skipped {
+                    q.set_status(item_id, Status::Skipped);
+                } else {
+                    match &result {
+                        Ok(_) => {
+                            q.set_status(item_id, Status::Complete);
+                        }
+                        Err(e) => {
+                            let prev_attempts =
+                                match q.items.iter().find(|i| i.id == item_id) {
+                                    Some(Item {
+                                        status: Status::Failed { attempts, .. },
+                                        ..
+                                    }) => *attempts,
+                                    _ => 0,
+                                };
+                            q.set_status(
+                                item_id,
+                                Status::Failed {
+                                    reason: format!("{:#}", e),
+                                    attempts: prev_attempts + 1,
+                                },
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            });
+
+            if cancel_main.is_cancelled() {
+                return;
+            }
+
+            if was_skipped {
+                eprintln!("  ⏭  #{}: skipped", item_id);
+            } else {
+                match &result {
+                    Ok(_) => {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        let name = next.url.rsplit('/').next().unwrap_or(&next.url);
+                        eprintln!("  ✅ #{}: {}", item_id, cli::percent_decode(name));
+                    }
+                    Err(e) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        let name = next.url.rsplit('/').next().unwrap_or(&next.url);
+                        eprintln!("  ❌ #{}: {} — {:#}", item_id, cli::percent_decode(name), e);
+                    }
                 }
             }
         });
 
-            let output = {
-            let raw_path = match &next.output {
-                Some(o) => cli::percent_decode(o),
-                None => {
-                    let raw = next.url.split('?').next()
-                        .and_then(|p| p.rsplit('/').next())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("download.bin");
-                    cli::percent_decode(raw)
-                }
-            };
+        handles.push(handle);
+    }
 
-            let full_path = cfg.resolve_output_path(&raw_path);
+    // Wait for all active downloads to finish
+    for handle in handles {
+        let _ = handle.await;
+    }
 
-            if let Some(parent) = std::path::Path::new(&full_path).parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-            }
+    watcher.abort();
 
-            Some(full_path)
-        };
-
-        let result = cli::run_download(
-            next.url.clone(),
-            output,
-            next.connections.unwrap_or(cfg.connections),
-            child.clone(),
-        ).await;
-
-        watcher.abort();
-
-        // Ctrl+C — mark pending, save, exit
-        if cancel.is_cancelled() {
-            Queue::locked(|q| {
-                q.set_status(next.id, Status::Pending);
-                Ok(())
-            })?;
-            eprintln!();
-            eprintln!("  ⚠ Queue interrupted — progress saved. Run `rdm queue start` to resume.");
-            break;
-        }
-
-        let was_skipped = child.is_cancelled();
-        let should_stop = read_signal().map(|s| s == "stop").unwrap_or(false);
-        clear_signal();
-
-        // Locked: update final status
-        Queue::locked(|q| {
-            if was_skipped {
-                q.set_status(next.id, Status::Skipped);
-            } else {
-                match &result {
-                    Ok(_) => {
-                        q.set_status(next.id, Status::Complete);
-                    }
-                    Err(e) => {
-                        let prev_attempts = match q.items.iter().find(|i| i.id == next.id) {
-                            Some(Item { status: Status::Failed { attempts, .. }, .. }) => *attempts,
-                            _ => 0,
-                        };
-                        q.set_status(next.id, Status::Failed {
-                            reason: format!("{:#}", e),
-                            attempts: prev_attempts + 1,
-                        });
-                    }
+    // Ctrl+C — catch any truly orphaned tasks
+    if cancel.is_cancelled() {
+        let _ = Queue::locked(|q| {
+            for item in &mut q.items {
+                if item.status == Status::Downloading {
+                    item.status = Status::Pending;
                 }
             }
             Ok(())
-        })?;
-
-        if was_skipped {
-            eprintln!("  ⏭  Skipped #{}", next.id);
-        } else {
-            match &result {
-                Ok(_) => completed += 1,
-                Err(e) => {
-                    failed += 1;
-                    eprintln!("  ❌ #{} failed: {:#}", next.id, e);
-                }
-            }
-        }
-
+        });
         eprintln!();
-
-        if should_stop {
-            eprintln!("  ⏹  Stop signal received.");
-            break;
-        }
+        eprintln!("  ⚠ Queue interrupted — progress saved. Run `rdm queue start` to resume.");
     }
 
-    eprintln!("  Done. {} completed, {} failed.", completed, failed);
+    let c = completed.load(Ordering::Relaxed);
+    let f = failed.load(Ordering::Relaxed);
+    eprintln!();
+    eprintln!("  Done. {} completed, {} failed.", c, f);
     Ok(())
 }
