@@ -31,7 +31,6 @@ pub async fn run_download(
     let client = reqwest::Client::builder()
         .user_agent("rdm")
         .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(30))
         .build()
         .context("Failed to build HTTP client")?;
 
