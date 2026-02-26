@@ -11,4 +11,7 @@ connections = 12
 
 # Default download directory
 download_dir = "~/Downloads"
+
+# Max Retries?
+max_retries = 69
 ```
