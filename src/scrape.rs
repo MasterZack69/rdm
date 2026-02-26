@@ -22,6 +22,13 @@ pub async fn discover_files(url: &str) -> Result<Option<Vec<DiscoveredFile>>> {
 
     let base_url = ensure_trailing_slash(url);
 
+    let folder_name = base_url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download");
+    let folder_name = cli::percent_decode(folder_name);
+
     let mut files: Vec<DiscoveredFile> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<(String, u32)> = VecDeque::new();
@@ -57,6 +64,8 @@ pub async fn discover_files(url: &str) -> Result<Option<Vec<DiscoveredFile>>> {
             if !is_safe_relative_path(&relative) {
                 continue;
             }
+
+            let relative = format!("{}/{}", folder_name, relative);
 
             files.push(DiscoveredFile { url: file_url, relative_path: relative });
 
