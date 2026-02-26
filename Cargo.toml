@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.13", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "stream", "charset", "http2", "json"] }
 anyhow = "1"
 futures-util = "0.3"
 tokio-util = "0.7"
