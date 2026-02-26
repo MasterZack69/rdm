@@ -118,12 +118,14 @@ fn main() -> Result<()> {
                         .clone();
                     let (output, connections) = parse_download_args(&args[4..]);
 
-                    let files = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?
-                        .block_on(scrape::discover_files(&url));
-
-                    let is_dir = looks_like_directory(&url);
+                    let files = if looks_like_directory(&url) {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?
+                            .block_on(scrape::discover_files(&url))
+                    } else {
+                        Ok(None)
+                    };
 
                     match files {
                         Ok(Some(urls)) => {
@@ -149,7 +151,7 @@ fn main() -> Result<()> {
                             eprintln!("  {} item(s) pending.", q.pending_count());
                             Ok(())
                         }
-                        Ok(None) if is_dir => {
+                        Ok(None) if looks_like_directory(&url) => {
                             eprintln!(
                                 "  📁 No files found in: {}",
                                 cli::percent_decode(&url)
@@ -322,9 +324,8 @@ fn main() -> Result<()> {
                     let cancel = CancellationToken::new();
                     let sh = signal::spawn_signal_handler(cancel.clone());
 
-                    if output.is_none() {
-                        let is_dir = looks_like_directory(&url);
-
+                    // Only attempt directory scan if it looks like a directory
+                    if output.is_none() && looks_like_directory(&url) {
                         match scrape::discover_files(&url).await {
                             Ok(Some(files)) => {
                                 eprintln!("  📁 Found {} file(s):", files.len());
@@ -353,12 +354,12 @@ fn main() -> Result<()> {
                                 sh.abort();
                                 return result;
                             }
-                            Ok(None) if is_dir => {
+                            Ok(None) => {
                                 eprintln!("  📁 No files found in: {}", &url);
                                 sh.abort();
                                 return Ok(());
                             }
-                            _ => {} // not a directory — fall through to single file
+                            _ => {} // scrape failed — fall through to single file
                         }
                     }
 
@@ -398,7 +399,7 @@ fn main() -> Result<()> {
                 "  rdm download <URL> [-o name] [-c N]    Download with options"
             );
             eprintln!(
-                "  rdm queue <command>                     Manage download queue"
+                "  rdm queue <command>                    Manage download queue"
             );
             eprintln!(
                 "  rdm config                             Show configuration"
