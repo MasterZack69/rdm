@@ -1,5 +1,5 @@
-mod chunk;
 mod cli;
+mod chunk;
 mod config;
 mod inspect;
 mod parallel;
@@ -9,6 +9,7 @@ mod resume;
 mod retry;
 mod scrape;
 mod signal;
+mod sync;
 
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
@@ -47,6 +48,10 @@ fn parse_parallel_flag(args: &[String]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn parse_delete_flag(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--delete" || a == "-d")
 }
 
 fn looks_like_directory(url: &str) -> bool {
@@ -97,6 +102,29 @@ fn main() -> Result<()> {
                     let result =
                         cli::run_download(url, Some(output_path), connections, cancel, false)
                             .await;
+                    sh.abort();
+                    result
+                })
+        }
+
+        Some("sync") => {
+            let url = args
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("Usage: rdm sync <URL> [-c N] [-p N] [--delete]"))?
+                .clone();
+            let (_, connections) = parse_download_args(&args[3..]);
+            let connections = connections.unwrap_or(cfg.connections);
+            let parallel = parse_parallel_flag(&args[3..]).unwrap_or(cfg.queue_parallel);
+            let delete = parse_delete_flag(&args[3..]);
+
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(async {
+                    let cancel = CancellationToken::new();
+                    let sh = signal::spawn_signal_handler(cancel.clone());
+                    let result =
+                        sync::run(&cfg, &url, connections, parallel, delete, cancel).await;
                     sh.abort();
                     result
                 })
@@ -324,7 +352,6 @@ fn main() -> Result<()> {
                     let cancel = CancellationToken::new();
                     let sh = signal::spawn_signal_handler(cancel.clone());
 
-                    // Only attempt directory scan if it looks like a directory
                     if output.is_none() && looks_like_directory(&url) {
                         match scrape::discover_files(&url).await {
                             Ok(Some(files)) => {
@@ -363,7 +390,6 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    // Single file download
                     let output_filename = output.unwrap_or_else(|| {
                         let raw = url
                             .split('?')
@@ -393,41 +419,49 @@ fn main() -> Result<()> {
             eprintln!();
             eprintln!("Usage:");
             eprintln!(
-                "  rdm <URL>                              Quick download"
+                "  rdm <URL>                                Quick download"
             );
             eprintln!(
-                "  rdm download <URL> [-o name] [-c N]    Download with options"
+                "  rdm download <URL> [-o name] [-c N]      Download with options"
             );
             eprintln!(
-                "  rdm queue <command>                    Manage download queue"
+                "  rdm sync <URL> [-c N] [-p N] [--delete]  Sync remote → local"
             );
             eprintln!(
-                "  rdm config                             Show configuration"
+                "  rdm queue <command>                      Manage download queue"
+            );
+            eprintln!(
+                "  rdm config                               Show configuration"
             );
             eprintln!();
             eprintln!("Queue commands:");
             eprintln!(
-                "  rdm queue add <URL> [-o name] [-c N]   Add to queue"
+                "  rdm queue add <URL> [-o name] [-c N]     Add to queue"
             );
             eprintln!(
-                "  rdm queue list                         Show queue"
+                "  rdm queue list                           Show queue"
             );
             eprintln!(
-                "  rdm queue start [-p N]                 Start processing"
+                "  rdm queue start [-p N]                   Start processing"
             );
             eprintln!(
-                "  rdm queue stop / skip                  Live control"
+                "  rdm queue stop / skip                    Live control"
             );
             eprintln!();
             eprintln!("Options:");
             eprintln!(
-                "  -c, --connections N   Connections per file (default: {})",
+                "  -c, --connections N    Connections per file (default: {})",
                 cfg.connections
             );
-            eprintln!("  -o, --output FILE     Output filename");
             eprintln!(
-                "  -p, --parallel N      Parallel queue downloads (default: {})",
+                "  -o, --output FILE      Output filename"
+            );
+            eprintln!(
+                "  -p, --parallel N       Parallel queue downloads (default: {})",
                 cfg.queue_parallel
+            );
+            eprintln!(
+                "  -d, --delete           Sync: remove local files not on remote"
             );
             eprintln!();
             eprintln!("Config: {}", config::config_path().display());

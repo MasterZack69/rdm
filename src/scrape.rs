@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use crate::cli;
 
@@ -12,6 +14,7 @@ pub async fn discover_files(url: &str) -> Result<Option<Vec<DiscoveredFile>>> {
     const MAX_DEPTH: u32 = 10;
     const MAX_DIRS: usize = 500;
     const MAX_FILES: usize = 10_000;
+    const CONCURRENCY: usize = 8;
 
     let client = reqwest::Client::builder()
         .user_agent("rdm")
@@ -31,60 +34,83 @@ pub async fn discover_files(url: &str) -> Result<Option<Vec<DiscoveredFile>>> {
 
     let mut files: Vec<DiscoveredFile> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+    let mut current_level: Vec<(String, u32)> = vec![(base_url.clone(), 0)];
+    let sem = Arc::new(Semaphore::new(CONCURRENCY));
 
-    queue.push_back((base_url.clone(), 0));
+    while !current_level.is_empty() {
+        let mut tasks = tokio::task::JoinSet::new();
 
-    while let Some((dir_url, depth)) = queue.pop_front() {
-        if depth > MAX_DEPTH || !visited.insert(dir_url.clone()) {
-            continue;
-        }
-
-        eprintln!("  📂 Scanning {}",
-            cli::percent_decode(dir_url.strip_prefix(&base_url).unwrap_or(&dir_url))
-                .trim_end_matches('/')
-                .split('/')
-                .last()
-                .map(|s| if s.is_empty() { &dir_url } else { s })
-                .unwrap_or(&dir_url),
-        );
-
-        let (found_files, found_dirs) = match fetch_directory(&client, &dir_url).await {
-            Ok(Some(r)) => r,
-            Ok(None) => continue,
-            Err(_) => continue,
-        };
-
-        for file_url in found_files {
-            let relative = file_url
-                .strip_prefix(&base_url)
-                .unwrap_or(&file_url)
-                .to_string();
-
-            if !is_safe_relative_path(&relative) {
+        for (dir_url, depth) in current_level.drain(..) {
+            if depth > MAX_DEPTH || !visited.insert(dir_url.clone()) {
                 continue;
             }
 
-            let relative = format!("{}/{}", folder_name, relative);
+            if visited.len() > MAX_DIRS {
+                eprintln!("   ⚠ Directory limit reached ({}), stopping scan", MAX_DIRS);
+                break;
+            }
 
-            files.push(DiscoveredFile { url: file_url, relative_path: relative });
+            let label = cli::percent_decode(
+                dir_url.strip_prefix(&base_url).unwrap_or(&dir_url)
+            )
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .map(|s| if s.is_empty() { dir_url.clone() } else { s.to_string() })
+            .unwrap_or_else(|| dir_url.clone());
 
-            if files.len() >= MAX_FILES {
-                eprintln!("   ⚠ File limit reached ({}), stopping scan", MAX_FILES);
-                return Ok(Some(files));
+            eprintln!("  📂 Scanning {}", label);
+
+            let client = client.clone();
+            let sem = sem.clone();
+
+            tasks.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let result = fetch_directory(&client, &dir_url).await;
+                (result, depth)
+            });
+        }
+
+        let mut next_level: Vec<(String, u32)> = Vec::new();
+
+        while let Some(joined) = tasks.join_next().await {
+            let (result, depth) = match joined {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let (found_files, found_dirs) = match result {
+                Ok(Some(r)) => r,
+                _ => continue,
+            };
+
+            for file_url in found_files {
+                let relative = file_url
+                    .strip_prefix(&base_url)
+                    .unwrap_or(&file_url)
+                    .to_string();
+
+                if !is_safe_relative_path(&relative) {
+                    continue;
+                }
+
+                let relative = format!("{}/{}", folder_name, relative);
+                files.push(DiscoveredFile { url: file_url, relative_path: relative });
+
+                if files.len() >= MAX_FILES {
+                    eprintln!("   ⚠ File limit reached ({}), stopping scan", MAX_FILES);
+                    return Ok(Some(files));
+                }
+            }
+
+            for sub_dir in found_dirs {
+                if !visited.contains(&sub_dir) {
+                    next_level.push((sub_dir, depth + 1));
+                }
             }
         }
 
-        if visited.len() > MAX_DIRS {
-            eprintln!("   ⚠ Directory limit reached ({}), stopping scan", MAX_DIRS);
-            break;
-        }
-
-        for sub_dir in found_dirs {
-            if !visited.contains(&sub_dir) {
-                queue.push_back((sub_dir, depth + 1));
-            }
-        }
+        current_level = next_level;
     }
 
     if files.is_empty() {
@@ -97,19 +123,15 @@ pub async fn discover_files(url: &str) -> Result<Option<Vec<DiscoveredFile>>> {
 
 fn is_safe_relative_path(path: &str) -> bool {
     let decoded = crate::cli::percent_decode(path);
-
     if decoded.is_empty() {
         return false;
     }
-
     if decoded.starts_with('/') {
         return false;
     }
-
     if decoded.split('/').any(|c| c == "..") {
         return false;
     }
-
     true
 }
 

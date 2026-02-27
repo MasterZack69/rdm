@@ -12,8 +12,6 @@ use tokio_util::sync::CancellationToken;
 use crate::cli;
 use crate::config::Config;
 
-// ── Types ──────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Status {
     Pending,
@@ -319,6 +317,10 @@ impl Queue {
             .filter(|i| i.status == Status::Pending)
             .count()
     }
+
+    pub fn failed_count(&self) -> usize {
+    self.items.iter().filter(|i| matches!(i.status, Status::Failed { .. })).count()
+}
 
     pub fn print_list(&self) {
         if self.items.is_empty() {
