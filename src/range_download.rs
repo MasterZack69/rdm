@@ -5,9 +5,8 @@ use std::io::SeekFrom;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio_util::sync::CancellationToken;
-use tokio::io::BufWriter;
 
 use crate::retry::{is_transient_status, TransientError};
 
@@ -43,28 +42,28 @@ pub async fn download_range(
     let range_value = format!("bytes={}-{}", effective_start, end);
 
     let response = tokio::select! {
-    biased;
+        biased;
 
-    _ = cancel.cancelled() => {
-        return Ok(DownloadStatus::Cancelled {
-            bytes_on_disk: resume_from
-        });
-    }
+        _ = cancel.cancelled() => {
+            return Ok(DownloadStatus::Cancelled {
+                bytes_on_disk: resume_from
+            });
+        }
 
-    result = client
-        .get(url)
-        .header(header::RANGE, &range_value)
-        .send() =>
-    {
-        result.with_context(|| format!("Range GET failed for {}", range_value))?
-    }
-};
+        result = client
+            .get(url)
+            .header(header::RANGE, &range_value)
+            .send() =>
+        {
+            result.with_context(|| format!("Range GET failed for {}", range_value))?
+        }
+    };
 
-        let status = response.status();
+    let status = response.status();
 
     if status == StatusCode::OK && effective_start == 0 {
         // Server doesn't support ranges but we're downloading from the start.
-    } else if status == StatusCode::OK && effective_start > 0 { 
+    } else if status == StatusCode::OK && effective_start > 0 {
         anyhow::bail!(
             "Server does not support range requests — cannot resume from byte {}",
             effective_start,
@@ -84,14 +83,14 @@ pub async fn download_range(
         validate_content_range(response.headers(), effective_start, end)?;
     }
 
-        let file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(file_path)
         .await
         .with_context(|| format!("Failed to open file: {}", file_path))?;
 
-    let mut file = BufWriter::with_capacity(256 * 1024, file);
+    let mut file = BufWriter::with_capacity(512 * 1024, file);
 
     file.seek(SeekFrom::Start(effective_start))
         .await
@@ -100,73 +99,70 @@ pub async fn download_range(
     let mut stream = response.bytes_stream();
     let mut bytes_written: u64 = 0;
     let mut bytes_since_flush: u64 = 0;
+    let mut reads_since_cancel_check: u32 = 0;
 
     loop {
-        tokio::select! {
-            biased;
-
-            _ = cancel.cancelled() => {
+        if reads_since_cancel_check >= 64 {
+            reads_since_cancel_check = 0;
+            if cancel.is_cancelled() {
                 file.flush().await.ok();
                 chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
                 return Ok(DownloadStatus::Cancelled {
                     bytes_on_disk: resume_from + bytes_written,
                 });
             }
+        }
 
-            chunk_opt = stream.next() => {
-                match chunk_opt {
-                    Some(Ok(data)) => {
-                        let data_len = data.len() as u64;
+        match stream.next().await {
+            Some(Ok(data)) => {
+                reads_since_cancel_check += 1;
+                let data_len = data.len() as u64;
 
-                        if bytes_written + data_len > expected_len {
-                            file.flush().await.ok();
-                            chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
-                            drop(stream);
-                            anyhow::bail!(
-                                "Server sent excess data for range {}: expected {} bytes, got at least {}",
-                                range_value, expected_len, bytes_written + data_len,
-                            );
-                        }
+                if bytes_written + data_len > expected_len {
+                    file.flush().await.ok();
+                    chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
+                    drop(stream);
+                    anyhow::bail!(
+                        "Server sent excess data for range {}: expected {} bytes, got at least {}",
+                        range_value, expected_len, bytes_written + data_len,
+                    );
+                }
 
-                        file.write_all(&data)
-                            .await
-                            .with_context(|| {
-                                format!("Write failed at offset {} in {}", effective_start + bytes_written, file_path)
-                            })?;
+                file.write_all(&data)
+                    .await
+                    .with_context(|| {
+                        format!("Write failed at offset {} in {}", effective_start + bytes_written, file_path)
+                    })?;
 
-                        bytes_written += data_len;
-                        bytes_since_flush += data_len;
+                bytes_written += data_len;
+                bytes_since_flush += data_len;
 
-                        // Flush every 1MB to limit data loss on hard kill
-                        if bytes_since_flush >= 1024 * 1024 {
-                            file.flush().await.with_context(|| {
-                                format!("Periodic flush failed at offset {}", effective_start + bytes_written)
-                            })?;
-                            bytes_since_flush = 0;
-                        }
+                if bytes_since_flush >= 4 * 1024 * 1024 {
+                    file.flush().await.with_context(|| {
+                        format!("Periodic flush failed at offset {}", effective_start + bytes_written)
+                    })?;
+                    bytes_since_flush = 0;
+                }
 
-                        chunk_progress.store(resume_from + bytes_written, Ordering::Relaxed);
-                        if let Some(ref gp) = global_progress {
-                            gp.fetch_add(data_len, Ordering::Relaxed);
-                        }
-                    }
-
-                    Some(Err(e)) => {
-                        file.flush().await.ok();
-                        chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
-                        return Err(e).context(format!(
-                            "Stream error at byte {} of range {}", bytes_written, range_value,
-                        ));
-                    }
-
-                    None => break,
+                chunk_progress.store(resume_from + bytes_written, Ordering::Relaxed);
+                if let Some(ref gp) = global_progress {
+                    gp.fetch_add(data_len, Ordering::Relaxed);
                 }
             }
+
+            Some(Err(e)) => {
+                file.flush().await.ok();
+                chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
+                return Err(e).context(format!(
+                    "Stream error at byte {} of range {}", bytes_written, range_value,
+                ));
+            }
+
+            None => break,
         }
     }
 
     file.flush().await.context("Failed to flush file after range write")?;
-
 
     if bytes_written != expected_len {
         chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
@@ -187,7 +183,7 @@ fn validate_content_range(headers: &header::HeaderMap, expected_start: u64, expe
         .with_context(|| format!("Unexpected Content-Range format: '{}'", value))?;
 
     let (range_part, _) = rest.split_once('/')
-    .with_context(|| format!("Content-Range missing '/': '{}'", value))?;
+        .with_context(|| format!("Content-Range missing '/': '{}'", value))?;
 
     let dash = range_part.find('-').with_context(|| format!("Content-Range missing '-': '{}'", value))?;
 
@@ -248,4 +244,3 @@ mod tests {
         assert!(validate_content_range(&h, 0, 99).is_err());
     }
 }
-
