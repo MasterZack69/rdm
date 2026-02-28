@@ -1,6 +1,11 @@
 use anyhow::{Context, Result};
+use reqwest::header::CONTENT_LENGTH;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli;
@@ -14,6 +19,7 @@ pub async fn run(
     connections: usize,
     parallel: usize,
     delete: bool,
+    ext_filter: Option<HashSet<String>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     {
@@ -44,6 +50,35 @@ pub async fn run(
         return Ok(());
     }
 
+    let total_before_filter = files.len();
+
+    let files: Vec<scrape::DiscoveredFile> = match &ext_filter {
+        Some(exts) => files
+            .into_iter()
+            .filter(|f| {
+                let name = extract_filename(&f.relative_path).to_lowercase();
+                file_has_ext(&name, exts)
+            })
+            .collect(),
+        None => files,
+    };
+
+    if let Some(exts) = ext_filter.as_ref() {
+        let mut sorted: Vec<&str> = exts.iter().map(|s| s.as_str()).collect();
+        sorted.sort();
+        eprintln!(
+            "  🔎 Filter: {} → {} file(s) matching .{}",
+            total_before_filter,
+            files.len(),
+            sorted.join(", ."),
+        );
+    }
+
+    if files.is_empty() {
+        eprintln!("  ❌ No files match the extension filter");
+        return Ok(());
+    }
+
     let remote_decoded: HashSet<String> = files
         .iter()
         .map(|f| cli::percent_decode(&f.relative_path))
@@ -66,20 +101,69 @@ pub async fn run(
 
     eprintln!("  🔍 Checking {} file(s)...", files.len());
 
-    let mut to_download: Vec<(String, String, Option<PathBuf>)> = Vec::new();
-    let mut up_to_date = 0u64;
+    let mut needs_head: Vec<(String, String, PathBuf, u64)> = Vec::new();
+    let mut to_download: Vec<(String, String)> = Vec::new();
 
     for f in &files {
-        let paths = candidate_paths(cfg, &f.relative_path);
-        match find_existing(&paths) {
-            Some((_, size)) if size > 0 => {
-                up_to_date += 1;
+        let path = local_path(cfg, &f.relative_path);
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() && m.len() > 0 => {
+                needs_head.push((f.url.clone(), f.relative_path.clone(), path, m.len()));
             }
-            Some((path, _)) => {
-                to_download.push((f.url.clone(), f.relative_path.clone(), Some(path)));
+            _ => {
+                to_download.push((f.url.clone(), f.relative_path.clone()));
             }
-            None => {
-                to_download.push((f.url.clone(), f.relative_path.clone(), None));
+        }
+    }
+
+    let mut up_to_date = 0u64;
+
+    if !needs_head.is_empty() {
+        eprintln!("  📡 Verifying {} existing file(s)...", needs_head.len());
+
+        let client = reqwest::Client::builder()
+            .user_agent("rdm")
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("Failed to build HTTP client")?;
+
+        let sem = Arc::new(Semaphore::new(8));
+        let mut tasks = JoinSet::new();
+
+        for (file_url, relative, path, size) in needs_head {
+            let client = client.clone();
+            let sem = sem.clone();
+            let cancel = cancel.clone();
+
+            tasks.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                if cancel.is_cancelled() {
+                    return None;
+                }
+                let status = head_compare(&client, &file_url, size).await;
+                Some((file_url, relative, path, status))
+            });
+        }
+
+        while let Some(joined) = tasks.join_next().await {
+            if cancel.is_cancelled() {
+                tasks.abort_all();
+                eprintln!("  ⚠ Cancelled during verification.");
+                return Ok(());
+            }
+            let (file_url, relative, _path, status) =
+                match joined.context("Task panicked")? {
+                    Some(v) => v,
+                    None => continue,
+                };
+            match status {
+                HeadStatus::UpToDate | HeadStatus::HeadFailed => {
+                    up_to_date += 1;
+                }
+                HeadStatus::SizeMismatch | HeadStatus::NoContentLength => {
+                    to_download.push((file_url, relative));
+                }
             }
         }
     }
@@ -91,7 +175,13 @@ pub async fn run(
         if let SyncRoot::Ok(ref root) = sync_root_result {
             let root_path = Path::new(root);
             if root_path.is_dir() {
-                collect_orphan_files(root_path, root_path, &remote_decoded, &mut to_delete);
+                collect_orphan_files(
+                    root_path,
+                    root_path,
+                    &remote_decoded,
+                    &ext_filter,
+                    &mut to_delete,
+                );
                 to_delete.sort();
             }
         }
@@ -113,7 +203,7 @@ pub async fn run(
 
     if !to_download.is_empty() {
         eprintln!();
-        for (_, relative, _) in &to_download {
+        for (_, relative) in &to_download {
             eprintln!("     + {}", cli::percent_decode(relative));
         }
     }
@@ -128,26 +218,25 @@ pub async fn run(
     eprintln!();
 
     if !to_download.is_empty() {
-        for (_, _, local_path) in &to_download {
-            if let Some(p) = local_path {
-                let _ = std::fs::remove_file(p);
-                let _ = std::fs::remove_file(format!("{}.part", p.display()));
-                let meta = crate::resume::ResumeMetadata::meta_path(&p.to_string_lossy());
-                let _ = std::fs::remove_file(&meta);
-            }
+        for (_, relative) in &to_download {
+            let path = local_path(cfg, relative);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}.part", path.display()));
+            let meta = crate::resume::ResumeMetadata::meta_path(&path.to_string_lossy());
+            let _ = std::fs::remove_file(&meta);
         }
 
-        for (_, relative, _) in &to_download {
-            let decoded = cli::percent_decode(relative);
-            let local_path = cfg.resolve_output_path(&decoded);
-            if let Some(parent) = Path::new(&local_path).parent() {
+        for (_, relative) in &to_download {
+            let path = local_path(cfg, relative);
+            if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
         }
 
         queue::Queue::locked(|q| {
-            for (file_url, relative, _) in &to_download {
-                q.add(file_url.clone(), Some(relative.clone()), Some(connections));
+            for (file_url, relative) in &to_download {
+                let decoded = cli::percent_decode(relative);
+                q.add(file_url.clone(), Some(decoded), Some(connections));
             }
             Ok(())
         })?;
@@ -169,7 +258,10 @@ pub async fn run(
 
         let q = queue::Queue::load_readonly();
         if q.failed_count() > 0 {
-            eprintln!("  ⚠ {} download(s) failed — skipping delete phase.", q.failed_count());
+            eprintln!(
+                "  ⚠ {} download(s) failed — skipping delete phase.",
+                q.failed_count()
+            );
             return Ok(());
         }
     }
@@ -186,7 +278,9 @@ pub async fn run(
             if to_delete.len() > 10 && pct > 50.0 {
                 eprintln!(
                     "  ⚠ Warning: about to delete {} of {} local files ({:.0}%)",
-                    to_delete.len(), total_local, pct,
+                    to_delete.len(),
+                    total_local,
+                    pct,
                 );
                 eprintln!("    This usually means the remote listing is incomplete.");
                 eprint!("    Continue? [y/N]: ");
@@ -208,7 +302,8 @@ pub async fn run(
                 match std::fs::remove_file(&full_path) {
                     Ok(_) => {
                         deleted += 1;
-                        let _ = std::fs::remove_file(format!("{}.part", full_path.display()));
+                        let _ =
+                            std::fs::remove_file(format!("{}.part", full_path.display()));
                         let meta = crate::resume::ResumeMetadata::meta_path(
                             &full_path.to_string_lossy(),
                         );
@@ -235,30 +330,31 @@ pub async fn run(
     Ok(())
 }
 
+enum HeadStatus {
+    UpToDate,
+    SizeMismatch,
+    HeadFailed,
+    NoContentLength,
+}
+
 enum SyncRoot {
     Ok(String),
     Empty,
     MixedRoots,
 }
 
-fn candidate_paths(cfg: &Config, relative: &str) -> Vec<PathBuf> {
-    let decoded_relative = cli::percent_decode(relative);
-    let filename_encoded = extract_filename(relative);
-    let filename_decoded = cli::percent_decode(&filename_encoded);
-
-    let mut paths: Vec<PathBuf> = vec![
-        PathBuf::from(cfg.resolve_output_path(&decoded_relative)),
-        PathBuf::from(cfg.resolve_output_path(&filename_decoded)),
-        PathBuf::from(cfg.resolve_output_path(relative)),
-        PathBuf::from(cfg.resolve_output_path(&filename_encoded)),
-    ];
-    paths.sort();
-    paths.dedup();
-    paths
+fn local_path(cfg: &Config, relative: &str) -> PathBuf {
+    let decoded = cli::percent_decode(relative);
+    PathBuf::from(cfg.resolve_output_path(&decoded))
 }
 
 fn extract_filename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+fn file_has_ext(filename: &str, exts: &HashSet<String>) -> bool {
+    let lower = filename.to_lowercase();
+    exts.iter().any(|ext| lower.ends_with(&format!(".{}", ext)))
 }
 
 fn find_existing(paths: &[PathBuf]) -> Option<(PathBuf, u64)> {
@@ -272,6 +368,27 @@ fn find_existing(paths: &[PathBuf]) -> Option<(PathBuf, u64)> {
     None
 }
 
+async fn head_compare(
+    client: &reqwest::Client,
+    url: &str,
+    local_size: u64,
+) -> HeadStatus {
+    let resp = match client.head(url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return HeadStatus::HeadFailed,
+    };
+    let remote_size = resp
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    match remote_size {
+        Some(rs) if rs == local_size => HeadStatus::UpToDate,
+        Some(_) => HeadStatus::SizeMismatch,
+        None => HeadStatus::NoContentLength,
+    }
+}
+
 fn derive_sync_root(cfg: &Config, files: &[scrape::DiscoveredFile]) -> SyncRoot {
     let first = match files.first() {
         Some(f) => f,
@@ -281,7 +398,10 @@ fn derive_sync_root(cfg: &Config, files: &[scrape::DiscoveredFile]) -> SyncRoot 
         Some(p) if !p.is_empty() => p,
         _ => return SyncRoot::Empty,
     };
-    if files.iter().any(|f| f.relative_path.split('/').next() != Some(prefix)) {
+    if files
+        .iter()
+        .any(|f| f.relative_path.split('/').next() != Some(prefix))
+    {
         return SyncRoot::MixedRoots;
     }
     let decoded_prefix = cli::percent_decode(prefix);
@@ -292,6 +412,7 @@ fn collect_orphan_files(
     dir: &Path,
     base: &Path,
     remote_decoded: &HashSet<String>,
+    ext_filter: &Option<HashSet<String>>,
     out: &mut Vec<String>,
 ) {
     let entries = match std::fs::read_dir(dir) {
@@ -306,8 +427,17 @@ fn collect_orphan_files(
             }
         }
         if path.is_dir() {
-            collect_orphan_files(&path, base, remote_decoded, out);
+            collect_orphan_files(&path, base, remote_decoded, ext_filter, out);
         } else if path.is_file() {
+            if let Some(exts) = ext_filter.as_ref() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if !file_has_ext(name, exts) {
+                    continue;
+                }
+            }
             let relative = match path.strip_prefix(base) {
                 Ok(r) => r.to_string_lossy().to_string().replace('\\', "/"),
                 Err(_) => continue,

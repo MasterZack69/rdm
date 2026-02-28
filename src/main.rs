@@ -12,6 +12,8 @@ mod signal;
 mod sync;
 
 use anyhow::Result;
+use std::collections::HashSet;
+use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 fn parse_download_args(args: &[String]) -> (Option<String>, Option<usize>) {
@@ -54,6 +56,54 @@ fn parse_delete_flag(args: &[String]) -> bool {
     args.iter().any(|a| a == "--delete" || a == "-d")
 }
 
+fn parse_ext_filter(args: &[String]) -> Option<HashSet<String>> {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ext" | "-e" => {
+                return args.get(i + 1).map(|v| {
+                    v.split(',')
+                        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                        .filter(|e| !e.is_empty())
+                        .collect()
+                });
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn resolve_output(output: Option<String>, url: &str, cfg: &config::Config) -> String {
+    let filename_from_url = || -> String {
+        let name = url
+            .split('?')
+            .next()
+            .unwrap_or(url)
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("download.bin");
+        cli::percent_decode(name)
+    };
+
+    match output {
+        Some(o) => {
+            let path = Path::new(&o);
+            if o.ends_with('/') || o.ends_with('\\') || path.is_dir() {
+                let dir = o.trim_end_matches('/').trim_end_matches('\\');
+                format!("{}/{}", dir, filename_from_url())
+            } else if path.is_absolute() {
+                o
+            } else {
+                cfg.resolve_output_path(&o)
+            }
+        }
+        None => cfg.resolve_output_path(&filename_from_url()),
+    }
+}
+
 fn looks_like_directory(url: &str) -> bool {
     if url.ends_with('/') {
         return true;
@@ -71,7 +121,7 @@ fn looks_like_directory(url: &str) -> bool {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let cfg = config::Config::load();
+    let mut cfg = config::Config::load();
 
     match args.get(1).map(|s| s.as_str()) {
         Some("download") | Some("d") => {
@@ -81,17 +131,7 @@ fn main() -> Result<()> {
                 .clone();
             let (output, connections) = parse_download_args(&args[3..]);
             let connections = connections.unwrap_or(cfg.connections);
-
-            let output_filename = output.unwrap_or_else(|| {
-                let raw = url
-                    .split('?')
-                    .next()
-                    .and_then(|p| p.rsplit('/').next())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("download.bin");
-                cli::percent_decode(raw)
-            });
-            let output_path = cfg.resolve_output_path(&output_filename);
+            let output_path = resolve_output(output, &url, &cfg);
 
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -110,12 +150,17 @@ fn main() -> Result<()> {
         Some("sync") => {
             let url = args
                 .get(2)
-                .ok_or_else(|| anyhow::anyhow!("Usage: rdm sync <URL> [-c N] [-p N] [--delete]"))?
+                .ok_or_else(|| anyhow::anyhow!("Usage: rdm sync <URL> [-o dir] [-c N] [-p N] [--delete] [--ext flac,mp3]"))?
                 .clone();
-            let (_, connections) = parse_download_args(&args[3..]);
+            let (output, connections) = parse_download_args(&args[3..]);
             let connections = connections.unwrap_or(cfg.connections);
             let parallel = parse_parallel_flag(&args[3..]).unwrap_or(cfg.queue_parallel);
             let delete = parse_delete_flag(&args[3..]);
+            let ext_filter = parse_ext_filter(&args[3..]);
+
+            if let Some(dir) = output {
+                cfg.download_dir = dir;
+            }
 
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -124,7 +169,8 @@ fn main() -> Result<()> {
                     let cancel = CancellationToken::new();
                     let sh = signal::spawn_signal_handler(cancel.clone());
                     let result =
-                        sync::run(&cfg, &url, connections, parallel, delete, cancel).await;
+                        sync::run(&cfg, &url, connections, parallel, delete, ext_filter, cancel)
+                            .await;
                     sh.abort();
                     result
                 })
@@ -187,8 +233,16 @@ fn main() -> Result<()> {
                             Ok(())
                         }
                         _ => {
+                            let resolved = output.map(|o| {
+                                let path = Path::new(&o);
+                                if path.is_absolute() {
+                                    o
+                                } else {
+                                    cfg.resolve_output_path(&o)
+                                }
+                            });
                             let id = queue::Queue::locked(|q| {
-                                Ok(q.add(url.clone(), output, connections))
+                                Ok(q.add(url.clone(), resolved, connections))
                             })?;
                             let q = queue::Queue::load_readonly();
                             eprintln!(
@@ -386,21 +440,11 @@ fn main() -> Result<()> {
                                 sh.abort();
                                 return Ok(());
                             }
-                            _ => {} // scrape failed — fall through to single file
+                            _ => {}
                         }
                     }
 
-                    let output_filename = output.unwrap_or_else(|| {
-                        let raw = url
-                            .split('?')
-                            .next()
-                            .and_then(|p| p.rsplit('/').next())
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or("download.bin");
-                        cli::percent_decode(raw)
-                    });
-                    let output_path = cfg.resolve_output_path(&output_filename);
-
+                    let output_path = resolve_output(output, &url, &cfg);
                     let result = cli::run_download(
                         url,
                         Some(output_path),
@@ -425,7 +469,7 @@ fn main() -> Result<()> {
                 "  rdm download <URL> [-o name] [-c N]      Download with options"
             );
             eprintln!(
-                "  rdm sync <URL> [-c N] [-p N] [--delete]  Sync remote → local"
+                "  rdm sync <URL> [-o dir] [-c N] [-p N] [--delete] [--ext flac,mp3]  Sync remote → local"
             );
             eprintln!(
                 "  rdm queue <command>                      Manage download queue"
@@ -454,11 +498,14 @@ fn main() -> Result<()> {
                 cfg.connections
             );
             eprintln!(
-                "  -o, --output FILE      Output filename"
+                "  -o, --output NAME      Output file or directory"
             );
             eprintln!(
                 "  -p, --parallel N       Parallel queue downloads (default: {})",
                 cfg.queue_parallel
+            );
+            eprintln!(
+                "  -e, --ext EXT,...      Sync: only sync these file extensions"
             );
             eprintln!(
                 "  -d, --delete           Sync: remove local files not on remote"
