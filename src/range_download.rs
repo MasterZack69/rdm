@@ -99,24 +99,22 @@ pub async fn download_range(
     let mut stream = response.bytes_stream();
     let mut bytes_written: u64 = 0;
     let mut bytes_since_flush: u64 = 0;
-    let mut reads_since_cancel_check: u32 = 0;
 
-    loop {
-        if reads_since_cancel_check >= 64 {
-            reads_since_cancel_check = 0;
-            if cancel.is_cancelled() {
+        loop {
+        let chunk = tokio::select! {
+            c = stream.next() => c,
+            _ = cancel.cancelled() => {
                 file.flush().await.ok();
                 chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
                 return Ok(DownloadStatus::Cancelled {
                     bytes_on_disk: resume_from + bytes_written,
                 });
             }
-        }
+        };
 
-        match stream.next().await {
+        match chunk {
             Some(Ok(data)) => {
-                reads_since_cancel_check += 1;
-                let data_len = data.len() as u64;
+                let data_len: u64 = data.len() as u64;
 
                 if bytes_written + data_len > expected_len {
                     file.flush().await.ok();
@@ -144,12 +142,8 @@ pub async fn download_range(
                     bytes_since_flush = 0;
                 }
 
-                chunk_progress.store(resume_from + bytes_written, Ordering::Relaxed);
-                if let Some(ref gp) = global_progress {
-                    gp.fetch_add(data_len, Ordering::Relaxed);
-                }
+                chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
             }
-
             Some(Err(e)) => {
                 file.flush().await.ok();
                 chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
@@ -157,7 +151,6 @@ pub async fn download_range(
                     "Stream error at byte {} of range {}", bytes_written, range_value,
                 ));
             }
-
             None => break,
         }
     }

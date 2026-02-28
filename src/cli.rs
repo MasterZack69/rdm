@@ -39,6 +39,16 @@ pub async fn run_download(
     }
     let info = inspect::inspect_url(&client, &url).await?;
 
+    let connections = if let Some(size) = info.size {
+        if size < 32 * 1024 * 1024 {
+            1
+        } else {
+            connections
+        }
+    } else {
+        connections
+    };
+
     let file_size = info.size.context("Server did not report file size. Cannot use parallel download.")?;
     if file_size == 0 { anyhow::bail!("Cannot download empty file (Content-Length: 0)"); }
 

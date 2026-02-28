@@ -121,7 +121,7 @@ where
 
     let monitor_handle = spawn_progress_monitor(
         progress_callback,
-        Arc::clone(&global_progress),
+        chunk_counters.clone(),
         Arc::clone(&done_flag),
         file_size,
     );
@@ -364,15 +364,32 @@ fn short_error(err: &anyhow::Error) -> String {
     }
 }
 
-fn spawn_progress_monitor<F>(callback: Option<F>, counter: Arc<AtomicU64>, done: Arc<AtomicBool>, total: u64) -> Option<JoinHandle<()>>
-where F: Fn(u64, u64) + Send + Sync + 'static {
+fn spawn_progress_monitor<F>(
+    callback: Option<F>,
+    counters: Vec<(u32, Arc<AtomicU64>)>,
+    done: Arc<AtomicBool>,
+    total: u64,
+) -> Option<JoinHandle<()>>
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
     let cb = callback?;
     Some(tokio::spawn(async move {
         loop {
-            cb(counter.load(Ordering::Relaxed), total);
-            if done.load(Ordering::Relaxed) { break; }
+            let current: u64 = counters
+                .iter()
+                .map(|(_, c)| c.load(Ordering::Relaxed))
+                .sum();
+            cb(current, total);
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        cb(counter.load(Ordering::Relaxed), total);
+        let current: u64 = counters
+            .iter()
+            .map(|(_, c)| c.load(Ordering::Relaxed))
+            .sum();
+        cb(current, total);
     }))
 }
