@@ -116,7 +116,19 @@ fn looks_like_directory(url: &str) -> bool {
         .rsplit('/')
         .next()
         .unwrap_or("");
-    !last_segment.contains('.')
+
+    if last_segment.is_empty() {
+        return true;
+    }
+
+    if last_segment.contains('.') {
+        return false;
+    }
+
+    let is_hex_like = last_segment.len() > 16
+        && last_segment.chars().all(|c| c.is_ascii_hexdigit() || c == '-' || c == '_');
+
+    !is_hex_like
 }
 
 fn main() -> Result<()> {
@@ -225,13 +237,25 @@ fn main() -> Result<()> {
                             eprintln!("  {} item(s) pending.", q.pending_count());
                             Ok(())
                         }
+                        
                         Ok(None) if looks_like_directory(&url) => {
-                            eprintln!(
-                                "  📁 No files found in: {}",
-                                cli::percent_decode(&url)
-                            );
-                            Ok(())
-                        }
+                        let resolved = output.map(|o| {
+                            let path = Path::new(&o);
+                            if path.is_absolute() {
+                                o
+                            } else {
+                                cfg.resolve_output_path(&o)
+                            }
+                        });
+                        let id = queue::Queue::locked(|q| {
+                            Ok(q.add(url.clone(), resolved, connections))
+                        })?;
+                        let q = queue::Queue::load_readonly();
+                        eprintln!("  ✅ Added #{}: {}", id, cli::percent_decode(&url));
+                        eprintln!("  {} item(s) pending.", q.pending_count());
+                        Ok(())
+                    }
+
                         _ => {
                             let resolved = output.map(|o| {
                                 let path = Path::new(&o);
@@ -436,9 +460,6 @@ fn main() -> Result<()> {
                                 return result;
                             }
                             Ok(None) => {
-                                eprintln!("  📁 No files found in: {}", &url);
-                                sh.abort();
-                                return Ok(());
                             }
                             _ => {}
                         }
