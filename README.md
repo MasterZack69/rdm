@@ -32,11 +32,6 @@ cd rdm
 cargo build --release
 ```
 
-### but before you do that, checkout prerequisite items
-- OpenSSl
-- pkg-config
-- rust & cargo
-
 # Credits
 - MasterZack69 - Of course I am getting the Credits
 - Claude 4.6 Opus - Wrote the code, fixed the bugs
