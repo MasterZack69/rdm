@@ -37,7 +37,22 @@ pub async fn run_download(
     if !quiet {
         eprintln!("  Inspecting: {}", url);
     }
+
     let info = inspect::inspect_url(&client, &url).await?;
+
+    let output_path = if let Some(ref name) = info.suggested_filename {
+        let path = std::path::Path::new(&output_path);
+        // No extension → auto-derived from hash URL → prefer server name
+        if path.extension().is_none() {
+            let dir = path.parent().unwrap_or(std::path::Path::new("."));
+            dir.join(name).to_string_lossy().to_string()
+        } else {
+            output_path
+        }
+    } else {
+        output_path
+    };
+
 
     let connections = if let Some(size) = info.size {
         if size < 32 * 1024 * 1024 {

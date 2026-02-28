@@ -5,12 +5,39 @@ use reqwest::{header, Client, StatusCode};
 pub struct FileInfo {
     pub size: Option<u64>,
     pub supports_range: bool,
+    pub suggested_filename: Option<String>,
 }
 
 impl FileInfo {
     pub fn can_chunk(&self) -> bool {
         self.size.is_some() && self.supports_range
     }
+}
+
+fn filename_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let val = headers.get("content-disposition")?.to_str().ok()?;
+
+    // Try filename*=UTF-8''name first (RFC 5987)
+    if let Some(pos) = val.find("filename*=UTF-8''") {
+        let name = &val[pos + 17..];
+        let name = name.split(';').next().unwrap_or(name).trim();
+        let decoded = crate::cli::percent_decode(name);
+        if !decoded.is_empty() {
+            return Some(decoded);
+        }
+    }
+
+    // Fallback: filename="name" or filename=name
+    if let Some(pos) = val.find("filename=") {
+        let name = &val[pos + 9..];
+        let name = name.split(';').next().unwrap_or(name).trim();
+        let name = name.trim_matches('"');
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+
+    None
 }
 
 pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> { 
@@ -22,6 +49,7 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         .context("Request failed — check the URL and your network connection")?;
 
     let status = resp.status();
+    let suggested_filename = filename_from_content_disposition(resp.headers());
 
     if status == StatusCode::PARTIAL_CONTENT {
         let size = extract_size_from_content_range(resp.headers())
@@ -29,6 +57,7 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         return Ok(FileInfo {
             size,
             supports_range: true,
+            suggested_filename: suggested_filename.clone(),
         });
     }
 
@@ -37,6 +66,7 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         return Ok(FileInfo {
             size,
             supports_range: false,
+            suggested_filename: suggested_filename.clone(),
         });
     }
 
@@ -45,6 +75,7 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         return Ok(FileInfo {
             size,
             supports_range: false,
+            suggested_filename: suggested_filename.clone(),
         });
     }
 
@@ -76,6 +107,7 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
     Ok(FileInfo {
         size,
         supports_range,
+        suggested_filename,
     })
 }
 
@@ -156,14 +188,14 @@ mod tests {
     }
 
     #[test]
-    fn test_file_info_can_chunk() {
-        let info = FileInfo { size: Some(1024), supports_range: true };
-        assert!(info.can_chunk());
+fn test_file_info_can_chunk() {
+    let info: FileInfo = FileInfo { size: Some(1024), supports_range: true, suggested_filename: None };
+    assert!(info.can_chunk());
 
-        let info = FileInfo { size: None, supports_range: true };
-        assert!(!info.can_chunk());
+    let info: FileInfo = FileInfo { size: None, supports_range: true, suggested_filename: None };
+    assert!(!info.can_chunk());
 
-        let info = FileInfo { size: Some(1024), supports_range: false };
-        assert!(!info.can_chunk());
+    let info: FileInfo = FileInfo { size: Some(1024), supports_range: false, suggested_filename: None };
+    assert!(!info.can_chunk());
     }
 }
