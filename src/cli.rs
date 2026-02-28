@@ -67,17 +67,28 @@ pub async fn run_download(
     }
 
     let start_time = Instant::now();
+    let last_print = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
     let speed_samples: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> =
         std::sync::Mutex::new(std::collections::VecDeque::new());
 
     let progress_callback = move |downloaded: u64, total: u64| {
         if quiet { return; }
 
+        let now = Instant::now();
+        let is_complete = downloaded >= total;
+
+        {
+            let mut lp = last_print.lock().unwrap();
+            if !is_complete && now.duration_since(*lp) < Duration::from_millis(100) {
+                return;
+            }
+            *lp = now;
+        }
+
         let elapsed_ms = start_time.elapsed().as_millis() as u64;
         let mut samples = speed_samples.lock().unwrap();
         samples.push_back((elapsed_ms, downloaded));
 
-        // Keep 3 second window
         while samples.len() > 1 && elapsed_ms - samples.front().unwrap().0 > 3000 {
             samples.pop_front();
         }
