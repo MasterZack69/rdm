@@ -33,7 +33,7 @@ pub async fn run(
         }
     }
 
-    let files = scrape::discover_files(url)
+        let files = scrape::discover_files(url, false)
         .await
         .context("Failed to scan remote directory")?;
 

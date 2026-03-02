@@ -174,11 +174,12 @@ pub async fn run_download(
     let retry_config = RetryConfig {
     max_retries: shared_config().max_retries,
     ..RetryConfig::default()
-    };
+    }; 
 
     let download_result = parallel::download_parallel(
         client, &url, &output_path, file_size, &chunks,
         &retry_config, Some(progress_callback), cancel,
+        info.etag.clone(), info.last_modified.clone(),
     ).await;
 
     if !quiet {

@@ -208,7 +208,8 @@ fn main() -> Result<()> {
                         tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()?
-                            .block_on(scrape::discover_files(&url))
+                            .block_on(scrape::discover_files(&url, true))
+
                     } else {
                         Ok(None)
                     };
@@ -431,7 +432,7 @@ fn main() -> Result<()> {
                     let sh = signal::spawn_signal_handler(cancel.clone());
 
                     if output.is_none() && looks_like_directory(&url) {
-                        match scrape::discover_files(&url).await {
+                        match scrape::discover_files(&url, true).await {
                             Ok(Some(files)) => {
                                 eprintln!("  📁 Found {} file(s):", files.len());
                                 eprintln!();
@@ -490,7 +491,7 @@ fn main() -> Result<()> {
                 "  rdm download <URL> [-o name] [-c N]      Download with options"
             );
             eprintln!(
-                "  rdm sync <URL> [-o dir] [-c N] [-p N] [--delete] [--ext flac,mp3]  Sync remote → local"
+                "  rdm sync <URL> [-d] [-e flac,mkv]        Sync remote → local"
             );
             eprintln!(
                 "  rdm queue <command>                      Manage download queue"

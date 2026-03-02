@@ -20,12 +20,25 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
-    pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let base_ms = self.base_delay.as_millis() as u64;
-        let factor = 2u64.saturating_pow(attempt);
+        let factor = 2u64.saturating_pow(attempt.min(10));
         let delay_ms = base_ms.saturating_mul(factor);
         let capped = delay_ms.min(self.max_delay.as_millis() as u64);
-        Duration::from_millis(capped)
+
+        let jitter_range = capped / 4;
+        let jittered = if jitter_range > 0 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64;
+            let offset = nanos % (jitter_range * 2);
+            capped - jitter_range + offset
+        } else {
+            capped
+        };
+
+        Duration::from_millis(jittered.min(self.max_delay.as_millis() as u64))
     }
 }
 
@@ -99,11 +112,10 @@ mod tests {
     #[test]
     fn test_exponential_backoff() {
         let config = RetryConfig::default();
-        assert_eq!(config.delay_for_attempt(0), Duration::from_secs(1));
-        assert_eq!(config.delay_for_attempt(1), Duration::from_secs(2));
-        assert_eq!(config.delay_for_attempt(2), Duration::from_secs(4));
-        assert_eq!(config.delay_for_attempt(3), Duration::from_secs(8));
-        assert_eq!(config.delay_for_attempt(4), Duration::from_secs(16));
+        let d0 = config.delay_for_attempt(0).as_millis();
+        assert!(d0 >= 700 && d0 <= 1300, "attempt 0: {}ms", d0);
+        let d2 = config.delay_for_attempt(2).as_millis();
+        assert!(d2 >= 2800 && d2 <= 5200, "attempt 2: {}ms", d2);
     }
 
     #[test]
@@ -113,15 +125,20 @@ mod tests {
             base_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(30),
         };
-        assert_eq!(config.delay_for_attempt(5), Duration::from_secs(30));
-        assert_eq!(config.delay_for_attempt(10), Duration::from_secs(30));
+        // Any attempt beyond cap should stay within max + jitter headroom
+        for attempt in [5, 8, 10, 15] {
+            let d = config.delay_for_attempt(attempt);
+            assert!(d <= config.max_delay, "attempt {}: {:?}", attempt, d);
+        }
     }
 
     #[test]
     fn test_backoff_no_overflow() {
         let config = RetryConfig::default();
-        let delay = config.delay_for_attempt(50);
-        assert_eq!(delay, config.max_delay);
+        for attempt in [30, 50, 64, 100] {
+            let delay = config.delay_for_attempt(attempt);
+            assert!(delay <= config.max_delay, "attempt {}: {:?}", attempt, delay);
+        }
     }
 
     #[test]

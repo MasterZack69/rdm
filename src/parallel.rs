@@ -22,6 +22,8 @@ pub async fn download_parallel<F>(
     retry_config: &RetryConfig,
     progress_callback: Option<F>,
     cancel: CancellationToken,
+    etag: Option<String>,
+    last_modified: Option<String>,
 ) -> Result<u64>
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
@@ -33,7 +35,7 @@ where
     let temp_path = format!("{}.part", output_path);
     let meta_path = ResumeMetadata::meta_path(output_path);
 
-    match parallel_inner(client, url, &temp_path, &meta_path, file_size, chunks, retry_config, progress_callback, cancel).await {
+    match parallel_inner(client, url, &temp_path, &meta_path, file_size, chunks, retry_config, progress_callback, cancel, etag, last_modified).await {
         Ok(total) => {
             resume::delete(&meta_path).await?;
             fs::rename(&temp_path, output_path).await
@@ -64,6 +66,8 @@ async fn parallel_inner<F>(
     retry_config: &RetryConfig,
     progress_callback: Option<F>,
     cancel: CancellationToken,
+    etag: Option<String>,
+    last_modified: Option<String>,
 ) -> Result<u64>
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
@@ -73,14 +77,17 @@ where
 
     let meta = load_or_create_metadata(
         meta_path,
+        temp_path,
         url,
         file_size,
         chunks,
+        etag.as_deref(),
+        last_modified.as_deref(),
     ).await?;
 
     let chunks = chunks_from_metadata(&meta);
 
-    ensure_file_allocated(temp_path, file_size).await?;
+    ensure_file_allocated(temp_path, file_size, chunks.len()).await?;
 
     let shared_meta = Arc::new(Mutex::new(meta));
 
@@ -212,33 +219,42 @@ where
 
 async fn load_or_create_metadata(
     meta_path: &str,
+    temp_path: &str,
     url: &str,
     file_size: u64,
     chunks: &[Chunk],
+    etag: Option<&str>,
+    last_modified: Option<&str>,
 ) -> Result<ResumeMetadata> {
-
     if let Ok(existing) = resume::load(meta_path).await {
-
-        if resume::validate_against(&existing, url, file_size, chunks) {
+        if resume::validate_against(&existing, url, file_size, chunks)
+            && existing.matches_server_identity(etag, last_modified)
+        {
             eprintln!("  [Resume] Using existing chunk layout ({} chunks)", existing.chunks.len());
             return Ok(existing);
         }
 
-        // Incompatible → delete and start fresh
+        if !existing.matches_server_identity(etag, last_modified) {
+            eprintln!("  [Resume] Server file changed (ETag/Last-Modified mismatch), restarting");
+        }
         let _ = resume::delete(meta_path).await;
+        let _ = fs::remove_file(temp_path).await;
     }
 
-    let meta = resume::create_new(url.to_string(), file_size, chunks);
+    let mut meta = resume::create_new(url.to_string(), file_size, chunks);
+    meta.etag = etag.map(|s| s.to_string());
+    meta.last_modified = last_modified.map(|s| s.to_string());
 
     resume::save_atomic(meta_path, &meta).await?;
 
     Ok(meta)
 }
 
-async fn ensure_file_allocated(path: &str, size: u64) -> Result<()> {
+async fn ensure_file_allocated(path: &str, size: u64, chunk_count: usize) -> Result<()> {
     match fs::metadata(path).await {
         Ok(m) if m.len() == size => Ok(()),
         Ok(_) => {
+            // Always resize existing files to correct size
             let file = fs::OpenOptions::new().write(true).open(path).await
                 .with_context(|| format!("Failed to open existing file: {}", path))?;
             file.set_len(size).await
@@ -248,8 +264,12 @@ async fn ensure_file_allocated(path: &str, size: u64) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let file = fs::File::create(path).await
                 .with_context(|| format!("Failed to create file: {}", path))?;
-            file.set_len(size).await
-                .with_context(|| format!("Failed to pre-allocate {} bytes for '{}'", size, path))?;
+            if chunk_count > 1 {
+                // Multi-chunk needs pre-allocation for random-access writes
+                file.set_len(size).await
+                    .with_context(|| format!("Failed to pre-allocate {} bytes for '{}'", size, path))?;
+            }
+            // Single chunk: file starts at 0 bytes, sequential write extends naturally
             Ok(())
         }
         Err(e) => Err(e).with_context(|| format!("Failed to stat file: {}", path)),
@@ -271,7 +291,7 @@ fn spawn_autosave(
                 }
                 meta.clone()
             };
-            let _ = resume::save_atomic(&meta_path, &snapshot).await;
+            let _ = resume::save_best_effort(&meta_path, &snapshot).await;
         }
     })
 }

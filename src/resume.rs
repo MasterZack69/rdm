@@ -10,6 +10,10 @@ pub struct ResumeMetadata {
     pub url: String,
     pub file_size: u64,
     pub chunks: Vec<ChunkState>,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -42,6 +46,25 @@ impl ResumeMetadata {
     pub fn meta_path(output_path: &str) -> String {
         format!("{}.rdm", output_path)
     }
+
+    pub fn matches_server_identity(
+        &self,
+        current_etag: Option<&str>,
+        current_last_modified: Option<&str>,
+    ) -> bool {
+        if let (Some(stored), Some(current)) = (&self.etag, current_etag) {
+            if stored != current {
+                return false;
+            }
+        }
+        if let (Some(stored), Some(current)) = (&self.last_modified, current_last_modified) {
+            if stored != current {
+                return false;
+            }
+        }
+        true
+    }
+
 }
 
 pub fn create_new(url: String, file_size: u64, chunks: &[Chunk]) -> ResumeMetadata {
@@ -59,6 +82,8 @@ pub fn create_new(url: String, file_size: u64, chunks: &[Chunk]) -> ResumeMetada
         url,
         file_size,
         chunks: chunk_states,
+        etag: None,
+        last_modified: None,
     }
 }
 
@@ -114,6 +139,34 @@ pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
 
     Ok(())
 }
+
+pub async fn save_best_effort(path: &str, meta: &ResumeMetadata) -> Result<()> {
+    let json = serde_json::to_string_pretty(meta)
+        .context("Failed to serialize resume metadata")?;
+
+    let tmp_path = format!("{}.tmp", path);
+
+    let mut file = fs::File::create(&tmp_path)
+        .await
+        .with_context(|| format!("Failed to create temp file: {}", tmp_path))?;
+
+    file.write_all(json.as_bytes())
+        .await
+        .context("Failed to write metadata")?;
+
+    file.flush()
+        .await
+        .context("Failed to flush metadata")?;
+
+    drop(file);
+
+    fs::rename(&tmp_path, path)
+        .await
+        .with_context(|| format!("Failed to rename '{}' to '{}'", tmp_path, path))?;
+
+    Ok(())
+}
+
 
 pub async fn load(path: &str) -> Result<ResumeMetadata> {
     let data = fs::read_to_string(path)

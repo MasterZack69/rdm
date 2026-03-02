@@ -10,7 +10,7 @@ pub struct DiscoveredFile {
     pub relative_path: String,
 }
 
-pub async fn discover_files(url: &str) -> Result<Option<Vec<DiscoveredFile>>> {
+pub async fn discover_files(url: &str, wrap_in_folder: bool) -> Result<Option<Vec<DiscoveredFile>>> {
     const MAX_DEPTH: u32 = 10;
     const MAX_DIRS: usize = 500;
     const MAX_FILES: usize = 10_000;
@@ -94,7 +94,12 @@ pub async fn discover_files(url: &str) -> Result<Option<Vec<DiscoveredFile>>> {
                     continue;
                 }
 
-                let relative = format!("{}/{}", folder_name, relative);
+                let relative = if wrap_in_folder {
+                    format!("{}/{}", folder_name, relative)
+                } else {
+                    relative
+                };
+
                 files.push(DiscoveredFile { url: file_url, relative_path: relative });
 
                 if files.len() >= MAX_FILES {

@@ -90,7 +90,7 @@ pub async fn download_range(
         .await
         .with_context(|| format!("Failed to open file: {}", file_path))?;
 
-    let mut file = BufWriter::with_capacity(512 * 1024, file);
+    let mut file = BufWriter::with_capacity(2 * 512 * 1024, file);
 
     file.seek(SeekFrom::Start(effective_start))
         .await
@@ -135,7 +135,7 @@ pub async fn download_range(
                 bytes_written += data_len;
                 bytes_since_flush += data_len;
 
-                if bytes_since_flush >= 4 * 1024 * 1024 {
+                if bytes_since_flush >= 16 * 1024 * 1024 {
                     file.flush().await.with_context(|| {
                         format!("Periodic flush failed at offset {}", effective_start + bytes_written)
                     })?;
