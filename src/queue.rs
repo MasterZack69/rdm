@@ -505,16 +505,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
         }
 
         // Clean up finished tasks
-        handles.retain(|h| !h.is_finished());
-
-        // Check for pending items
-        if Queue::load_readonly().pending_count() == 0 {
-            if handles.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            continue;
-        }
+        handles.retain(|h| !h.is_finished()); 
 
         // Wait for a download slot
         let permit = tokio::select! {
@@ -530,7 +521,6 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             break;
         }
 
-        // Atomically grab next pending + mark as Downloading
         let next = Queue::locked(|q| {
             match q.next_pending().cloned() {
                 Some(item) => {
@@ -541,15 +531,18 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             }
         })?;
 
-        let next = match next {
+            let next = match next {
             Some(item) => item,
             None => {
                 drop(permit);
+                if handles.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
         };
 
-        // Create child cancel token for this download
         let child = cancel.child_token();
         {
             let mut children = active_children.lock().await;

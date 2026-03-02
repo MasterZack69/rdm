@@ -22,7 +22,7 @@ impl Default for Config {
             connections: 8,
             download_dir,
             max_retries: 6,
-            queue_parallel: 1,
+            queue_parallel: 3,
         }
     }
 }

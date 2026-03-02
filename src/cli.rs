@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
-use std::io::{self, BufRead, IsTerminal, Write};
+use futures_util::StreamExt;
+use std::io::{self, BufRead, Write};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::chunk::Chunk;
@@ -8,6 +11,27 @@ use crate::inspect;
 use crate::parallel;
 use crate::resume::ResumeMetadata;
 use crate::retry::RetryConfig;
+
+static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn shared_client() -> Result<&'static reqwest::Client> {
+    if let Some(c) = SHARED_CLIENT.get() {
+        return Ok(c);
+    }
+    let client = reqwest::Client::builder()
+        .user_agent("rdm")
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("Failed to build HTTP client")?;
+    Ok(SHARED_CLIENT.get_or_init(|| client))
+}
+
+static SHARED_CONFIG: OnceLock<crate::config::Config> = OnceLock::new();
+
+fn shared_config() -> &'static crate::config::Config {
+    SHARED_CONFIG.get_or_init(crate::config::Config::load)
+}
+
 
 pub async fn run_download(
     url: String,
@@ -28,21 +52,17 @@ pub async fn run_download(
     };
     let connections = connections.max(1);
 
-    let client = reqwest::Client::builder()
-        .user_agent("rdm")
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .context("Failed to build HTTP client")?;
+    let client = shared_client()?;
 
     if !quiet {
         eprintln!("  Inspecting: {}", url);
     }
 
-    let info = inspect::inspect_url(&client, &url).await?;
+    let info = inspect::inspect_url(client, &url).await?;
 
+    // Use server-suggested filename when URL has no extension
     let output_path = if let Some(ref name) = info.suggested_filename {
         let path = std::path::Path::new(&output_path);
-        // No extension → auto-derived from hash URL → prefer server name
         if path.extension().is_none() {
             let dir = path.parent().unwrap_or(std::path::Path::new("."));
             dir.join(name).to_string_lossy().to_string()
@@ -53,19 +73,39 @@ pub async fn run_download(
         output_path
     };
 
-
-    let connections = if let Some(size) = info.size {
-        if size < 32 * 1024 * 1024 {
-            1
-        } else {
-            connections
+    // ── Fix #1: Unknown file size → streaming fallback ──
+    let file_size = match info.size {
+        Some(0) => anyhow::bail!("Cannot download empty file (Content-Length: 0)"),
+        Some(s) => s,
+        None => {
+            if !quiet {
+                eprintln!("  File size : unknown (streaming)");
+                eprintln!("  Output    : {}", output_path);
+                eprintln!();
+            }
+            let start_time = Instant::now();
+            let result = download_streaming(client, &url, &output_path, cancel, quiet).await;
+            if !quiet { eprint!("\r\x1b[2K"); }
+            return match result {
+                Ok(bytes) => {
+                    if !quiet {
+                        let secs = start_time.elapsed().as_secs_f64();
+                        let avg = if secs > 0.1 { (bytes as f64 / secs) as u64 } else { 0 };
+                        eprintln!("  ✅ Download complete: {}", output_path);
+                        eprintln!("  {} in {:.1}s ({})", format_bytes(bytes), secs, format_speed(avg));
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    if !quiet { eprintln!("  ❌ Download failed."); }
+                    Err(e)
+                }
+            };
         }
-    } else {
-        connections
     };
 
-    let file_size = info.size.context("Server did not report file size. Cannot use parallel download.")?;
-    if file_size == 0 { anyhow::bail!("Cannot download empty file (Content-Length: 0)"); }
+    // Fix #5: lower single-connection threshold from 32 MiB → 4 MiB
+    let connections = if file_size < 4 * 1024 * 1024 { 1 } else { connections };
 
     if !quiet {
         eprintln!("  File size : {}", format_bytes(file_size));
@@ -131,10 +171,13 @@ pub async fn run_download(
         print_progress_bar(downloaded, total, speed_bps);
     };
 
-    let retry_config = RetryConfig::default();
+    let retry_config = RetryConfig {
+    max_retries: shared_config().max_retries,
+    ..RetryConfig::default()
+    };
 
     let download_result = parallel::download_parallel(
-        &client, &url, &output_path, file_size, &chunks,
+        client, &url, &output_path, file_size, &chunks,
         &retry_config, Some(progress_callback), cancel,
     ).await;
 
@@ -165,6 +208,113 @@ pub async fn run_download(
     }
 }
 
+async fn download_streaming(
+    client: &reqwest::Client,
+    url: &str,
+    output_path: &str,
+    cancel: CancellationToken,
+    quiet: bool,
+) -> Result<u64> {
+    let temp_path = format!("{}.part", output_path);
+
+    // Resume: check existing .part file size
+    let existing_bytes = tokio::fs::metadata(&temp_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let mut req = client.get(url); 
+
+    let resp = req.send().await.context("GET request failed")?;
+    let status = resp.status();
+
+    let (resume_offset, append) = if existing_bytes > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT {
+        if !quiet {
+            eprintln!("  Resuming from {}", format_bytes_compact(existing_bytes));
+        }
+        (existing_bytes, true)
+    } else if status.is_success() {
+        if existing_bytes > 0 && !quiet {
+            eprintln!("  Server ignored range request, restarting from zero");
+        }
+        (0, false)
+    } else {
+        anyhow::bail!(
+            "Server returned {} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Unknown")
+        );
+    };
+
+    let file = if append {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&temp_path)
+            .await
+            .context("Failed to open .part for append")?
+    } else {
+        tokio::fs::File::create(&temp_path)
+            .await
+            .context("Failed to create .part file")?
+    };
+
+    let mut writer = tokio::io::BufWriter::with_capacity(512 * 1024, file);
+    let mut stream = resp.bytes_stream();
+    let mut downloaded: u64 = resume_offset;
+    let mut bytes_since_flush: u64 = 0;
+    let start_time = Instant::now();
+    let mut last_print = Instant::now() - Duration::from_secs(1);
+
+    loop {
+        let chunk = tokio::select! {
+            c = stream.next() => c,
+            _ = cancel.cancelled() => {
+                writer.flush().await.ok();
+                anyhow::bail!("Download cancelled at {} bytes", downloaded);
+            }
+        };
+
+        match chunk {
+            Some(Ok(data)) => {
+                let len = data.len() as u64;
+                writer.write_all(&data).await.context("Write failed")?;
+                downloaded += len;
+                bytes_since_flush += len;
+
+                if bytes_since_flush >= 4 * 1024 * 1024 {
+                    writer.flush().await?;
+                    bytes_since_flush = 0;
+                }
+
+                if !quiet {
+                    let now = Instant::now();
+                    if now.duration_since(last_print) >= Duration::from_millis(100) {
+                        last_print = now;
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        let new_bytes = downloaded - resume_offset;
+                        let speed = if elapsed > 0.1 { (new_bytes as f64 / elapsed) as u64 } else { 0 };
+                        eprint!("\r\x1b[2K  {} | {}", format_bytes_compact(downloaded), format_speed(speed));
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                writer.flush().await.ok();
+                return Err(e).context(format!("Stream error at byte {}", downloaded));
+            }
+            None => break,
+        }
+    }
+
+    writer.flush().await?;
+    drop(writer);
+
+    tokio::fs::rename(&temp_path, output_path)
+        .await
+        .with_context(|| format!("Failed to rename '{}' to '{}'", temp_path, output_path))?;
+
+    Ok(downloaded)
+}
+
 pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<String>> {
     use std::io::{BufRead, IsTerminal, Write};
 
@@ -177,7 +327,6 @@ pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<Str
         return Ok(Some(path.to_string()));
     }
 
-    // Resume metadata exists → validate using resume module APIs
     let meta_path = crate::resume::ResumeMetadata::meta_path(path);
     if let Ok(meta) = crate::resume::load(&meta_path).await {
         let chunks: Vec<crate::chunk::Chunk> = meta.chunks.iter().map(|c| {
@@ -244,39 +393,6 @@ pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<Str
     }
 }
 
-
-/// Prompt user for a new filename. Returns None if input was empty.
-fn prompt_rename(original_path: &str) -> Result<Option<String>> {
-    use std::path::Path;
-
-    eprint!("  Enter new filename: ");
-    io::stderr().flush().ok();
-
-    let mut input = String::new();
-    io::stdin().lock().read_line(&mut input)
-        .context("Failed to read input")?;
-
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    // If user gave just a filename (no directory), preserve original directory
-    let new_path = if Path::new(trimmed).parent().map(|p| p.as_os_str().is_empty()).unwrap_or(true) {
-        match Path::new(original_path).parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => {
-                dir.join(trimmed).to_string_lossy().to_string()
-            }
-            _ => trimmed.to_string(),
-        }
-    } else {
-        trimmed.to_string()
-    };
-
-    eprintln!("  Output changed to: {}", new_path);
-    Ok(Some(new_path))
-}
-
 fn resolve_output_path(url: &str, output: Option<&str>) -> String {
     if let Some(provided) = output { return provided.to_string(); }
     extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
@@ -331,6 +447,8 @@ fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
     chunks
 }
 
+// ── Progress Display ───────────────────────────────────────────────
+
 fn print_progress_bar(downloaded: u64, total: u64, speed_bps: u64) {
     if total == 0 { return; }
     let pct = (downloaded as f64 / total as f64 * 100.0).min(100.0);
@@ -381,6 +499,8 @@ fn format_bytes_compact(bytes: u64) -> String {
     else if b >= KIB { format!("{:.1} KiB", b / KIB) }
     else { format!("{} B", bytes) }
 }
+
+// ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
