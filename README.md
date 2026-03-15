@@ -1,6 +1,7 @@
 # Rust Download Manager
 - A "usable" download manager. Emphasis on usable.
 - Resume support on most connections like other download managers.
+- Efficient as Fuck.
 - Written in rust so it must be cool. Emphasis on must.
 - Linux only.
 
@@ -10,7 +11,7 @@
 # Parallel connections per file
 connections = 12
 
-# Default download directory
+# Default download directoryc
 download_dir = "~/Downloads"
 
 # Max Retries?
