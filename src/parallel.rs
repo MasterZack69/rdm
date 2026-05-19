@@ -41,9 +41,10 @@ where
     let meta_path = ResumeMetadata::meta_path(ctx.output_path);
 
     match parallel_inner(
-        ctx.client, ctx.url, &temp_path, &meta_path, ctx.file_size,
-        ctx.chunks, ctx.retry_config, progress_callback, ctx.cancel.clone(),
-        ctx.etag.clone(), ctx.last_modified.clone(),
+        ctx,
+        &temp_path,
+        &meta_path,
+        progress_callback,
     ).await {
         Ok(total) => {
             resume::delete(&meta_path).await?;
@@ -66,17 +67,10 @@ fn chunks_from_metadata(meta: &ResumeMetadata) -> Vec<Chunk> {
 }
 
 async fn parallel_inner<F>(
-    client: &Client,
-    url: &str,
+    ctx: &ParallelDownloadCtx<'_>,
     temp_path: &str,
     meta_path: &str,
-    file_size: u64,
-    chunks: &[Chunk],
-    retry_config: &RetryConfig,
     progress_callback: Option<F>,
-    cancel: CancellationToken,
-    etag: Option<String>,
-    last_modified: Option<String>,
 ) -> Result<u64>
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
@@ -87,16 +81,16 @@ where
     let meta = load_or_create_metadata(
         meta_path,
         temp_path,
-        url,
-        file_size,
-        chunks,
-        etag.as_deref(),
-        last_modified.as_deref(),
+        ctx.url,
+        ctx.file_size,
+        ctx.chunks,
+        ctx.etag.as_deref(),
+        ctx.last_modified.as_deref(),
     ).await?;
 
     let chunks = chunks_from_metadata(&meta);
 
-    ensure_file_allocated(temp_path, file_size, chunks.len()).await?;
+    ensure_file_allocated(temp_path, ctx.file_size, chunks.len()).await?;
 
     let shared_meta = Arc::new(Mutex::new(meta));
 
@@ -138,23 +132,22 @@ where
         progress_callback,
         chunk_counters.clone(),
         Arc::clone(&done_flag),
-        file_size,
+        ctx.file_size,
     );
 
     let mut active_workers = chunks.len().max(1);
     let mut join_set: JoinSet<Result<u64>> = JoinSet::new();
-    // FIX: Initialize from initial_completed so resumed bytes are included in total
     let mut total_bytes: u64 = initial_completed;
 
     while !queue.is_empty() || !join_set.is_empty() {
         while join_set.len() < active_workers && !queue.is_empty() {
             let chunk = queue.pop_front().unwrap();
 
-            let client = client.clone();
-            let url = url.to_string();
+            let client = ctx.client.clone();
+            let url = ctx.url.to_string();
             let path = temp_path.to_string();
-            let cancel = cancel.clone();
-            let config = retry_config.clone();
+            let cancel = ctx.cancel.clone();
+            let config = ctx.retry_config.clone();
             let chunk_progress = chunk_counters
                 .iter()
                 .find(|(id, _)| *id == chunk.id)
@@ -187,7 +180,6 @@ where
             });
         }
 
-        // FIX: Use active_workers instead of chunks.len() for pressure threshold
         if retry_pressure.load(Ordering::Relaxed) >= active_workers * 2 && active_workers > 1 {
             let new = (active_workers / 2).max(1);
             eprintln!(
@@ -212,10 +204,10 @@ where
     }
     let _ = autosave_handle.await;
 
-    if total_bytes != file_size {
+    if total_bytes != ctx.file_size {
         anyhow::bail!(
             "Total bytes mismatch: expected {} but downloaded {}",
-            file_size,
+            ctx.file_size,
             total_bytes
         );
     }
@@ -322,7 +314,6 @@ async fn download_chunk_with_retry(
             client, url, file_path, chunk.start, chunk.end, resume_from,
             Arc::clone(&chunk_progress), cancel.clone(),
         ).await {
-            // FIX 3: Report only bytes written during this invocation
             Ok(DownloadStatus::Complete { bytes_written: _ }) => {
                 return Ok(chunk_progress.load(Ordering::SeqCst) - initial_completed);
             }
