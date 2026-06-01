@@ -107,6 +107,7 @@ pub async fn run_download(
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<()> {
+    let url = normalize_download_url(&url);
     let output_path = resolve_output_path(&url, output.as_deref());
     let output_path = match resolve_existing_output(&output_path, &url).await? {
         Some(p) => p,
@@ -511,13 +512,60 @@ fn resolve_output_path(url: &str, output: Option<&str>) -> String {
     extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
 }
 
-fn extract_filename_from_url(url: &str) -> Option<String> {
-    let path = url.split('?').next()?;
+pub fn extract_filename_from_url(url: &str) -> Option<String> {
+    let normalized = normalize_download_url(url);
+    let without_fragment = normalized.split('#').next()?;
+    let path = without_fragment.split('?').next()?;
     let segment = path.rsplit('/').next()?;
     let decoded = percent_decode(segment);
     let trimmed = decoded.trim();
     if trimmed.is_empty() || trimmed == "/" { return None; }
     Some(trimmed.to_string())
+}
+
+pub fn normalize_download_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return url.to_string();
+    };
+
+    let Some(fragment) = parsed.fragment() else {
+        return url.to_string();
+    };
+
+    let route = fragment.split('?').next().unwrap_or(fragment);
+    let route = route.trim_start_matches('/').to_string();
+    let mut route_segments = route.split('/');
+    if route_segments.next() != Some("download") {
+        return url.to_string();
+    }
+
+    let rest: Vec<String> = route_segments
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let Some(last) = rest.last() else {
+        return url.to_string();
+    };
+    if !last.contains('.') {
+        return url.to_string();
+    }
+
+    parsed.set_fragment(None);
+    parsed.set_query(None);
+
+    let mut base_dir = parsed.path().to_string();
+    if !base_dir.ends_with('/') {
+        if let Some(pos) = base_dir.rfind('/') {
+            base_dir.truncate(pos + 1);
+        } else {
+            base_dir.clear();
+            base_dir.push('/');
+        }
+    }
+
+    let new_path = format!("{}download/{}", base_dir, rest.join("/"));
+    parsed.set_path(&new_path);
+    parsed.to_string()
 }
 
 pub fn percent_decode(input: &str) -> String {
@@ -628,6 +676,9 @@ mod tests {
 
     #[test] fn test_extract_filename_simple() { assert_eq!(extract_filename_from_url("https://example.com/path/file.zip"), Some("file.zip".into())); }
     #[test] fn test_extract_filename_query() { assert_eq!(extract_filename_from_url("https://example.com/file.tar.gz?t=1"), Some("file.tar.gz".into())); }
+    #[test] fn test_extract_filename_hash_download_route() { assert_eq!(extract_filename_from_url("https://mobdisc.com/dwbfc3e38e/download.html?lang=en#/download/8189-DOOM-3-v1-1-0-22-cache1.zip"), Some("8189-DOOM-3-v1-1-0-22-cache1.zip".into())); }
+    #[test] fn test_normalize_hash_download_route() { assert_eq!(normalize_download_url("https://mobdisc.com/dwbfc3e38e/download.html?lang=en#/download/8189-DOOM-3-v1-1-0-22-cache1.zip"), "https://mobdisc.com/dwbfc3e38e/download/8189-DOOM-3-v1-1-0-22-cache1.zip"); }
+    #[test] fn test_normalize_ignores_regular_fragment() { let url = "https://example.com/file.zip#section"; assert_eq!(normalize_download_url(url), url); }
     #[test] fn test_extract_filename_percent() { assert_eq!(extract_filename_from_url("https://example.com/my%20file.zip"), Some("my file.zip".into())); }
     #[test] fn test_extract_filename_trailing() { assert_eq!(extract_filename_from_url("https://example.com/"), None); }
     #[test] fn test_resolve_explicit() { assert_eq!(resolve_output_path("https://example.com/f.zip", Some("out.zip")), "out.zip"); }

@@ -71,15 +71,7 @@ fn parse_ext_filter(args: &[String]) -> Option<HashSet<String>> {
 
 fn resolve_output(output: Option<String>, url: &str, cfg: &config::Config) -> String {
     let filename_from_url = || -> String {
-        let name = url
-            .split('?')
-            .next()
-            .unwrap_or(url)
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or("download.bin");
-        cli::percent_decode(name)
+        cli::extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
     };
 
     match output {
@@ -135,6 +127,7 @@ fn main() -> Result<()> {
                 .get(2)
                 .ok_or_else(|| anyhow::anyhow!("Usage: rdm download <URL> [-o name] [-c N]"))?
                 .clone();
+            let url = cli::normalize_download_url(&url);
             let (output, connections) = parse_download_args(&args[3..]);
             let connections = connections.unwrap_or(cfg.connections);
             let output_path = resolve_output(output, &url, &cfg);
@@ -196,6 +189,7 @@ fn main() -> Result<()> {
                             anyhow::anyhow!("Usage: rdm queue add <URL> [-o name] [-c N]")
                         })?
                         .clone();
+                    let url = cli::normalize_download_url(&url);
                     let (output, connections) = parse_download_args(&args[4..]);
 
                     let files = if looks_like_directory(&url) {
@@ -414,7 +408,7 @@ fn main() -> Result<()> {
 
         // Quick URL — directory or single file
         Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
-            let url = url.to_string();
+            let url = cli::normalize_download_url(url);
             let (output, connections) = parse_download_args(&args[2..]);
             let connections = connections.unwrap_or(cfg.connections);
 
