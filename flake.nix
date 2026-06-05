@@ -20,9 +20,6 @@
             buildInputs = with pkgs; [
               rustup
             ];
-            shellHook = ''
-              echo "Shell Loaded"
-            '';
           };
         }
       );

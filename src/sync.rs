@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use reqwest::header::CONTENT_LENGTH;
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -33,7 +34,7 @@ pub async fn run(
         }
     }
 
-        let files = scrape::discover_files(url, false)
+    let files = scrape::discover_files(url, false)
         .await
         .context("Failed to scan remote directory")?;
 
@@ -131,6 +132,11 @@ pub async fn run(
         let sem = Arc::new(Semaphore::new(8));
         let mut tasks = JoinSet::new();
 
+        // Capture total before needs_head is moved into the spawn loop.
+        let verify_total = needs_head.len();
+        let verify_started = Instant::now();
+        let mut verified = 0usize;
+
         for (file_url, relative, path, size) in needs_head {
             let client = client.clone();
             let sem = sem.clone();
@@ -149,6 +155,7 @@ pub async fn run(
         while let Some(joined) = tasks.join_next().await {
             if cancel.is_cancelled() {
                 tasks.abort_all();
+                clear_progress();
                 eprintln!("  ⚠ Cancelled during verification.");
                 return Ok(());
             }
@@ -157,6 +164,8 @@ pub async fn run(
                     Some(v) => v,
                     None => continue,
                 };
+            verified += 1;
+            print_progress("Verify", verified, verify_total, verify_started);
             match status {
                 HeadStatus::UpToDate | HeadStatus::HeadFailed => {
                     up_to_date += 1;
@@ -166,6 +175,7 @@ pub async fn run(
                 }
             }
         }
+        clear_progress();
     }
 
     to_download.sort_by(|a, b| a.1.cmp(&b.1));
@@ -284,6 +294,7 @@ pub async fn run(
                 );
                 eprintln!("    This usually means the remote listing is incomplete.");
                 eprint!("    Continue? [y/N]: ");
+                let _ = std::io::stderr().flush();
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input).ok();
                 if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
@@ -295,6 +306,10 @@ pub async fn run(
 
         let mut deleted = 0u64;
         let mut delete_failed = 0u64;
+
+        let delete_total = to_delete.len();
+        let delete_started = Instant::now();
+        let mut delete_done = 0usize;
 
         if let SyncRoot::Ok(ref root) = sync_root_result {
             for relative in &to_delete {
@@ -312,10 +327,14 @@ pub async fn run(
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
                         delete_failed += 1;
+                        clear_progress();
                         eprintln!("  ⚠ Failed to delete {}: {}", relative, e);
                     }
                 }
+                delete_done += 1;
+                print_progress("Delete", delete_done, delete_total, delete_started);
             }
+            clear_progress();
             remove_empty_dirs(Path::new(root));
         }
 
@@ -328,6 +347,32 @@ pub async fn run(
     eprintln!();
     eprintln!("  ✅ Sync complete!");
     Ok(())
+}
+
+fn print_progress(label: &str, done: usize, total: usize, started: Instant) {
+    let eta = format_eta(done, total, started.elapsed());
+    eprint!("\r\x1b[2K  {}: {}/{} | {}", label, done, total, eta);
+    let _ = std::io::stderr().flush();
+}
+
+fn clear_progress() {
+    eprint!("\r\x1b[2K");
+    let _ = std::io::stderr().flush();
+}
+
+fn format_eta(done: usize, total: usize, elapsed: Duration) -> String {
+    if done == 0 {
+        return "ETA --:--".to_string();
+    }
+    let remaining = total.saturating_sub(done);
+    let secs = (elapsed.as_secs_f64() / done as f64 * remaining as f64).round() as u64;
+    if secs >= 3600 {
+        format!("ETA {}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("ETA {}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("ETA {}s", secs)
+    }
 }
 
 enum HeadStatus {

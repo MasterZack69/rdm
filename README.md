@@ -5,6 +5,33 @@
 - Written in rust so it must be cool. Emphasis on must.
 - Linux only.
 
+# HoW To uSe 
+```
+RDM — Rust Download Manager
+
+Usage:
+  rdm <URL>                                Quick download
+  rdm download <URL> [-o name] [-c N]      Download with options
+  rdm sync <URL> [-d] [-e flac,mkv]        Sync remote → local
+  rdm queue <command>                      Manage download queue
+  rdm config                               Show configuration
+
+Queue commands:
+  rdm queue add <URL> [-o name] [-c N]     Add to queue
+  rdm queue list                           Show queue
+  rdm queue start [-p N]                   Start processing
+  rdm queue stop / skip                    Live control
+
+Options:
+  -c, --connections N    Connections per file (default: 8)
+  -o, --output NAME      Output file or directory
+  -p, --parallel N       Parallel queue downloads (default: 5)
+  -e, --ext EXT,...      Sync: only sync these file extensions
+  -d, --delete           Sync: remove local files not on remote
+```
+
+If you have set up the path variable like a normal person then you can reproduce the above wall of text by typing 'rdm', assuming the variable is rdm.
+
 # Example Config File
 
 ```

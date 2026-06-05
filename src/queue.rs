@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -195,6 +195,75 @@ fn atomic_write(path: &PathBuf, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn spawn_progress_line(
+    total: u32,
+    completed: Arc<AtomicU32>,
+    failed: Arc<AtomicU32>,
+    skipped: Arc<AtomicU32>,
+    active: Arc<AtomicU32>,
+    done: Arc<AtomicBool>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let started = Instant::now();
+
+        loop {
+            let finished = completed.load(Ordering::Relaxed)
+                + failed.load(Ordering::Relaxed)
+                + skipped.load(Ordering::Relaxed);
+            let act = active.load(Ordering::Relaxed);
+
+            print_progress_line("Queue", finished, total, act, started);
+
+            if done.load(Ordering::Relaxed) || cancel.is_cancelled() || finished >= total {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        clear_progress_line();
+    })
+}
+
+fn print_progress_line(label: &str, done: u32, total: u32, active: u32, started: Instant) {
+    let eta = format_count_eta(done, total, started.elapsed());
+    if active > 0 {
+        eprint!("\r\x1b[2K  {}: {}/{} ({}↓) | {}", label, done, total, active, eta);
+    } else {
+        eprint!("\r\x1b[2K  {}: {}/{} | {}", label, done, total, eta);
+    }
+    let _ = std::io::stderr().flush();
+}
+
+fn clear_progress_line() {
+    eprint!("\r\x1b[2K");
+    let _ = std::io::stderr().flush();
+}
+
+fn format_count_eta(done: u32, total: u32, elapsed: Duration) -> String {
+    if done == 0 {
+        let secs = elapsed.as_secs();
+        return if secs >= 3600 {
+            format!("{}h {:02}m elapsed", secs / 3600, (secs % 3600) / 60)
+        } else if secs >= 60 {
+            format!("{}m {:02}s elapsed", secs / 60, secs % 60)
+        } else {
+            format!("{}s elapsed", secs)
+        };
+    }
+
+    let remaining = total.saturating_sub(done);
+    let secs = (elapsed.as_secs_f64() / done as f64 * remaining as f64).round() as u64;
+    if secs >= 3600 {
+        format!("ETA {}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("ETA {}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("ETA {}s", secs)
+    }
+}
+
 // ── Queue State ────────────────────────────────────────────────────
 
 impl Queue {
@@ -319,8 +388,11 @@ impl Queue {
     }
 
     pub fn failed_count(&self) -> usize {
-    self.items.iter().filter(|i| matches!(i.status, Status::Failed { .. })).count()
-}
+        self.items
+            .iter()
+            .filter(|i| matches!(i.status, Status::Failed { .. }))
+            .count()
+    }
 
     pub fn print_list(&self) {
         if self.items.is_empty() {
@@ -332,9 +404,7 @@ impl Queue {
         eprintln!("  {:>4}  {:<16}  {}", "ID", "Status", "URL");
         eprintln!(
             "  {}  {}  {}",
-            "────",
-            "────────────────",
-            "───────────────────────────────────────────"
+            "────", "────────────────", "───────────────────────────────────────────"
         );
 
         for item in &self.items {
@@ -462,10 +532,23 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel));
     let completed = Arc::new(AtomicU32::new(0));
     let failed = Arc::new(AtomicU32::new(0));
+    let skipped = Arc::new(AtomicU32::new(0));
+    let active = Arc::new(AtomicU32::new(0));
     let position = Arc::new(AtomicU32::new(0));
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let progress_done = Arc::new(AtomicBool::new(false));
     let active_children: Arc<Mutex<Vec<(u64, CancellationToken)>>> =
         Arc::new(Mutex::new(Vec::new()));
+
+    let progress = spawn_progress_line(
+        pending as u32,
+        Arc::clone(&completed),
+        Arc::clone(&failed),
+        Arc::clone(&skipped),
+        Arc::clone(&active),
+        Arc::clone(&progress_done),
+        cancel.clone(),
+    );
 
     // Signal watcher — polls for skip/stop from another terminal
     let watcher_cancel = cancel.clone();
@@ -483,6 +566,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                     clear_signal();
                     let children = watcher_children.lock().await;
                     for (id, token) in children.iter() {
+                        clear_progress_line();
                         eprintln!("  ⏭  Skipping #{}", id);
                         token.cancel();
                     }
@@ -490,6 +574,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                 Some(ref s) if s == "stop" => {
                     clear_signal();
                     watcher_stop.store(true, Ordering::SeqCst);
+                    clear_progress_line();
                     eprintln!("  ⏹  Stop signal — finishing active downloads...");
                 }
                 _ => {}
@@ -505,7 +590,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
         }
 
         // Clean up finished tasks
-        handles.retain(|h| !h.is_finished()); 
+        handles.retain(|h| !h.is_finished());
 
         // Wait for a download slot
         let permit = tokio::select! {
@@ -531,7 +616,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             }
         })?;
 
-            let next = match next {
+        let next = match next {
             Some(item) => item,
             None => {
                 drop(permit);
@@ -552,6 +637,8 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
         let cfg = cfg.clone();
         let completed = Arc::clone(&completed);
         let failed = Arc::clone(&failed);
+        let skipped = Arc::clone(&skipped);
+        let active = Arc::clone(&active);
         let position = Arc::clone(&position);
         let active_children = Arc::clone(&active_children);
         let cancel_main = cancel.clone();
@@ -562,8 +649,10 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
 
             let pos = position.fetch_add(1, Ordering::Relaxed) + 1;
             let name = next.url.rsplit('/').next().unwrap_or(&next.url);
-            eprintln!("  ▶ [{}] #{}: {}",
-                pos, item_id, cli::percent_decode(name));
+            clear_progress_line();
+            eprintln!("  ▶ [{}] #{}: {}", pos, item_id, cli::percent_decode(name));
+
+            active.fetch_add(1, Ordering::Relaxed);
 
             // Resolve output path
             let output = {
@@ -604,6 +693,8 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                 let mut children = active_children.lock().await;
                 children.retain(|(id, _)| *id != item_id);
             }
+
+            active.fetch_sub(1, Ordering::Relaxed);
 
             // Determine skip vs cancel
             let was_skipped = child.is_cancelled() && !cancel_main.is_cancelled();
@@ -649,17 +740,21 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             }
 
             if was_skipped {
+                skipped.fetch_add(1, Ordering::Relaxed);
+                clear_progress_line();
                 eprintln!("  ⏭  #{}: skipped", item_id);
             } else {
                 match &result {
                     Ok(_) => {
                         completed.fetch_add(1, Ordering::Relaxed);
                         let name = next.url.rsplit('/').next().unwrap_or(&next.url);
+                        clear_progress_line();
                         eprintln!("  ✅ #{}: {}", item_id, cli::percent_decode(name));
                     }
                     Err(e) => {
                         failed.fetch_add(1, Ordering::Relaxed);
                         let name = next.url.rsplit('/').next().unwrap_or(&next.url);
+                        clear_progress_line();
                         eprintln!("  ❌ #{}: {} — {:#}", item_id, cli::percent_decode(name), e);
                     }
                 }
@@ -675,6 +770,8 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
     }
 
     watcher.abort();
+    progress_done.store(true, Ordering::Relaxed);
+    let _ = progress.await;
 
     // Ctrl+C — catch any truly orphaned tasks
     if cancel.is_cancelled() {
@@ -686,12 +783,14 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             }
             Ok(())
         });
+        clear_progress_line();
         eprintln!();
         eprintln!("  ⚠ Queue interrupted — progress saved. Run `rdm queue start` to resume.");
     }
 
     let c = completed.load(Ordering::Relaxed);
     let f = failed.load(Ordering::Relaxed);
+    clear_progress_line();
     eprintln!();
     eprintln!("  Done. {} completed, {} failed.", c, f);
     Ok(())
