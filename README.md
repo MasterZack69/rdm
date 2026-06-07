@@ -39,7 +39,7 @@ If you have set up the path variable like a normal person then you can reproduce
 # Parallel connections per file
 connections = 12
 
-# Default download directoryc
+# Default download directory
 download_dir = "~/Downloads"
 
 # Max Retries?
