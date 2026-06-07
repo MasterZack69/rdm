@@ -54,9 +54,9 @@ const MAX_RELATIVE_PATH_LEN: usize = 4096;
 pub async fn discover_files(
     url: &str,
     wrap_in_folder: bool,
+    allow_private: bool,
 ) -> Result<Option<Vec<DiscoveredFile>>> {
-    // (4) Validate URL: scheme is http/https and host isn't private/loopback/etc.
-    let base_url = parse_and_validate_url(url).context("Invalid base URL")?;
+    let base_url = parse_and_validate_url(url, allow_private).context("Invalid base URL")?;
     let base_url = ensure_trailing_slash(base_url);
 
     let client = reqwest::Client::builder()
@@ -66,7 +66,6 @@ pub async fn discover_files(
         .build()
         .context("Failed to build HTTP client")?;
 
-    // (23) Folder name is decoded and sanitized; falls back to host or "download".
     let folder_name = derive_folder_name(&base_url);
 
     let base_str = base_url.as_str().to_string();
@@ -91,7 +90,6 @@ pub async fn discover_files(
                 continue;
             }
 
-            // (6) Hard stop on directory cap — propagate beyond inner loop.
             if visited.len() > MAX_DIRS {
                 eprintln!("   ⚠ Directory limit reached ({}), stopping scan", MAX_DIRS);
                 hard_stopped = true;
@@ -105,7 +103,6 @@ pub async fn discover_files(
             let base_c = base_url.clone();
 
             tasks.spawn(async move {
-                // (9) No `unwrap()`: handle a closed semaphore gracefully.
                 let _permit = match sem_c.acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => {
@@ -122,7 +119,6 @@ pub async fn discover_files(
         }
 
         let mut next_level: Vec<(Url, u32)> = Vec::new();
-        // (7) Dedupe directories within the same BFS level.
         let mut next_seen: HashSet<String> = HashSet::new();
 
         while let Some(joined) = tasks.join_next().await {
@@ -138,26 +134,21 @@ pub async fn discover_files(
                 Ok(Some(r)) => r,
                 Ok(None) => continue,
                 Err(e) => {
-                    // (22) Surface sub-fetch errors instead of swallowing.
                     eprintln!("   ⚠ failed to scan {}: {:#}", dir_url, e);
                     continue;
                 }
             };
 
             for file_url in found_files {
-                // (19) Cross-directory dedup keyed on absolute URL.
                 if !seen_files.insert(file_url.clone()) {
                     continue;
                 }
 
                 let raw_relative = match file_url.strip_prefix(&base_str) {
                     Some(s) => s.to_string(),
-                    // Shouldn't happen — `is_under_base` already enforced scope —
-                    // but guard anyway.
                     None => continue,
                 };
 
-                // (1) Sanitize on the *decoded* form, then keep the sanitized result.
                 let safe = match sanitize_relative_path(&raw_relative) {
                     Some(s) => s,
                     None => continue,
@@ -176,7 +167,6 @@ pub async fn discover_files(
 
                 if files.len() >= MAX_FILES {
                     eprintln!("   ⚠ File limit reached ({}), stopping scan", MAX_FILES);
-                    // (8) Cleanly cancel in-flight tasks before returning.
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
                     hard_stopped = true;
@@ -207,7 +197,7 @@ pub async fn discover_files(
 
 // ---------- URL parsing & scope ----------
 
-fn parse_and_validate_url(s: &str) -> Result<Url> {
+fn parse_and_validate_url(s: &str, allow_private: bool) -> Result<Url> {
     let url = Url::parse(s).context("URL parse failed")?;
     match url.scheme() {
         "http" | "https" => {}
@@ -217,9 +207,8 @@ fn parse_and_validate_url(s: &str) -> Result<Url> {
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
 
-    // Allow override for tests/internal use against localhost.
-    let allow_private = std::env::var_os("RDM_ALLOW_PRIVATE").is_some();
-    if !allow_private {
+        let skip_private_check = allow_private || std::env::var_os("RDM_ALLOW_PRIVATE").is_some();
+        if !skip_private_check {
         if let Some(ip) = parse_host_as_ip(host_str) {
             if is_disallowed_ip(ip) {
                 anyhow::bail!("Refusing to scan private/internal address: {}", ip);
@@ -230,7 +219,6 @@ fn parse_and_validate_url(s: &str) -> Result<Url> {
 }
 
 fn parse_host_as_ip(host: &str) -> Option<IpAddr> {
-    // `Url::host_str()` strips the brackets from IPv6 literals, but be defensive.
     let trimmed = host.trim_start_matches('[').trim_end_matches(']');
     trimmed.parse::<IpAddr>().ok()
 }
@@ -257,8 +245,6 @@ fn is_disallowed_ip(ip: IpAddr) -> bool {
     }
 }
 
-// (17) Strip fragment and ensure trailing slash on the path component only.
-//      Query string is preserved (some servers paginate with ?C=N;O=A).
 fn ensure_trailing_slash(mut url: Url) -> Url {
     url.set_fragment(None);
     if !url.path().ends_with('/') {
@@ -268,7 +254,6 @@ fn ensure_trailing_slash(mut url: Url) -> Url {
     url
 }
 
-// (2, 3) Proper origin+path-prefix containment check using parsed URLs.
 fn is_under_base(url: &Url, base: &Url) -> bool {
     if url.scheme() != base.scheme() {
         return false;
@@ -949,21 +934,28 @@ mod tests {
 
     #[test]
     fn test_validate_url_rejects_bad_schemes() {
-        assert!(parse_and_validate_url("file:///etc/passwd").is_err());
-        assert!(parse_and_validate_url("ftp://x.com/").is_err());
-        assert!(parse_and_validate_url("javascript:alert(1)").is_err());
+        assert!(parse_and_validate_url("file:///etc/passwd", false).is_err());
+        assert!(parse_and_validate_url("ftp://x.com/", false).is_err());
+        assert!(parse_and_validate_url("javascript:alert(1)", false).is_err());
     }
+
+     #[test]
+    fn test_validate_url_allows_private_when_flag_set() {
+     unsafe { std::env::remove_var("RDM_ALLOW_PRIVATE"); }
+     assert!(parse_and_validate_url("http://10.214.89.214:8000/", true).is_ok());
+     assert!(parse_and_validate_url("http://192.168.1.1/", true).is_ok());
+     assert!(parse_and_validate_url("http://127.0.0.1/", true).is_ok());
+    }
+
    
     #[test]
     fn test_validate_url_rejects_private_ips() {
-        // SAFETY: This test mutates a process-global env var. It's safe here
-        // because no other test reads or writes `RDM_ALLOW_PRIVATE`.
         unsafe {
             std::env::remove_var("RDM_ALLOW_PRIVATE");
         }
-        assert!(parse_and_validate_url("http://127.0.0.1/").is_err());
-        assert!(parse_and_validate_url("http://10.0.0.1/").is_err());
-        assert!(parse_and_validate_url("http://169.254.169.254/").is_err());
-        assert!(parse_and_validate_url("http://[::1]/").is_err());
-    }   // ← closes the fn
-}       // ← closes `mod tests { ... }`  ← THIS ONE IS MISSING
+    assert!(parse_and_validate_url("http://127.0.0.1/", false).is_err());
+    assert!(parse_and_validate_url("http://10.0.0.1/", false).is_err());
+    assert!(parse_and_validate_url("http://169.254.169.254/", false).is_err());
+    assert!(parse_and_validate_url("http://[::1]/", false).is_err());
+    }
+}

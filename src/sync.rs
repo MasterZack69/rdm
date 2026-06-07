@@ -21,6 +21,7 @@ pub async fn run(
     parallel: usize,
     delete: bool,
     ext_filter: Option<HashSet<String>>,
+    allow_private: bool,
     cancel: CancellationToken,
 ) -> Result<()> {
     {
@@ -34,7 +35,7 @@ pub async fn run(
         }
     }
 
-    let files = scrape::discover_files(url, false)
+    let files = scrape::discover_files(url, false, allow_private)
         .await
         .context("Failed to scan remote directory")?;
 

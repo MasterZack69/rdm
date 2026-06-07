@@ -50,6 +50,10 @@ fn parse_delete_flag(args: &[String]) -> bool {
     args.iter().any(|a| a == "--delete" || a == "-d")
 }
 
+fn parse_allow_private(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--allow-private")
+}
+
 fn parse_ext_filter(args: &[String]) -> Option<HashSet<String>> {
     let mut i = 0;
     while i < args.len() {
@@ -156,6 +160,7 @@ fn main() -> Result<()> {
             let parallel = parse_parallel_flag(&args[3..]).unwrap_or(cfg.queue_parallel);
             let delete = parse_delete_flag(&args[3..]);
             let ext_filter = parse_ext_filter(&args[3..]);
+            let allow_private = parse_allow_private(&args[3..]);
 
             if let Some(dir) = output {
                 cfg.download_dir = dir;
@@ -168,7 +173,7 @@ fn main() -> Result<()> {
                     let cancel = CancellationToken::new();
                     let sh = signal::spawn_signal_handler(cancel.clone());
                     let result =
-                        sync::run(&cfg, &url, connections, parallel, delete, ext_filter, cancel)
+                        sync::run(&cfg, &url, connections, parallel, delete, ext_filter, allow_private, cancel)
                             .await;
                     sh.abort();
                     result
@@ -196,7 +201,7 @@ fn main() -> Result<()> {
                         tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()?
-                            .block_on(scrape::discover_files(&url, true))
+                            .block_on(scrape::discover_files(&url, true, parse_allow_private(&args[4..])))
 
                     } else {
                         Ok(None)
@@ -420,7 +425,8 @@ fn main() -> Result<()> {
                     let sh = signal::spawn_signal_handler(cancel.clone());
 
                     if output.is_none() && looks_like_directory(&url) {
-                        match scrape::discover_files(&url, true).await {
+                        let allow_private = parse_allow_private(&args[2..]);
+                        match scrape::discover_files(&url, true, allow_private).await {
                             Ok(Some(files)) => {
                                 eprintln!("  📁 Found {} file(s):", files.len());
                                 eprintln!();
@@ -519,6 +525,9 @@ fn main() -> Result<()> {
             );
             eprintln!(
                 "  -d, --delete           Sync: remove local files not on remote"
+            );
+            eprintln!(
+                "  --allow-private        Allow scanning private/local IP addresses"
             );
             eprintln!();
             eprintln!("Config: {}", config::config_path().display());
