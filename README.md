@@ -28,6 +28,7 @@ Options:
   -p, --parallel N       Parallel queue downloads (default: 5)
   -e, --ext EXT,...      Sync: only sync these file extensions
   -d, --delete           Sync: remove local files not on remote
+  --allow-private        Allow scanning private/local IP addresses
 ```
 
 If you have set up the path variable like a normal person then you can reproduce the above wall of text by typing 'rdm', assuming the variable is rdm.
