@@ -27,26 +27,33 @@ Arguments:
 Options:
   -o, --output <PATH>     Output file or directory [default: download_dir from config]
   -c, --connections <N>   Connections per file [default: connections from config]
-  -q, --quiet             Suppress progress output
       --allow-private     Allow scanning private, loopback and link-local addresses
+  -q, --quiet             Suppress progress output
   -h, --help              Print help
   -V, --version           Print version
 
-Defaults for -c/-p and the download directory come from config.toml.
+Defaults for -c and the download directory come from config.toml.
 Run `rdm config` to see the values currently in effect.
+
+sync and queue have options of their own — see `rdm sync --help` and
+`rdm queue --help`.
 ```
 
 If you have set up the path variable like a normal person then you can reproduce the above wall of text by typing 'rdm', assuming the variable is rdm.
+
+`-o`, `-c`, `--allow-private` and `-q` work on every download path: bare `rdm <URL>`, `rdm download`, `rdm sync` and `rdm queue add`. The flags below are specific to the commands they belong to, so they won't show up in the root help above.
 
 ## Sync
 
 ```
 rdm sync <URL> [-o dir] [-c N] [-p N] [-d] [-e flac,mkv]
 
-  -p, --parallel <N>   Files to download concurrently
+  -p, --parallel <N>   Files to download concurrently [default: queue_parallel from config]
   -d, --delete         Delete local files that no longer exist on the remote
   -e, --ext <EXT>      Only sync these extensions (repeatable or comma separated)
 ```
+
+`-o` sets the destination directory for a sync, not a filename. `-e` takes a comma separated list or repeated flags, with or without leading dots, and is case insensitive: `-e flac,mkv` and `-e .flac -e .MKV` do the same thing.
 
 ## Queue
 
@@ -60,6 +67,8 @@ rdm queue remove <ID>                    Remove one item             [rm]
 rdm queue retry [ID|failed|skipped]      Requeue items               [r]
 rdm queue clear [pending|done]           Clear queue (all by default)   [c]
 ```
+
+`-p` on `queue start` defaults to `queue_parallel` from the config.
 
 Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything it finds and starts downloading, and `rdm queue add <URL>` enqueues without starting.
 

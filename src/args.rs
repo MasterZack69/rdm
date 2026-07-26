@@ -10,6 +10,15 @@
 //! so baking a default in here would either print a wrong default in `--help`
 //! or silently override the config file. `main` resolves `None` against the
 //! loaded [`crate::config::Config`] instead.
+//!
+//! ## Flag scoping
+//!
+//! `-o/--output`, `-c/--connections`, `--allow-private` and `-q/--quiet` are
+//! shared by every download path via [`DownloadOpts`]. `-p/--parallel` belongs
+//! only to `sync` and `queue start`, and `-d/--delete` and `-e/--ext` only to
+//! `sync`, because they are meaningless for a single-file download. Keep the
+//! `after_help` footers in sync with the options actually present on each
+//! command.
 
 use std::collections::HashSet;
 
@@ -29,7 +38,7 @@ pub const MAX_PARALLEL: usize = 32;
     about = "RDM \u{2014} Rust Download Manager",
     arg_required_else_help = true,
     args_conflicts_with_subcommands = true,
-    after_help = "Defaults for -c/-p and the download directory come from config.toml.\nRun `rdm config` to see the values currently in effect."
+    after_help = "Defaults for -c and the download directory come from config.toml.\nRun `rdm config` to see the values currently in effect.\n\nsync and queue have options of their own \u{2014} see `rdm sync --help` and\n`rdm queue --help`."
 )]
 pub struct Cli {
     /// URL to download (shorthand for `rdm download <URL>`)
@@ -66,7 +75,10 @@ pub struct DownloadOpts {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Download a single URL
-    #[command(visible_alias = "d")]
+    #[command(
+        visible_alias = "d",
+        after_help = "Defaults for -c and the download directory come from config.toml."
+    )]
     Download {
         #[arg(value_name = "URL", value_parser = parse_url)]
         url: String,
@@ -76,6 +88,9 @@ pub enum Command {
     },
 
     /// Mirror a remote directory listing into a local directory
+    #[command(
+        after_help = "-o sets the destination directory for a sync, not a filename.\n\nDefaults for -c/-p and the download directory come from config.toml.\nRun `rdm config` to see the values currently in effect.\n\n-e accepts a comma separated list or repeated flags, with or without\nleading dots: `-e flac,mkv` and `-e .flac -e .MKV` are equivalent."
+    )]
     Sync {
         #[arg(value_name = "URL", value_parser = parse_url)]
         url: String,
@@ -124,7 +139,10 @@ pub enum QueueCommand {
     List,
 
     /// Start processing the queue
-    #[command(visible_aliases = ["run", "s"])]
+    #[command(
+        visible_aliases = ["run", "s"],
+        after_help = "-p defaults to queue_parallel from config.toml."
+    )]
     Start {
         /// Files to download concurrently [default: queue_parallel from config]
         #[arg(short, long, value_name = "N", value_parser = parse_parallel)]
@@ -289,6 +307,57 @@ mod tests {
         assert!(Cli::try_parse_from(["rdm"]).is_err());
     }
 
+    // \u{2500}\u{2500} Help text honesty \u{2500}\u{2500}
+
+    /// The root footer once advertised `-c/-p` while `-p` existed only on sync
+    /// and queue start, sending people looking for a flag that wasn't there.
+    /// Every footer must only mention options its own command really has.
+    #[test]
+    fn help_footers_only_mention_present_flags() {
+        fn render(args: &[&str]) -> String {
+            let mut cmd = Cli::command();
+            for name in &args[1..] {
+                cmd = cmd
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("no subcommand {name}"))
+                    .clone();
+            }
+            cmd.render_long_help().to_string()
+        }
+
+        let root = render(&["rdm"]);
+        assert!(root.contains("-c, --connections"));
+        assert!(!root.contains("-p, --parallel"));
+        assert!(!root.contains("-c/-p"), "root footer must not promise -p");
+
+        let sync = render(&["rdm", "sync"]);
+        assert!(sync.contains("-p, --parallel"));
+        assert!(sync.contains("-d, --delete"));
+        assert!(sync.contains("-e, --ext"));
+        assert!(sync.contains("-c/-p"));
+
+        let start = render(&["rdm", "queue", "start"]);
+        assert!(start.contains("-p, --parallel"));
+
+        // -d and -e are sync-only; they must not leak into unrelated commands.
+        let download = render(&["rdm", "download"]);
+        assert!(!download.contains("--delete"));
+        assert!(!download.contains("--ext"));
+    }
+
+    /// Root-level flags really are rejected, so the scoping above is enforced
+    /// by the parser and not just by the help text.
+    #[test]
+    fn sync_only_flags_are_rejected_at_root() {
+        for flag in ["-p", "--parallel"] {
+            assert!(Cli::try_parse_from(["rdm", "https://e.com/f.zip", flag, "4"]).is_err());
+        }
+        for flag in ["-d", "--delete", "-e", "--ext"] {
+            assert!(Cli::try_parse_from(["rdm", "https://e.com/f.zip", flag]).is_err());
+        }
+        assert!(Cli::try_parse_from(["rdm", "download", "https://e.com/f", "-d"]).is_err());
+    }
+
     // \u{2500}\u{2500} Quick download \u{2500}\u{2500}
 
     #[test]
@@ -391,8 +460,36 @@ mod tests {
     }
 
     #[test]
+    fn sync_short_flags_work() {
+        let cli = parse(&["rdm", "sync", "https://e.com/d/", "-d", "-e", "mkv", "-p", "2"]);
+        match cli.command {
+            Some(Command::Sync { parallel, delete, ext, .. }) => {
+                assert_eq!(parallel, Some(2));
+                assert!(delete);
+                assert_eq!(ext, vec!["mkv".to_string()]);
+            }
+            other => panic!("expected sync, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_defaults_are_left_unresolved() {
+        let cli = parse(&["rdm", "sync", "https://e.com/d/"]);
+        match cli.command {
+            Some(Command::Sync { opts, parallel, delete, ext, .. }) => {
+                assert_eq!(opts.connections, None);
+                assert_eq!(parallel, None);
+                assert!(!delete);
+                assert!(ext.is_empty());
+            }
+            other => panic!("expected sync, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parallel_is_validated() {
         assert!(Cli::try_parse_from(["rdm", "sync", "https://e.com/d/", "-p", "0"]).is_err());
+        assert!(Cli::try_parse_from(["rdm", "sync", "https://e.com/d/", "-p", "99"]).is_err());
         assert!(Cli::try_parse_from(["rdm", "queue", "start", "-p", "0"]).is_err());
     }
 
@@ -593,6 +690,13 @@ mod tests {
         );
         assert!(parse_url("ftp://e.com/f.zip").is_err());
         assert!(parse_url("").is_err());
+    }
+
+    #[test]
+    fn parse_url_hint_has_no_stray_braces() {
+        let err = parse_url("example.com/f.zip").expect_err("expected rejection");
+        assert!(err.contains("https://example.com/f.zip"), "got: {err}");
+        assert!(!err.contains('{') && !err.contains('}'), "got: {err}");
     }
 
     #[test]
