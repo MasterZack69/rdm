@@ -14,11 +14,17 @@
 //! ## Flag scoping
 //!
 //! `-o/--output`, `-c/--connections`, `--allow-private` and `-q/--quiet` are
-//! shared by every download path via [`DownloadOpts`]. `-p/--parallel` belongs
-//! only to `sync` and `queue start`, and `-d/--delete` and `-e/--ext` only to
-//! `sync`, because they are meaningless for a single-file download. Keep the
-//! `after_help` footers in sync with the options actually present on each
-//! command.
+//! shared by every download path via [`DownloadOpts`].
+//!
+//! `-p/--parallel` is scoped to the three places where more than one file can
+//! be in flight: `sync`, `queue start`, and the root `rdm <URL>` form when the
+//! URL turns out to be a directory listing. It is deliberately *not* part of
+//! [`DownloadOpts`], which would wrongly add it to `download` and `queue add`.
+//!
+//! `-d/--delete` and `-e/--ext` belong to `sync` alone.
+//!
+//! Keep the `after_help` footers honest: a footer must never mention a flag
+//! that its own command does not have. There is a test for this.
 
 use std::collections::HashSet;
 
@@ -38,7 +44,7 @@ pub const MAX_PARALLEL: usize = 32;
     about = "RDM \u{2014} Rust Download Manager",
     arg_required_else_help = true,
     args_conflicts_with_subcommands = true,
-    after_help = "Defaults for -c and the download directory come from config.toml.\nRun `rdm config` to see the values currently in effect.\n\nsync and queue have options of their own \u{2014} see `rdm sync --help` and\n`rdm queue --help`."
+    after_help = "Defaults for -c/-p and the download directory come from config.toml.\nRun `rdm config` to see the values currently in effect.\n\n-p applies only when <URL> is a directory listing, which is expanded into\nthe queue and downloaded concurrently.\n\nsync and queue have options of their own \u{2014} see `rdm sync --help` and\n`rdm queue --help`."
 )]
 pub struct Cli {
     /// URL to download (shorthand for `rdm download <URL>`)
@@ -47,6 +53,11 @@ pub struct Cli {
 
     #[command(flatten)]
     pub opts: DownloadOpts,
+
+    /// Files to download concurrently if <URL> is a directory listing
+    /// [default: queue_parallel from config]
+    #[arg(short, long, value_name = "N", value_parser = parse_parallel)]
+    pub parallel: Option<usize>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -295,6 +306,17 @@ mod tests {
         Cli::try_parse_from(args).expect("expected args to parse")
     }
 
+    fn render_help(args: &[&str]) -> String {
+        let mut cmd = Cli::command();
+        for name in &args[1..] {
+            cmd = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("no subcommand {name}"))
+                .clone();
+        }
+        cmd.render_long_help().to_string()
+    }
+
     /// Catches invalid clap configuration (duplicate IDs, bad aliases, illegal
     /// flag combinations) at test time instead of at runtime.
     #[test]
@@ -309,53 +331,49 @@ mod tests {
 
     // \u{2500}\u{2500} Help text honesty \u{2500}\u{2500}
 
-    /// The root footer once advertised `-c/-p` while `-p` existed only on sync
-    /// and queue start, sending people looking for a flag that wasn't there.
-    /// Every footer must only mention options its own command really has.
+    /// The root footer once advertised `-c/-p` when `-p` was not a root option,
+    /// sending people looking for a flag that wasn't there. Every footer must
+    /// only mention options its own command really has.
     #[test]
     fn help_footers_only_mention_present_flags() {
-        fn render(args: &[&str]) -> String {
-            let mut cmd = Cli::command();
-            for name in &args[1..] {
-                cmd = cmd
-                    .find_subcommand(name)
-                    .unwrap_or_else(|| panic!("no subcommand {name}"))
-                    .clone();
-            }
-            cmd.render_long_help().to_string()
-        }
-
-        let root = render(&["rdm"]);
+        let root = render_help(&["rdm"]);
         assert!(root.contains("-c, --connections"));
-        assert!(!root.contains("-p, --parallel"));
-        assert!(!root.contains("-c/-p"), "root footer must not promise -p");
+        assert!(root.contains("-p, --parallel"), "root promises -p in its footer");
+        // -d/-e are sync-only and must not leak into the root help.
+        assert!(!root.contains("--delete"));
+        assert!(!root.contains("--ext"));
 
-        let sync = render(&["rdm", "sync"]);
+        let sync = render_help(&["rdm", "sync"]);
         assert!(sync.contains("-p, --parallel"));
         assert!(sync.contains("-d, --delete"));
         assert!(sync.contains("-e, --ext"));
         assert!(sync.contains("-c/-p"));
 
-        let start = render(&["rdm", "queue", "start"]);
+        let start = render_help(&["rdm", "queue", "start"]);
         assert!(start.contains("-p, --parallel"));
 
-        // -d and -e are sync-only; they must not leak into unrelated commands.
-        let download = render(&["rdm", "download"]);
+        // Nothing runs concurrently for these, so -p must stay away.
+        let download = render_help(&["rdm", "download"]);
+        assert!(!download.contains("--parallel"));
         assert!(!download.contains("--delete"));
         assert!(!download.contains("--ext"));
+        assert!(!download.contains("-c/-p"));
+
+        let add = render_help(&["rdm", "queue", "add"]);
+        assert!(!add.contains("--parallel"));
     }
 
-    /// Root-level flags really are rejected, so the scoping above is enforced
-    /// by the parser and not just by the help text.
+    /// `-p` is meaningful at the root only because a listing URL is expanded
+    /// into the queue. `-d`/`-e` have no root meaning and stay rejected.
     #[test]
     fn sync_only_flags_are_rejected_at_root() {
-        for flag in ["-p", "--parallel"] {
-            assert!(Cli::try_parse_from(["rdm", "https://e.com/f.zip", flag, "4"]).is_err());
-        }
         for flag in ["-d", "--delete", "-e", "--ext"] {
             assert!(Cli::try_parse_from(["rdm", "https://e.com/f.zip", flag]).is_err());
         }
         assert!(Cli::try_parse_from(["rdm", "download", "https://e.com/f", "-d"]).is_err());
+        // -p is not shared via DownloadOpts, so it must not reach these.
+        assert!(Cli::try_parse_from(["rdm", "download", "https://e.com/f", "-p", "4"]).is_err());
+        assert!(Cli::try_parse_from(["rdm", "queue", "add", "https://e.com/f", "-p", "4"]).is_err());
     }
 
     // \u{2500}\u{2500} Quick download \u{2500}\u{2500}
@@ -365,6 +383,7 @@ mod tests {
         let cli = parse(&["rdm", "https://example.com/f.zip"]);
         assert_eq!(cli.url.as_deref(), Some("https://example.com/f.zip"));
         assert!(cli.command.is_none());
+        assert_eq!(cli.parallel, None);
     }
 
     #[test]
@@ -383,6 +402,27 @@ mod tests {
         assert_eq!(cli.opts.connections, Some(16));
         assert!(cli.opts.allow_private);
         assert!(cli.opts.quiet);
+    }
+
+    #[test]
+    fn root_accepts_parallel_for_listings() {
+        for flag in ["-p", "--parallel"] {
+            let cli = parse(&["rdm", "https://example.com/music/", flag, "6"]);
+            assert_eq!(cli.parallel, Some(6));
+            assert!(cli.command.is_none());
+        }
+
+        // Combines with the shared options.
+        let cli = parse(&["rdm", "https://example.com/music/", "-c", "8", "-p", "3"]);
+        assert_eq!(cli.opts.connections, Some(8));
+        assert_eq!(cli.parallel, Some(3));
+    }
+
+    #[test]
+    fn root_parallel_is_validated() {
+        assert!(Cli::try_parse_from(["rdm", "https://e.com/d/", "-p", "0"]).is_err());
+        assert!(Cli::try_parse_from(["rdm", "https://e.com/d/", "-p", "99"]).is_err());
+        assert!(Cli::try_parse_from(["rdm", "https://e.com/d/", "-p", "some"]).is_err());
     }
 
     #[test]

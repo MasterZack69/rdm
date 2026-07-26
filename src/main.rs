@@ -23,7 +23,7 @@ fn main() -> Result<()> {
                 .url
                 .as_deref()
                 .expect("clap guarantees a URL when no subcommand is given");
-            quick_download(&cfg, url, &args.opts)
+            quick_download(&cfg, url, &args.opts, args.parallel)
         }
 
         Some(Command::Download { url, opts }) => {
@@ -76,7 +76,16 @@ fn main() -> Result<()> {
 
 /// `rdm <URL>` \u{2014} download a file, or expand a directory listing into the queue
 /// and immediately start working through it.
-fn quick_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+///
+/// `parallel` only takes effect on the listing path, where several files are
+/// downloaded at once. On the single-file path it has nothing to act on, so we
+/// say so rather than accepting the flag and quietly doing nothing with it.
+fn quick_download(
+    cfg: &config::Config,
+    url: &str,
+    opts: &DownloadOpts,
+    parallel: Option<usize>,
+) -> Result<()> {
     let url = cli::normalize_download_url(url);
     let connections = opts.connections.unwrap_or(cfg.connections);
     let scan_for_listing = opts.output.is_none() && looks_like_directory(&url);
@@ -100,9 +109,16 @@ fn quick_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Resul
                         Ok(())
                     })?;
 
-                    return queue::start(cfg, cancel, cfg.queue_parallel).await;
+                    let parallel = parallel.unwrap_or(cfg.queue_parallel);
+                    return queue::start(cfg, cancel, parallel).await;
                 }
             }
+        }
+
+        if parallel.is_some() && !opts.quiet {
+            eprintln!(
+                "  \u{26a0} -p applies to directory listings; ignoring it for a single file."
+            );
         }
 
         let output_path = resolve_output(opts.output.clone(), &url, cfg);
