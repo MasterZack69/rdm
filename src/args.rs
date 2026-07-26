@@ -137,7 +137,7 @@ pub fn resolve_output(output: Option<String>, url: &str, download_dir: &str) -> 
             let path = std::path::Path::new(&o);
             if o.ends_with('/') || o.ends_with('\\') || path.is_dir() {
                 let dir = o.trim_end_matches('/').trim_end_matches('\\');
-                format!("{}/ {}", dir, filename_from_url())
+                format!("{}/{}", dir, filename_from_url())
             } else if path.is_absolute() {
                 o
             } else {
