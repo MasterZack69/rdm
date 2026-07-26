@@ -108,3 +108,5 @@ cargo test
 - Claude Opus 4.6 - Wrote the code, fixed the bugs
 - GPT 5.2 - Asked “what if it races?” one too many times
 - Claude Opus 4.7 - Here to do everything better
+- Claude Opus 5 - Clap Migration
+- DeepSeek V4 Flash - Clippy error fixer
