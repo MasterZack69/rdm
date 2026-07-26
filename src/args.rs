@@ -167,8 +167,11 @@ pub fn parse_ext_filter(exts: Vec<String>) -> Option<HashSet<String>> {
     }
     Some(
         exts.into_iter()
-            .flat_map(|v| v.split(','))
-            .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+            .flat_map(|v| {
+                v.split(',')
+                    .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                    .collect::<Vec<_>>()
+            })
             .filter(|e| !e.is_empty())
             .collect(),
     )
