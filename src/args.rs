@@ -173,3 +173,66 @@ pub fn parse_ext_filter(exts: Vec<String>) -> Option<HashSet<String>> {
             .collect(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_output_explicit_file() {
+        assert_eq!(
+            resolve_output(Some("out.zip".into()), "https://example.com/file.zip", "/downloads"),
+            "out.zip"
+        );
+    }
+
+    #[test]
+    fn test_resolve_output_directory_trailing_slash() {
+        assert_eq!(
+            resolve_output(Some("/tmp/".into()), "https://example.com/file.zip", "/downloads"),
+            "/tmp/file.zip"
+        );
+    }
+
+    #[test]
+    fn test_resolve_output_from_url() {
+        assert_eq!(
+            resolve_output(None, "https://example.com/file.zip", "/downloads"),
+            "/downloads/file.zip"
+        );
+    }
+
+    #[test]
+    fn test_resolve_output_fallback() {
+        assert_eq!(
+            resolve_output(None, "https://example.com/", "/downloads"),
+            "/downloads/download.bin"
+        );
+    }
+
+    #[test]
+    fn test_parse_ext_filter_empty() {
+        assert_eq!(parse_ext_filter(vec![]), None);
+    }
+
+    #[test]
+    fn test_parse_ext_filter_single() {
+        let set = parse_ext_filter(vec!["mp4".into()]).unwrap();
+        assert!(set.contains("mp4"));
+    }
+
+    #[test]
+    fn test_parse_ext_filter_delimited() {
+        let set = parse_ext_filter(vec!["flac,mkv,MP3".into()]).unwrap();
+        assert!(set.contains("flac"));
+        assert!(set.contains("mkv"));
+        assert!(set.contains("mp3"));
+    }
+
+    #[test]
+    fn test_parse_ext_filter_strips_dots() {
+        let set = parse_ext_filter(vec![".mp4".into(), ".MOV".into()]).unwrap();
+        assert!(set.contains("mp4"));
+        assert!(set.contains("mov"));
+    }
+}
