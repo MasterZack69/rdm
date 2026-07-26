@@ -136,4 +136,40 @@ pub fn resolve_output(output: Option<String>, url: &str, download_dir: &str) -> 
         Some(o) => {
             let path = std::path::Path::new(&o);
             if o.ends_with('/') || o.ends_with('\\') || path.is_dir() {
-                let dir = o.trim_end_matches('/').trim_end
+                let dir = o.trim_end_matches('/').trim_end_matches('\\');
+                format!("{}/ {}", dir, filename_from_url())
+            } else if path.is_absolute() {
+                o
+            } else {
+                resolve_relative_path(&o, download_dir)
+            }
+        }
+        None => resolve_relative_path(&filename_from_url(), download_dir),
+    }
+}
+
+fn resolve_relative_path(filename: &str, download_dir: &str) -> String {
+    let path = std::path::Path::new(filename);
+    if path.is_absolute() {
+        filename.to_string()
+    } else {
+        std::path::PathBuf::from(download_dir)
+            .join(filename)
+            .to_string_lossy()
+            .to_string()
+    }
+}
+
+/// Convert a comma-separated extension list into a set of lowercase extensions.
+pub fn parse_ext_filter(exts: Vec<String>) -> Option<HashSet<String>> {
+    if exts.is_empty() {
+        return None;
+    }
+    Some(
+        exts.into_iter()
+            .flat_map(|v| v.split(','))
+            .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+            .filter(|e| !e.is_empty())
+            .collect(),
+    )
+}
