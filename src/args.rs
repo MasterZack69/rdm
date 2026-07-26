@@ -182,10 +182,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_output_explicit_file() {
+    fn test_resolve_output_relative_file() {
         assert_eq!(
             resolve_output(Some("out.zip".into()), "https://example.com/file.zip", "/downloads"),
-            "out.zip"
+            "/downloads/out.zip"
+        );
+    }
+
+    #[test]
+    fn test_resolve_output_absolute_file() {
+        assert_eq!(
+            resolve_output(Some("/tmp/out.zip".into()), "https://example.com/file.zip", "/downloads"),
+            "/tmp/out.zip"
         );
     }
 
