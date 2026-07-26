@@ -252,8 +252,8 @@ fn run_queue_command(
     }
 }
 
-fn run_quick_download(url: String, cli: &Cli, cfg: &config::Config) -> Result<()> {
-    let url = cli::normalize_download_url(&url);
+fn run_quick_download(url: &str, cli: &Cli, cfg: &config::Config) -> Result<()> {
+    let url = cli::normalize_download_url(url);
     let connections = cli.connections.unwrap_or(cfg.connections);
 
     tokio::runtime::Builder::new_multi_thread()
@@ -315,7 +315,7 @@ fn main() -> Result<()> {
             run_queue_command(args.command, cli.output, cli.connections, cli.allow_private, &cfg)
         }
         None => {
-            if let Some(url) = cli.url {
+            if let Some(ref url) = cli.url {
                 run_quick_download(url, &cli, &cfg)
             } else {
                 // clap's arg_required_else_help already handles the empty case,
