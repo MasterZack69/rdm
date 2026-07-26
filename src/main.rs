@@ -259,7 +259,7 @@ where
         })
 }
 
-fn print_discovered(files: &[scrape::RemoteFile]) {
+fn print_discovered(files: &[scrape::DiscoveredFile]) {
     eprintln!("  \u{1f4c1} Found {} file(s):", files.len());
     eprintln!();
     for file in files {
