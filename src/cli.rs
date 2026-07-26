@@ -108,8 +108,8 @@ pub async fn run_download(
     quiet: bool,
 ) -> Result<()> {
     let url = normalize_download_url(&url);
-    let output_path = resolve_output_path(&url, output.as_deref());
-    let output_path = match resolve_existing_output(&output_path, &url).await? {
+    let original_path = resolve_output_path(&url, output.as_deref());
+    let output_path = match resolve_existing_output(&original_path, &url).await? {
         Some(p) => p,
         None => {
             if !quiet {
@@ -118,6 +118,7 @@ pub async fn run_download(
             return Ok(());
         }
     };
+    let user_explicitly_renamed = output_path != original_path;
     let connections = connections.max(1);
 
     let client = shared_client()?;
@@ -128,8 +129,11 @@ pub async fn run_download(
 
     let info = inspect::inspect_url(client, &url).await?;
 
-    // Use server-suggested filename when URL has no extension
-    let output_path = if let Some(ref name) = info.suggested_filename {
+    // Use server-suggested filename when URL has no extension,
+    // but only if the user didn't explicitly choose a name (via rename or -o).
+    let output_path = if user_explicitly_renamed {
+        output_path
+    } else if let Some(ref name) = info.suggested_filename {
         let path = std::path::Path::new(&output_path);
         if path.extension().is_none() {
             let dir = path.parent().unwrap_or(std::path::Path::new("."));
