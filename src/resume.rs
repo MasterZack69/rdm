@@ -52,15 +52,15 @@ impl ResumeMetadata {
         current_etag: Option<&str>,
         current_last_modified: Option<&str>,
     ) -> bool {
-        if let (Some(stored), Some(current)) = (&self.etag, current_etag) {
-            if stored != current {
-                return false;
-            }
+        if let (Some(stored), Some(current)) = (&self.etag, current_etag)
+            && stored != current
+        {
+            return false;
         }
-        if let (Some(stored), Some(current)) = (&self.last_modified, current_last_modified) {
-            if stored != current {
-                return false;
-            }
+        if let (Some(stored), Some(current)) = (&self.last_modified, current_last_modified)
+            && stored != current
+        {
+            return false;
         }
         true
     }

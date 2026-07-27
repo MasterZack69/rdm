@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use rdm::args::{
     Cli, ClearTarget, Command, DownloadOpts, QueueCommand, RetryTarget, normalize_extensions,
 };
-use rdm::{cli, config, queue, scrape, signal, sync};
+use rdm::{config, engine, queue, scrape, signal, sync};
 
 fn main() -> Result<()> {
     let args = Cli::parse();
@@ -27,12 +27,12 @@ fn main() -> Result<()> {
         }
 
         Some(Command::Download { url, opts }) => {
-            let url = cli::normalize_download_url(&url);
+            let url = engine::normalize_download_url(&url);
             let connections = opts.connections.unwrap_or(cfg.connections);
             let output_path = resolve_output(opts.output.clone(), &url, &cfg);
 
             run_async(|cancel| async move {
-                cli::run_download(url, Some(output_path), connections, cancel, opts.quiet).await
+                engine::run_download(url, Some(output_path), connections, cancel, opts.quiet).await
             })
         }
 
@@ -72,9 +72,9 @@ fn main() -> Result<()> {
     }
 }
 
-// \u{2500}\u{2500} Command handlers \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+// -- Command handlers ------------------------------------------------
 
-/// `rdm <URL>` \u{2014} download a file, or expand a directory listing into the queue
+/// `rdm <URL>` — download a file, or expand a directory listing into the queue
 /// and immediately start working through it.
 ///
 /// `parallel` only takes effect on the listing path, where several files are
@@ -86,7 +86,7 @@ fn quick_download(
     opts: &DownloadOpts,
     parallel: Option<usize>,
 ) -> Result<()> {
-    let url = cli::normalize_download_url(url);
+    let url = engine::normalize_download_url(url);
     let connections = opts.connections.unwrap_or(cfg.connections);
     let scan_for_listing = opts.output.is_none() && looks_like_directory(&url);
 
@@ -94,24 +94,24 @@ fn quick_download(
         if scan_for_listing {
             // A failed scan is not fatal: fall through and treat the URL as a
             // single file, which is what it usually turns out to be.
-            if let Ok(Some(files)) = scrape::discover_files(&url, true, opts.allow_private).await {
-                if !files.is_empty() {
-                    print_discovered(&files);
+            if let Ok(Some(files)) = scrape::discover_files(&url, true, opts.allow_private).await
+                && !files.is_empty()
+            {
+                print_discovered(&files);
 
-                    queue::Queue::locked(|q| {
-                        for file in &files {
-                            q.add(
-                                file.url.clone(),
-                                Some(file.relative_path.clone()),
-                                Some(connections),
-                            );
-                        }
-                        Ok(())
-                    })?;
+                queue::Queue::locked(|q| {
+                    for file in &files {
+                        q.add(
+                            file.url.clone(),
+                            Some(file.relative_path.clone()),
+                            Some(connections),
+                        );
+                    }
+                    Ok(())
+                })?;
 
-                    let parallel = parallel.unwrap_or(cfg.queue_parallel);
-                    return queue::start(cfg, cancel, parallel).await;
-                }
+                let parallel = parallel.unwrap_or(cfg.queue_parallel);
+                return queue::start(cfg, cancel, parallel).await;
             }
         }
 
@@ -122,7 +122,7 @@ fn quick_download(
         }
 
         let output_path = resolve_output(opts.output.clone(), &url, cfg);
-        cli::run_download(url, Some(output_path), connections, cancel, opts.quiet).await
+        engine::run_download(url, Some(output_path), connections, cancel, opts.quiet).await
     })
 }
 
@@ -206,9 +206,9 @@ fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
     }
 }
 
-/// `rdm queue add` \u{2014} enqueue a single file, or every file behind a listing.
+/// `rdm queue add` — enqueue a single file, or every file behind a listing.
 fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
-    let url = cli::normalize_download_url(url);
+    let url = engine::normalize_download_url(url);
 
     let discovered = if looks_like_directory(&url) {
         tokio::runtime::Builder::new_current_thread()
@@ -242,7 +242,7 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
                 .as_deref()
                 .map(|o| resolve_relative_to_config(o, cfg));
             let id = queue::Queue::locked(|q| Ok(q.add(url.clone(), output, opts.connections)))?;
-            eprintln!("  \u{2705} Added #{}: {}", id, cli::percent_decode(&url));
+            eprintln!("  \u{2705} Added #{}: {}", id, engine::percent_decode(&url));
         }
     }
 
@@ -253,7 +253,7 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
     Ok(())
 }
 
-// \u{2500}\u{2500} Helpers \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+// -- Helpers ---------------------------------------------------------
 
 /// Builds a multi-threaded runtime, wires SIGINT/SIGTERM to a
 /// [`CancellationToken`] so in-flight downloads can checkpoint their progress,
@@ -275,11 +275,18 @@ where
         })
 }
 
+/// Shows what was found without burying the terminal: a listing of 4000 files
+/// used to print 4000 lines before a single byte was downloaded.
 fn print_discovered(files: &[scrape::DiscoveredFile]) {
+    const SAMPLE: usize = 20;
+
     eprintln!("  \u{1f4c1} Found {} file(s):", files.len());
     eprintln!();
-    for file in files {
-        eprintln!("     + {}", cli::percent_decode(&file.relative_path));
+    for file in files.iter().take(SAMPLE) {
+        eprintln!("     + {}", engine::percent_decode(&file.relative_path));
+    }
+    if files.len() > SAMPLE {
+        eprintln!("     \u{2026} and {} more", files.len() - SAMPLE);
     }
     eprintln!();
 }
@@ -291,7 +298,7 @@ fn print_discovered(files: &[scrape::DiscoveredFile]) {
 /// Relative paths land under the configured download directory.
 fn resolve_output(output: Option<String>, url: &str, cfg: &config::Config) -> String {
     let filename_from_url = || -> String {
-        cli::extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
+        engine::extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
     };
 
     match output {

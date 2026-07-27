@@ -1,7 +1,19 @@
+//! The download engine.
+//!
+//! Formerly `cli.rs`, which was a misnomer: argument parsing lives in
+//! `args.rs` and the command dispatch lives in `main.rs`. This module knows
+//! how to turn a URL into a file on disk and nothing else.
+//!
+//! It never prints. Callers hand it a [`ProgressSink`] and receive an
+//! [`Outcome`]; a single download passes a [`ui::SoloBar`], the queue passes a
+//! lane of its live board. That is what makes per-file progress lines
+//! possible during parallel runs.
+
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
@@ -9,6 +21,7 @@ use crate::chunk::Chunk;
 use crate::inspect;
 use crate::parallel;
 use crate::retry::RetryConfig;
+use crate::ui::{self, ProgressSink, SlotState};
 
 static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
@@ -30,7 +43,61 @@ fn shared_config() -> &'static crate::config::Config {
     SHARED_CONFIG.get_or_init(crate::config::Config::load)
 }
 
-// ── Streaming Resume Helpers ───────────────────────────────────────
+// ── Request / outcome ───────────────────────────────────────────────────
+
+/// What to do when the target file already exists on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingPolicy {
+    /// Prompt the user to overwrite / rename / cancel. Interactive only.
+    Ask,
+    /// Treat the existing file as done. Used by every batch path, so a queue
+    /// of 400 files never blocks on a hidden prompt behind the progress board.
+    Reuse,
+    /// Remove the file (and any `.part` / `.rdm` state) and download again.
+    Overwrite,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadRequest {
+    pub url: String,
+    pub output: Option<String>,
+    pub connections: usize,
+    pub policy: ExistingPolicy,
+}
+
+impl DownloadRequest {
+    pub fn new(url: String, output: Option<String>, connections: usize) -> Self {
+        Self {
+            url,
+            output,
+            connections,
+            policy: ExistingPolicy::Ask,
+        }
+    }
+
+    pub fn with_policy(mut self, policy: ExistingPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+}
+
+/// How a download ended. Errors are still returned as `Err`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Completed { path: String, bytes: u64 },
+    AlreadyPresent { path: String },
+    Cancelled,
+}
+
+/// Result of reconciling the requested output path with what is on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputDecision {
+    Use(String),
+    AlreadyPresent,
+    Cancelled,
+}
+
+// ── Streaming resume helpers ─────────────────────────────────────────────
 
 /// Describes what the streaming download should do after the initial response.
 #[derive(Debug, PartialEq)]
@@ -77,12 +144,8 @@ pub fn resolve_resume_action(
             // Server ignored Range header entirely
             ResumeAction::Restart
         }
-        reqwest::StatusCode::RANGE_NOT_SATISFIABLE => {
-            ResumeAction::Restart
-        }
-        _ => {
-            ResumeAction::Fail(status)
-        }
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE => ResumeAction::Restart,
+        _ => ResumeAction::Fail(status),
     }
 }
 
@@ -98,39 +161,42 @@ pub fn build_streaming_request(
     req
 }
 
-// ── Main Download Entry Point ──────────────────────────────────────
+// ── Main download entry point ────────────────────────────────────────────
 
-pub async fn run_download(
-    url: String,
-    output: Option<String>,
-    connections: usize,
+/// Downloads one file, reporting everything through `sink`.
+pub async fn download(
+    req: DownloadRequest,
     cancel: CancellationToken,
-    quiet: bool,
-) -> Result<()> {
-    let url = normalize_download_url(&url);
-    let original_path = resolve_output_path(&url, output.as_deref());
-    let output_path = match resolve_existing_output(&original_path, &url).await? {
-        Some(p) => p,
-        None => {
-            if !quiet {
-                eprintln!("  Download cancelled.");
-            }
-            return Ok(());
+    sink: Arc<dyn ProgressSink>,
+) -> Result<Outcome> {
+    let url = normalize_download_url(&req.url);
+    let original_path = resolve_output_path(&url, req.output.as_deref());
+
+    let output_path = match resolve_existing_output(&original_path, &url, req.policy).await? {
+        OutputDecision::Use(p) => p,
+        OutputDecision::AlreadyPresent => {
+            sink.finish();
+            return Ok(Outcome::AlreadyPresent {
+                path: original_path,
+            });
+        }
+        OutputDecision::Cancelled => {
+            sink.finish();
+            return Ok(Outcome::Cancelled);
         }
     };
-    let user_explicitly_renamed = output_path != original_path;
-    let connections = connections.max(1);
 
+    let user_explicitly_renamed = output_path != original_path;
+    let connections = req.connections.max(1);
     let client = shared_client()?;
 
-    if !quiet {
-        eprintln!("  Inspecting: {}", url);
-    }
+    sink.state(SlotState::Inspecting);
+    sink.detail(&format!("Inspecting: {}", url));
 
     let info = inspect::inspect_url(client, &url).await?;
 
-    // Use server-suggested filename when URL has no extension,
-    // but only if the user didn't explicitly choose a name (via rename or -o).
+    // Use the server-suggested filename when the URL has no extension, but
+    // only if the user didn't explicitly choose a name (via rename or -o).
     let output_path = if user_explicitly_renamed {
         output_path
     } else if let Some(ref name) = info.suggested_filename {
@@ -145,50 +211,56 @@ pub async fn run_download(
         output_path
     };
 
-    // ── Fix #1: Unknown file size → streaming fallback ──
+    // Unknown file size → streaming fallback.
     let file_size = match info.size {
         Some(0) => anyhow::bail!("Cannot download empty file (Content-Length: 0)"),
         Some(s) => s,
         None => {
-            if !quiet {
-                eprintln!("  File size : unknown (streaming)");
-                eprintln!("  Output    : {}", output_path);
-                eprintln!();
-            }
-            let start_time = Instant::now();
-            let result = download_streaming(client, &url, &output_path, cancel, quiet).await;
-            if !quiet { eprint!("\r\x1b[2K"); }
+            sink.detail("File size : unknown (streaming)");
+            sink.detail(&format!("Output    : {}", output_path));
+            sink.total(None);
+            sink.state(SlotState::Downloading);
+
+            let result =
+                download_streaming(client, &url, &output_path, cancel, Arc::clone(&sink)).await;
+            sink.finish();
+
             return match result {
-                Ok(bytes) => {
-                    if !quiet {
-                        let secs = start_time.elapsed().as_secs_f64();
-                        let avg = if secs > 0.1 { (bytes as f64 / secs) as u64 } else { 0 };
-                        eprintln!("  \u{2705} Download complete: {}", output_path);
-                        eprintln!("  {} in {:.1}s ({})", format_bytes(bytes), secs, format_speed(avg));
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    if !quiet { eprintln!("  \u{274d} Download failed."); }
-                    Err(e)
-                }
+                Ok(bytes) => Ok(Outcome::Completed {
+                    path: output_path,
+                    bytes,
+                }),
+                Err(e) => Err(e),
             };
         }
     };
 
-    // Fix #5: lower single-connection threshold from 32 MiB → 4 MiB
-    let connections = if file_size < 4 * 1024 * 1024 { 1 } else { connections };
+    // Small files gain nothing from parallel connections.
+    let connections = if file_size < 4 * 1024 * 1024 {
+        1
+    } else {
+        connections
+    };
 
-    if !quiet {
-        eprintln!("  File size : {}", format_bytes(file_size));
-        eprintln!("  Range     : {}", if info.supports_range { "supported" } else { "not supported" });
-        eprintln!("  Output    : {}", output_path);
-    }
+    sink.detail(&format!("File size : {}", ui::format_size(file_size)));
+    sink.detail(&format!(
+        "Range     : {}",
+        if info.supports_range {
+            "supported"
+        } else {
+            "not supported"
+        }
+    ));
+    sink.detail(&format!("Output    : {}", output_path));
 
     let chunks = if info.supports_range && connections > 1 {
         plan_chunks_with_count(file_size, connections as u32)
     } else {
-        vec![Chunk { id: 1, start: 0, end: file_size - 1 }]
+        vec![Chunk {
+            id: 1,
+            start: 0,
+            end: file_size - 1,
+        }]
     };
 
     if !info.supports_range {
@@ -198,49 +270,16 @@ pub async fn run_download(
         let _ = std::fs::remove_file(&part_path);
     }
 
-    if !quiet {
-        eprintln!("  Chunks    : {}", chunks.len());
-        eprintln!();
-    }
+    sink.detail(&format!("Chunks    : {}", chunks.len()));
 
-    let start_time = Instant::now();
-    let last_print = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
-    let speed_samples: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> =
-        std::sync::Mutex::new(std::collections::VecDeque::new());
+    sink.total(Some(file_size));
+    sink.state(SlotState::Downloading);
 
-    let progress_callback = move |downloaded: u64, total: u64| {
-        if quiet { return; }
-
-        let now = Instant::now();
-        let is_complete = downloaded >= total;
-
-        {
-            let mut lp = last_print.lock().unwrap_or_else(|p| p.into_inner());
-            if !is_complete && now.duration_since(*lp) < Duration::from_millis(100) {
-                return;
-            }
-            *lp = now;
-        }
-
-        let elapsed_ms = start_time.elapsed().as_millis() as u64;
-        let mut samples = speed_samples.lock().unwrap_or_else(|p| p.into_inner());
-        samples.push_back((elapsed_ms, downloaded));
-
-        while samples.len() > 1 && elapsed_ms - samples.front().unwrap().0 > 3000 {
-            samples.pop_front();
-        }
-
-        let speed_bps = if samples.len() >= 2 {
-            let oldest = samples.front().unwrap();
-            let dt = (elapsed_ms - oldest.0) as f64 / 1000.0;
-            let db = downloaded.saturating_sub(oldest.1) as f64;
-            if dt > 0.1 { (db / dt) as u64 } else { 0 }
-        } else {
-            0
-        };
-
-        drop(samples);
-        print_progress_bar(downloaded, total, speed_bps);
+    // The sink owns throttling, smoothing, and ETA maths now, so the callback
+    // is just a forwarder.
+    let progress_sink = Arc::clone(&sink);
+    let progress_callback = move |downloaded: u64, _total: u64| {
+        progress_sink.progress(downloaded);
     };
 
     let retry_config = RetryConfig {
@@ -260,27 +299,80 @@ pub async fn run_download(
         last_modified: info.last_modified.clone(),
     };
 
-    let download_result = parallel::download_parallel(
-        &ctx, Some(progress_callback),
-    ).await;
+    let download_result = parallel::download_parallel(&ctx, Some(progress_callback)).await;
 
-    if !quiet {
-        eprint!("\r\x1b[2K");
-    }
+    sink.state(SlotState::Finishing);
+    sink.finish();
 
     match download_result {
-        Ok(bytes) => {
+        Ok(bytes) => Ok(Outcome::Completed {
+            path: output_path,
+            bytes,
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+/// Single-download convenience wrapper: renders its own progress bar and
+/// prints a summary line. Used by `rdm <url>` and `rdm download`.
+pub async fn run_download(
+    url: String,
+    output: Option<String>,
+    connections: usize,
+    cancel: CancellationToken,
+    quiet: bool,
+) -> Result<()> {
+    let name = output
+        .clone()
+        .map(|o| o.rsplit('/').next().unwrap_or(&o).to_string())
+        .or_else(|| extract_filename_from_url(&url))
+        .unwrap_or_else(|| "download".to_string());
+
+    let bar = if quiet {
+        None
+    } else {
+        Some(ui::SoloBar::new(&name))
+    };
+    let sink: Arc<dyn ProgressSink> = match &bar {
+        Some(b) => Arc::clone(b) as Arc<dyn ProgressSink>,
+        None => ui::silent(),
+    };
+
+    let request = DownloadRequest::new(url, output, connections);
+    let result = download(request, cancel, sink).await;
+    let elapsed = bar.as_ref().map(|b| b.elapsed()).unwrap_or_default();
+
+    match result {
+        Ok(Outcome::Completed { path, bytes }) => {
             if !quiet {
-                let secs = start_time.elapsed().as_secs_f64();
-                let avg = if secs > 0.1 { (bytes as f64 / secs) as u64 } else { 0 };
-                eprintln!("  \u{2705} Download complete: {}", output_path);
-                eprintln!("  {} in {:.1}s ({})",
-                    format_bytes(bytes), secs, format_speed(avg),
+                let secs = elapsed.as_secs_f64();
+                let avg = if secs > 0.1 {
+                    Some((bytes as f64 / secs) as u64)
+                } else {
+                    None
+                };
+                eprintln!("  \u{2705} Download complete: {}", path);
+                eprintln!(
+                    "  {} in {} ({})",
+                    ui::format_size(bytes),
+                    ui::format_duration(elapsed.as_secs()),
+                    ui::format_speed(avg),
                 );
             }
             Ok(())
         }
-
+        Ok(Outcome::AlreadyPresent { path }) => {
+            if !quiet {
+                eprintln!("  \u{2713} Already downloaded: {}", path);
+            }
+            Ok(())
+        }
+        Ok(Outcome::Cancelled) => {
+            if !quiet {
+                eprintln!("  Download cancelled.");
+            }
+            Ok(())
+        }
         Err(e) => {
             if !quiet {
                 eprintln!("  \u{274d} Download failed.");
@@ -296,7 +388,7 @@ async fn download_streaming(
     url: &str,
     output_path: &str,
     cancel: CancellationToken,
-    quiet: bool,
+    sink: Arc<dyn ProgressSink>,
 ) -> Result<u64> {
     let temp_path = format!("{}.part", output_path);
 
@@ -320,48 +412,47 @@ async fn download_streaming(
         .map(|s| s.to_owned());
 
     // Phase 2: Decide resume/restart/fresh/fail
-    let (resume_offset, append, resp) = match resolve_resume_action(
-        status,
-        existing_bytes,
-        content_range.as_deref(),
-    ) {
-        ResumeAction::Resume(offset) => {
-            if !quiet {
-                eprintln!("  Resuming from {}", format_bytes_compact(offset));
+    let (resume_offset, append, resp) =
+        match resolve_resume_action(status, existing_bytes, content_range.as_deref()) {
+            ResumeAction::Resume(offset) => {
+                sink.note(&format!("Resuming from {}", ui::format_size(offset)));
+                (offset, true, resp)
             }
-            (offset, true, resp)
-        }
-        ResumeAction::Restart => {
-            // Drop the unusable response and issue a fresh non-range GET
-            drop(resp);
-            if existing_bytes > 0 && !quiet {
-                eprintln!("  Server response unusable for resume, restarting from zero");
+            ResumeAction::Restart => {
+                // Drop the unusable response and issue a fresh non-range GET
+                drop(resp);
+                if existing_bytes > 0 {
+                    sink.note("Server response unusable for resume, restarting from zero");
+                }
+                let fresh_resp = client
+                    .get(url)
+                    .send()
+                    .await
+                    .context("Fresh GET request failed")?;
+                if !fresh_resp.status().is_success() {
+                    anyhow::bail!(
+                        "Restart request failed with status {} {}",
+                        fresh_resp.status().as_u16(),
+                        fresh_resp.status().canonical_reason().unwrap_or("Unknown"),
+                    );
+                }
+                (0u64, false, fresh_resp)
             }
-            let fresh_resp = client
-                .get(url)
-                .send()
-                .await
-                .context("Fresh GET request failed")?;
-            if !fresh_resp.status().is_success() {
+            ResumeAction::Fresh => (0u64, false, resp),
+            ResumeAction::Fail(code) => {
                 anyhow::bail!(
-                    "Restart request failed with status {} {}",
-                    fresh_resp.status().as_u16(),
-                    fresh_resp.status().canonical_reason().unwrap_or("Unknown"),
+                    "Server returned {} {}",
+                    code.as_u16(),
+                    code.canonical_reason().unwrap_or("Unknown"),
                 );
             }
-            (0u64, false, fresh_resp)
-        }
-        ResumeAction::Fresh => {
-            (0u64, false, resp)
-        }
-        ResumeAction::Fail(code) => {
-            anyhow::bail!(
-                "Server returned {} {}",
-                code.as_u16(),
-                code.canonical_reason().unwrap_or("Unknown"),
-            );
-        }
-    };
+        };
+
+    // A streaming response may still tell us how big it is; if so the sink can
+    // draw a real bar and ETA instead of a byte counter.
+    if let Some(len) = resp.content_length() {
+        sink.total(Some(len + resume_offset));
+    }
 
     // Phase 3: Open file and stream body
     let file = if append {
@@ -380,8 +471,8 @@ async fn download_streaming(
     let mut stream = resp.bytes_stream();
     let mut downloaded: u64 = resume_offset;
     let mut bytes_since_flush: u64 = 0;
-    let start_time = Instant::now();
-    let mut last_print = Instant::now() - Duration::from_secs(1);
+
+    sink.progress(downloaded);
 
     loop {
         let chunk = tokio::select! {
@@ -404,16 +495,7 @@ async fn download_streaming(
                     bytes_since_flush = 0;
                 }
 
-                if !quiet {
-                    let now = Instant::now();
-                    if now.duration_since(last_print) >= Duration::from_millis(100) {
-                        last_print = now;
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        let new_bytes = downloaded - resume_offset;
-                        let speed = if elapsed > 0.1 { (new_bytes as f64 / elapsed) as u64 } else { 0 };
-                        eprint!("\r\x1b[2K  {} | {}", format_bytes_compact(downloaded), format_speed(speed));
-                    }
-                }
+                sink.progress(downloaded);
             }
             Some(Err(e)) => {
                 writer.flush().await.ok();
@@ -426,6 +508,8 @@ async fn download_streaming(
     writer.flush().await?;
     drop(writer);
 
+    sink.state(SlotState::Finishing);
+
     tokio::fs::rename(&temp_path, output_path)
         .await
         .with_context(|| format!("Failed to rename '{}' to '{}'", temp_path, output_path))?;
@@ -433,26 +517,52 @@ async fn download_streaming(
     Ok(downloaded)
 }
 
-pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<String>> {
+/// Decides what to do about an already-existing output file.
+///
+/// A resumable download (a `.part` file, or valid `.rdm` metadata) always wins
+/// over the policy — there is nothing to ask about, we just continue.
+pub async fn resolve_existing_output(
+    path: &str,
+    url: &str,
+    policy: ExistingPolicy,
+) -> Result<OutputDecision> {
     use std::io::{BufRead, IsTerminal, Write};
 
     if !std::path::Path::new(path).exists() {
-        return Ok(Some(path.to_string()));
+        return Ok(OutputDecision::Use(path.to_string()));
     }
 
     let part_path = format!("{}.part", path);
     if std::path::Path::new(&part_path).exists() {
-        return Ok(Some(path.to_string()));
+        return Ok(OutputDecision::Use(path.to_string()));
     }
 
     let meta_path = crate::resume::ResumeMetadata::meta_path(path);
     if let Ok(meta) = crate::resume::load(&meta_path).await {
-        let chunks: Vec<crate::chunk::Chunk> = meta.chunks.iter().map(|c| {
-            crate::chunk::Chunk { id: c.id, start: c.start, end: c.end }
-        }).collect();
+        let chunks: Vec<crate::chunk::Chunk> = meta
+            .chunks
+            .iter()
+            .map(|c| crate::chunk::Chunk {
+                id: c.id,
+                start: c.start,
+                end: c.end,
+            })
+            .collect();
         if crate::resume::validate_against(&meta, url, meta.file_size, &chunks) {
-            return Ok(Some(path.to_string()));
+            return Ok(OutputDecision::Use(path.to_string()));
         }
+    }
+
+    match policy {
+        // Batch runs must never block on stdin.
+        ExistingPolicy::Reuse => return Ok(OutputDecision::AlreadyPresent),
+        ExistingPolicy::Overwrite => {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&part_path);
+            let _ = std::fs::remove_file(&meta_path);
+            return Ok(OutputDecision::Use(path.to_string()));
+        }
+        ExistingPolicy::Ask => {}
     }
 
     if !std::io::stdin().is_terminal() {
@@ -484,35 +594,35 @@ pub async fn resolve_existing_output(path: &str, url: &str) -> Result<Option<Str
                 let _ = std::fs::remove_file(path);
                 let _ = std::fs::remove_file(&part_path);
                 let _ = std::fs::remove_file(&meta_path);
-                return Ok(Some(path.to_string()));
+                return Ok(OutputDecision::Use(path.to_string()));
             }
-            "2" => {
-                loop {
-                    eprint!("  New filename: ");
-                    std::io::stderr().flush()?;
-                    let mut name = String::new();
-                    std::io::stdin().lock().read_line(&mut name)?;
-                    let trimmed = name.trim();
-                    if trimmed.is_empty() {
-                        eprintln!("  Filename cannot be empty.");
-                        continue;
-                    }
-                    let new_path = if parent.as_os_str().is_empty() {
-                        trimmed.to_string()
-                    } else {
-                        parent.join(trimmed).to_string_lossy().to_string()
-                    };
-                    return Ok(Some(new_path));
+            "2" => loop {
+                eprint!("  New filename: ");
+                std::io::stderr().flush()?;
+                let mut name = String::new();
+                std::io::stdin().lock().read_line(&mut name)?;
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    eprintln!("  Filename cannot be empty.");
+                    continue;
                 }
-            }
-            "3" => return Ok(None),
+                let new_path = if parent.as_os_str().is_empty() {
+                    trimmed.to_string()
+                } else {
+                    parent.join(trimmed).to_string_lossy().to_string()
+                };
+                return Ok(OutputDecision::Use(new_path));
+            },
+            "3" => return Ok(OutputDecision::Cancelled),
             _ => eprintln!("  Invalid choice. Enter 1, 2, or 3."),
         }
     }
 }
 
 fn resolve_output_path(url: &str, output: Option<&str>) -> String {
-    if let Some(provided) = output { return provided.to_string(); }
+    if let Some(provided) = output {
+        return provided.to_string();
+    }
     extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
 }
 
@@ -523,7 +633,9 @@ pub fn extract_filename_from_url(url: &str) -> Option<String> {
     let segment = path.rsplit('/').next()?;
     let decoded = percent_decode(segment);
     let trimmed = decoded.trim();
-    if trimmed.is_empty() || trimmed == "/" { return None; }
+    if trimmed.is_empty() || trimmed == "/" {
+        return None;
+    }
     Some(trimmed.to_string())
 }
 
@@ -580,11 +692,11 @@ pub fn percent_decode(input: &str) -> String {
             let hi = chars.next();
             let lo = chars.next();
             if let (Some(h), Some(l)) = (hi, lo) {
-                if let Ok(s) = std::str::from_utf8(&[h, l]) {
-                    if let Ok(decoded) = u8::from_str_radix(s, 16) {
-                        bytes.push(decoded);
-                        continue;
-                    }
+                if let Ok(s) = std::str::from_utf8(&[h, l])
+                    && let Ok(decoded) = u8::from_str_radix(s, 16)
+                {
+                    bytes.push(decoded);
+                    continue;
                 }
                 // Failed decode — push all three bytes back
                 bytes.push(b'%');
@@ -593,7 +705,9 @@ pub fn percent_decode(input: &str) -> String {
             } else {
                 // Incomplete sequence — push what we have
                 bytes.push(b'%');
-                if let Some(h) = hi { bytes.push(h); }
+                if let Some(h) = hi {
+                    bytes.push(h);
+                }
             }
         } else {
             bytes.push(b);
@@ -613,66 +727,17 @@ fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
         let size = chunk_size + extra;
         let start = offset;
         let end = start + size - 1;
-        chunks.push(Chunk { id: i + 1, start, end });
+        chunks.push(Chunk {
+            id: i + 1,
+            start,
+            end,
+        });
         offset = end + 1;
     }
     chunks
 }
 
-// ── Progress Display ────────────────────────────────────────────────
-
-fn print_progress_bar(downloaded: u64, total: u64, speed_bps: u64) {
-    if total == 0 { return; }
-    let pct = (downloaded as f64 / total as f64 * 100.0).min(100.0);
-    let remaining = total.saturating_sub(downloaded);
-    let speed = format_speed(speed_bps);
-    let eta = format_eta(speed_bps, remaining);
-    let bar_width = 25;
-    let filled = (pct / 100.0 * bar_width as f64) as usize;
-    let empty = bar_width - filled;
-    eprint!("\r\x1b[2K  {:>5.1}% [{}{}] {} / {} | {} | {}",
-        pct, "\u{2588}".repeat(filled), "\u{2591}".repeat(empty),
-        format_bytes_compact(downloaded), format_bytes_compact(total), speed, eta,
-    );
-}
-
-fn format_speed(bytes_per_sec: u64) -> String {
-    if bytes_per_sec == 0 { return "-- MB/s".to_string(); }
-    format!("{}/s", format_bytes_compact(bytes_per_sec))
-}
-
-fn format_eta(speed_bps: u64, remaining: u64) -> String {
-    if speed_bps == 0 {
-        return "ETA --:--".to_string();
-    }
-    let eta_secs = remaining / speed_bps;
-    if eta_secs >= 3600 {
-        format!("ETA {}h {:02}m", eta_secs / 3600, (eta_secs % 3600) / 60)
-    } else if eta_secs >= 60 {
-        format!("ETA {}m {:02}s", eta_secs / 60, eta_secs % 60)
-    } else {
-        format!("ETA {}s", eta_secs)
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024; const MIB: u64 = KIB * 1024; const GIB: u64 = MIB * 1024;
-    if bytes >= GIB { format!("{:.2} GiB ({} bytes)", bytes as f64 / GIB as f64, bytes) }
-    else if bytes >= MIB { format!("{:.2} MiB ({} bytes)", bytes as f64 / MIB as f64, bytes) }
-    else if bytes >= KIB { format!("{:.2} KiB ({} bytes)", bytes as f64 / KIB as f64, bytes) }
-    else { format!("{} bytes", bytes) }
-}
-
-fn format_bytes_compact(bytes: u64) -> String {
-    const KIB: f64 = 1024.0; const MIB: f64 = KIB * 1024.0; const GIB: f64 = MIB * 1024.0;
-    let b = bytes as f64;
-    if b >= GIB { format!("{:.2} GiB", b / GIB) }
-    else if b >= MIB { format!("{:.1} MiB", b / MIB) }
-    else if b >= KIB { format!("{:.1} KiB", b / KIB) }
-    else { format!("{} B", bytes) }
-}
-
-// ── Tests ───────────────────────────────────────────────────────────
+// ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -703,6 +768,80 @@ mod tests {
         let total: u64 = chunks.iter().map(|c| c.end - c.start + 1).sum();
         assert_eq!(total, 1003);
         for i in 1..chunks.len() { assert_eq!(chunks[i].start, chunks[i-1].end + 1); }
+    }
+
+    // ── Request builder ──
+
+    #[test]
+    fn request_defaults_to_asking_about_existing_files() {
+        let req = DownloadRequest::new("https://example.com/f.zip".into(), None, 8);
+        assert_eq!(req.policy, ExistingPolicy::Ask);
+        assert_eq!(req.with_policy(ExistingPolicy::Reuse).policy, ExistingPolicy::Reuse);
+    }
+
+    // ── Existing-output policy ──
+
+    #[tokio::test]
+    async fn missing_file_is_always_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.bin").to_string_lossy().to_string();
+        assert_eq!(
+            resolve_existing_output(&path, "https://example.com/nope.bin", ExistingPolicy::Ask)
+                .await
+                .unwrap(),
+            OutputDecision::Use(path),
+        );
+    }
+
+    #[tokio::test]
+    async fn reuse_policy_reports_existing_file_instead_of_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("done.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        let path = path.to_string_lossy().to_string();
+
+        assert_eq!(
+            resolve_existing_output(&path, "https://example.com/done.bin", ExistingPolicy::Reuse)
+                .await
+                .unwrap(),
+            OutputDecision::AlreadyPresent,
+        );
+    }
+
+    #[tokio::test]
+    async fn overwrite_policy_clears_the_file_and_its_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.bin");
+        std::fs::write(&path, b"old").unwrap();
+        let path = path.to_string_lossy().to_string();
+
+        assert_eq!(
+            resolve_existing_output(
+                &path,
+                "https://example.com/stale.bin",
+                ExistingPolicy::Overwrite
+            )
+            .await
+            .unwrap(),
+            OutputDecision::Use(path.clone()),
+        );
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn a_partial_download_resumes_regardless_of_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("half.bin");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::write(dir.path().join("half.bin.part"), b"partial").unwrap();
+        let path = path.to_string_lossy().to_string();
+
+        assert_eq!(
+            resolve_existing_output(&path, "https://example.com/half.bin", ExistingPolicy::Reuse)
+                .await
+                .unwrap(),
+            OutputDecision::Use(path),
+        );
     }
 
     // ── Streaming resume helper tests ──

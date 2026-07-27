@@ -23,7 +23,7 @@ fn filename_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Op
     if let Some(pos) = val.find("filename*=UTF-8''") {
         let name = &val[pos + 17..];
         let name = name.split(';').next().unwrap_or(name).trim();
-        let decoded = crate::cli::percent_decode(name);
+        let decoded = crate::engine::percent_decode(name);
         if !decoded.is_empty() {
             return Some(decoded);
         }
