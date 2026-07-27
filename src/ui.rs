@@ -3,16 +3,27 @@
 //! Everything rdm draws while work is in flight goes through this module so
 //! that concurrent downloads can't scribble over each other:
 //!
-//!   - [`Board`]  — a live, multi-line display: one line per in-flight file
-//!                  plus an aggregate header. Used by the queue (and therefore
-//!                  by `sync` and directory downloads).
+//!   - [`Board`] — a live block: one short line per in-flight file plus a
+//!     summary line. Used by the queue (and therefore by `sync` and directory
+//!     downloads).
 //!   - [`SoloBar`] — a single refreshing line for one-file downloads.
-//!   - [`CountProgress`] — a counter + ETA line for non-byte work (hashing,
-//!                  verification, deletes).
+//!   - [`CountProgress`] — a counter + ETA line for non-byte work.
 //!   - [`ScanSpinner`] — a live counter for directory scraping.
 //!
-//! All of them write to **stderr**, degrade to plain, scroll-safe output when
-//! stderr is not a TTY, and share the formatters at the bottom of the file.
+//! ## Rules this module must never break
+//!
+//! 1. **Every emitted line is clipped to `term_width() - 1`.** A line that is
+//!    even one column too long wraps onto a second physical row, and then the
+//!    `ESC[nA` cursor math (which counts logical lines) is wrong forever after
+//!    — the block scrolls instead of redrawing. This is what caused the
+//!    repeated-line spam.
+//! 2. **Width is measured in columns, not chars.** Emoji occupy two columns;
+//!    counting them as one re-introduces rule 1.
+//! 3. **A live block never ends with a newline.** The cursor stays parked on
+//!    the last drawn line so the next frame can move up exactly `lines - 1`.
+//!
+//! Everything writes to stderr and degrades to plain, scroll-safe output when
+//! stderr is not a TTY.
 
 use std::collections::VecDeque;
 use std::io::{IsTerminal, Write};
@@ -20,24 +31,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-/// Speed is averaged over this window so the number stays readable instead of
-/// jittering with every TCP burst.
+/// Speed is averaged over this window so the number stays readable.
 const RATE_WINDOW: Duration = Duration::from_secs(3);
 /// Redraw interval when we own a terminal.
-const TTY_TICK: Duration = Duration::from_millis(120);
+const TTY_TICK: Duration = Duration::from_millis(150);
 /// How often a non-TTY run prints a plain status line.
 const PLAIN_TICK: Duration = Duration::from_secs(5);
-/// Minimum gap between [`SoloBar`] repaints.
-const SOLO_TICK: Duration = Duration::from_millis(100);
+/// Minimum gap between single-line widget repaints.
+const SOLO_TICK: Duration = Duration::from_millis(150);
+/// Below this width there is no room for a bar, so we drop it.
+const BAR_MIN_WIDTH: usize = 76;
 
-// ── Terminal basics ─────────────────────────────────────────────────────────
+// ── Terminal basics ────────────────────────────────────────────────
 
 /// Is stderr an interactive terminal? Decides ANSI vs. plain output.
 pub fn is_tty() -> bool {
     std::io::stderr().is_terminal()
 }
 
-/// Usable terminal width, clamped to something sane for layout math.
+/// Total terminal columns.
 pub fn term_width() -> usize {
     #[cfg(unix)]
     unsafe {
@@ -52,7 +64,13 @@ pub fn term_width() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|w| *w > 20)
         .map(|w| w.min(200))
-        .unwrap_or(100)
+        .unwrap_or(80)
+}
+
+/// Columns we are allowed to fill. One short of the real width: writing the
+/// final column makes some terminals wrap immediately.
+fn draw_width() -> usize {
+    term_width().saturating_sub(1).max(20)
 }
 
 fn emit(s: &str) {
@@ -73,12 +91,88 @@ pub fn clear_line() {
     }
 }
 
-// ── Rate estimation ─────────────────────────────────────────────────────────
+// ── Width accounting ──────────────────────────────────────────────
 
-/// Sliding-window byte-rate estimator.
-///
-/// Feeding it a monotonically increasing total (rather than deltas) means a
-/// caller can sample whenever it likes without losing accuracy.
+/// Approximate column width of a character. Only needs to be right about the
+/// two cases that matter: zero-width joiners/selectors and double-width
+/// glyphs (CJK and emoji), which is what our own status lines contain.
+fn char_width(c: char) -> usize {
+    let c = c as u32;
+    if c == 0x200d || c == 0xfe0f || c == 0xfe0e || (0x0300..=0x036f).contains(&c) {
+        return 0;
+    }
+    let wide = (0x1100..=0x115f).contains(&c)
+        || (0x2e80..=0x303e).contains(&c)
+        || (0x3041..=0x33ff).contains(&c)
+        || (0x3400..=0x4dbf).contains(&c)
+        || (0x4e00..=0x9fff).contains(&c)
+        || (0xa000..=0xa4cf).contains(&c)
+        || (0xac00..=0xd7a3).contains(&c)
+        || (0xf900..=0xfaff).contains(&c)
+        || (0xfe30..=0xfe6f).contains(&c)
+        || (0xff00..=0xff60).contains(&c)
+        || (0xffe0..=0xffe6).contains(&c)
+        || (0x1f300..=0x1f64f).contains(&c)
+        || (0x1f680..=0x1f6ff).contains(&c)
+        || (0x1f900..=0x1f9ff).contains(&c)
+        || (0x1fa70..=0x1faff).contains(&c)
+        || matches!(c, 0x231a..=0x231b | 0x23e9..=0x23ec | 0x23f0 | 0x23f3)
+        || matches!(c, 0x25fd..=0x25fe | 0x2614..=0x2615 | 0x2648..=0x2653)
+        || matches!(c, 0x267f | 0x2693 | 0x26a1 | 0x26aa..=0x26ab | 0x26bd..=0x26be)
+        || matches!(c, 0x26c4..=0x26c5 | 0x26ce | 0x26d4 | 0x26ea | 0x26f2..=0x26f3)
+        || matches!(c, 0x26f5 | 0x26fa | 0x26fd | 0x2705 | 0x270a..=0x270b | 0x2728)
+        || matches!(c, 0x274c | 0x274e | 0x2753..=0x2755 | 0x2757 | 0x2795..=0x2797)
+        || matches!(c, 0x27b0 | 0x27bf | 0x2b1b..=0x2b1c | 0x2b50 | 0x2b55);
+    if wide { 2 } else { 1 }
+}
+
+/// Column width of a string.
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// Truncates to `max` **columns**, adding an ellipsis when it had to cut.
+/// This is the single choke point that keeps rule 1 above true.
+pub fn clip(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    let budget = max - 1; // room for the ellipsis
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = char_width(ch);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Kept under its old name; callers outside this module use it for names.
+pub fn ellipsize(s: &str, max: usize) -> String {
+    clip(s, max)
+}
+
+/// Right-pads to `width` columns (`{:<width$}` counts bytes, not columns).
+fn pad(s: &str, width: usize) -> String {
+    let len = display_width(s);
+    if len >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(width - len))
+    }
+}
+
+// ── Rate estimation ───────────────────────────────────────────────
+
+/// Sliding-window byte-rate estimator. Fed absolute totals, not deltas.
 #[derive(Default)]
 pub struct Rate {
     samples: VecDeque<(Instant, u64)>,
@@ -95,9 +189,7 @@ impl Rate {
 
     fn record_at(&mut self, now: Instant, total: u64) {
         self.samples.push_back((now, total));
-        while self.samples.len() > 2
-            && now.duration_since(self.samples[0].0) > RATE_WINDOW
-        {
+        while self.samples.len() > 2 && now.duration_since(self.samples[0].0) > RATE_WINDOW {
             self.samples.pop_front();
         }
     }
@@ -116,9 +208,9 @@ impl Rate {
     }
 }
 
-// ── Progress sinks ──────────────────────────────────────────────────────────
+// ── Progress sinks ────────────────────────────────────────────────
 
-/// What a worker is currently doing. Drives the glyph on its progress line.
+/// What a worker is currently doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotState {
     Waiting,
@@ -128,12 +220,13 @@ pub enum SlotState {
 }
 
 impl SlotState {
-    pub fn glyph(self) -> &'static str {
+    /// Short word shown instead of numbers while there are no bytes yet.
+    pub fn label(self) -> &'static str {
         match self {
-            SlotState::Waiting => "\u{25cb}",
-            SlotState::Inspecting => "\u{1f50e}",
-            SlotState::Downloading => "\u{2b07}",
-            SlotState::Finishing => "\u{1f4be}",
+            SlotState::Waiting => "queued",
+            SlotState::Inspecting => "connecting",
+            SlotState::Downloading => "starting",
+            SlotState::Finishing => "saving",
         }
     }
 }
@@ -147,7 +240,7 @@ pub trait ProgressSink: Send + Sync {
     fn progress(&self, _downloaded: u64) {}
     /// Phase change.
     fn state(&self, _state: SlotState) {}
-    /// Chatty per-download detail ("File size: …"). Hidden in multi-file runs.
+    /// Chatty per-download detail. Hidden in multi-file runs.
     fn detail(&self, _msg: &str) {}
     /// Something the user must see even mid-queue (retries, server hiccups).
     fn note(&self, _msg: &str) {}
@@ -164,7 +257,7 @@ pub fn silent() -> Arc<dyn ProgressSink> {
     Arc::new(Silent)
 }
 
-// ── Solo download bar ───────────────────────────────────────────────────────
+// ── Solo download bar ─────────────────────────────────────────────
 
 /// One refreshing line for a single download.
 pub struct SoloBar {
@@ -208,7 +301,6 @@ impl SoloBar {
         if !self.tty {
             return;
         }
-
         {
             let mut last = lock(&self.last_draw);
             if !force && last.elapsed() < SOLO_TICK {
@@ -217,26 +309,21 @@ impl SoloBar {
             *last = Instant::now();
         }
 
+        let width = draw_width();
         let done = self.done.load(Ordering::Relaxed);
         let total = self.total.load(Ordering::Relaxed);
-        let speed = lock(&self.rate).per_second();
-        let state = *lock(&self.state);
-
-        let width = term_width();
-        let right = progress_tail(done, total, speed, self.started);
-        let name_room = width
-            .saturating_sub(display_width(&right) + 6)
-            .clamp(8, 60);
-
-        let line = format!(
-            "  {} {}  {}",
-            state.glyph(),
-            pad(&ellipsize(&self.name, name_room), name_room),
-            right
+        let line = compose(
+            &self.name,
+            *lock(&self.state),
+            done,
+            total,
+            lock(&self.rate).per_second(),
+            self.started,
+            width,
         );
 
         self.dirty.store(true, Ordering::Relaxed);
-        emit(&format!("\r\x1b[2K{}", ellipsize(&line, width)));
+        emit(&format!("\r\x1b[2K{}", line));
     }
 }
 
@@ -258,12 +345,11 @@ impl ProgressSink for SoloBar {
 
     fn detail(&self, msg: &str) {
         self.wipe();
-        eprintln!("  {}", msg);
+        eprintln!("{}", clip(&format!("  {}", msg), draw_width()));
     }
 
     fn note(&self, msg: &str) {
-        self.wipe();
-        eprintln!("  {}", msg);
+        self.detail(msg);
     }
 
     fn finish(&self) {
@@ -271,7 +357,7 @@ impl ProgressSink for SoloBar {
     }
 }
 
-// ── Multi-file board ────────────────────────────────────────────────────────
+// ── Multi-file board ──────────────────────────────────────────────
 
 struct Slot {
     id: u64,
@@ -303,7 +389,7 @@ impl ProgressSink for Slot {
 
     fn note(&self, msg: &str) {
         if let Some(board) = self.board.upgrade() {
-            board.log(&format!("     #{} {}", self.id, msg));
+            board.log(&format!("  #{} {}", self.id, msg));
         }
     }
 }
@@ -345,12 +431,10 @@ impl BoardInner {
             + self.skipped.load(Ordering::Relaxed)
     }
 
-    /// Overall ETA.
-    ///
-    /// Bytes are the honest unit, but we only know the size of files that have
-    /// started, so queued files are projected using the average size of what
-    /// has already been measured. With no size information at all we fall back
-    /// to "seconds per finished file".
+    /// Overall ETA. Bytes are the honest unit, but we only know the size of
+    /// files that have started, so queued files are projected from the average
+    /// size of what has already finished. With no size information at all we
+    /// fall back to seconds-per-finished-file.
     fn eta(&self) -> Option<u64> {
         let total_files = self.total_files.load(Ordering::Relaxed);
         let finished = self.finished_count();
@@ -375,36 +459,31 @@ impl BoardInner {
 
         if speed > 0 && measured > 0 {
             let avg = self.finished_bytes.load(Ordering::Relaxed) / measured as u64;
-            let projected = live_remaining + avg * queued as u64;
-            return Some(projected / speed.max(1));
+            return Some((live_remaining + avg * queued as u64) / speed.max(1));
         }
-
         if speed > 0 && queued == 0 && live_remaining > 0 {
             return Some(live_remaining / speed.max(1));
         }
-
         if finished > 0 {
             let per_file = self.started.elapsed().as_secs_f64() / finished as f64;
             return Some((per_file * remaining_files as f64) as u64);
         }
-
         None
     }
 
-    fn header(&self, width: usize) -> String {
-        let total_files = self.total_files.load(Ordering::Relaxed);
-        let completed = self.completed.load(Ordering::Relaxed);
+    /// `  3/12  1.4G  38M/s  ETA 3m 12s` — no title, no word "files".
+    fn summary(&self, width: usize) -> String {
         let failed = self.failed.load(Ordering::Relaxed);
         let skipped = self.skipped.load(Ordering::Relaxed);
-        let active = self.active().len();
-        let bytes = self.downloaded();
-        let speed = lock(&self.rate).per_second();
 
         let mut parts = vec![
-            format!("{}/{} files", self.finished_count(), total_files),
-            format!("{} active", active),
-            format_size(bytes),
-            format_speed(speed),
+            format!(
+                "{}/{}",
+                self.finished_count(),
+                self.total_files.load(Ordering::Relaxed)
+            ),
+            short_size(self.downloaded()),
+            short_speed(lock(&self.rate).per_second()),
             format_eta(self.eta()),
         ];
         if failed > 0 {
@@ -413,38 +492,35 @@ impl BoardInner {
         if skipped > 0 {
             parts.push(format!("{} skipped", skipped));
         }
-        let _ = completed;
 
-        ellipsize(
-            &format!("  {}  {}", self.title, parts.join(" \u{b7} ")),
-            width,
-        )
+        clip(&format!("  {}", parts.join("  ")), width)
     }
 
     fn lane_line(&self, slot: &Slot, width: usize) -> String {
-        let done = slot.done.load(Ordering::Relaxed);
-        let total = slot.total.load(Ordering::Relaxed);
-        let speed = lock(&slot.rate).per_second();
-        let state = *lock(&slot.state);
-
-        let right = progress_tail(done, total, speed, slot.started);
-        let label = format!("#{} {}", slot.id, slot.name);
-        let name_room = width
-            .saturating_sub(display_width(&right) + 8)
-            .clamp(8, 64);
-
-        ellipsize(
-            &format!(
-                "    {} {}  {}",
-                state.glyph(),
-                pad(&ellipsize(&label, name_room), name_room),
-                right
-            ),
+        compose(
+            &slot.name,
+            *lock(&slot.state),
+            slot.done.load(Ordering::Relaxed),
+            slot.total.load(Ordering::Relaxed),
+            lock(&slot.rate).per_second(),
+            slot.started,
             width,
         )
     }
 
-    /// Erases the live block so ordinary output can scroll past it.
+    fn frame(&self) -> Vec<String> {
+        let width = draw_width();
+        let mut lines: Vec<String> = self
+            .active()
+            .iter()
+            .map(|s| self.lane_line(s, width))
+            .collect();
+        lines.push(self.summary(width));
+        lines
+    }
+
+    /// Erases the live block so ordinary output can scroll past it. Leaves the
+    /// cursor at column 0 of the block's first line.
     fn wipe(&self) {
         if !self.tty {
             return;
@@ -453,57 +529,67 @@ impl BoardInner {
         if *drawn == 0 {
             return;
         }
-        let mut buf = format!("\x1b[{}A", *drawn);
-        for _ in 0..*drawn {
-            buf.push_str("\x1b[2K\n");
+        let mut buf = String::from("\r\x1b[2K");
+        for _ in 1..*drawn {
+            buf.push_str("\x1b[1A\r\x1b[2K");
         }
-        buf.push_str(&format!("\x1b[{}A", *drawn));
         *drawn = 0;
         emit(&buf);
     }
 
+    /// Redraws the block in place. Never emits a trailing newline, so the
+    /// cursor stays on the last line and the next frame can move up exactly
+    /// `drawn - 1` rows.
     fn render(&self) {
         if !self.tty || self.stopped.load(Ordering::Relaxed) {
             return;
         }
 
-        let width = term_width();
-        let mut lines = vec![self.header(width)];
-        for slot in self.active() {
-            lines.push(self.lane_line(&slot, width));
+        let lines = self.frame();
+        let mut drawn = lock(&self.drawn);
+
+        let mut buf = String::new();
+        if *drawn > 1 {
+            buf.push_str(&format!("\x1b[{}A", *drawn - 1));
+        }
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                buf.push('\n');
+            }
+            buf.push_str("\r\x1b[2K");
+            buf.push_str(line);
+        }
+        // Blank out rows left over from a taller previous frame, then come back.
+        let leftover = drawn.saturating_sub(lines.len());
+        for _ in 0..leftover {
+            buf.push_str("\n\r\x1b[2K");
+        }
+        if leftover > 0 {
+            buf.push_str(&format!("\x1b[{}A", leftover));
         }
 
-        let mut drawn = lock(&self.drawn);
-        let mut buf = String::new();
-        if *drawn > 0 {
-            buf.push_str(&format!("\x1b[{}A", *drawn));
-        }
-        for line in &lines {
-            buf.push_str("\x1b[2K");
-            buf.push_str(line);
-            buf.push('\n');
-        }
-        // Blank out lanes that finished since the last frame.
-        for _ in lines.len()..*drawn {
-            buf.push_str("\x1b[2K\n");
-        }
-        *drawn = lines.len().max(*drawn);
+        *drawn = lines.len();
         emit(&buf);
     }
 
     fn log(&self, msg: &str) {
+        let line = clip(msg, draw_width());
         self.wipe();
-        emit(&format!("{}\n", msg));
+        emit(&format!("{}\n", line));
         self.render();
     }
 
     fn plain_status(&self) {
-        emit(&format!("{}\n", self.header(100).trim_end()));
+        emit(&format!(
+            "{}{}\n",
+            self.title,
+            self.summary(usize::MAX).trim_end()
+        ));
     }
 }
 
-/// A live, multi-line progress display: one lane per in-flight file plus an
-/// aggregate header. Cheap to clone; every clone points at the same display.
+/// A live progress block: one short line per in-flight file plus a summary.
+/// Cheap to clone; every clone points at the same display.
 #[derive(Clone)]
 pub struct Board(Arc<BoardInner>);
 
@@ -649,9 +735,9 @@ impl Drop for Lane {
     }
 }
 
-// ── Counter progress (non-byte work) ────────────────────────────────────────
+// ── Counter progress (non-byte work) ───────────────────────────────────
 
-/// `120/430 \u{2593}\u{2591} 28% ETA 12s` for work measured in items, not bytes.
+/// `Verifying 120/430  28%  12s` for work measured in items, not bytes.
 pub struct CountProgress {
     label: String,
     total: usize,
@@ -699,6 +785,7 @@ impl CountProgress {
             *last = Instant::now();
         }
 
+        let width = draw_width();
         let done = self.done.load(Ordering::Relaxed);
         let fraction = done as f64 / self.total as f64;
         let eta = if done == 0 {
@@ -708,37 +795,38 @@ impl CountProgress {
             Some((per * (self.total - done) as f64) as u64)
         };
 
-        self.dirty.store(true, Ordering::Relaxed);
-        emit(&format!(
-            "\r\x1b[2K  {}  {}/{}  {} {:>4}  {}",
-            self.label,
-            done,
-            self.total,
-            progress_bar(fraction, 18),
-            format!("{}%", (fraction * 100.0) as u64),
-            format_eta(eta),
+        let mut line = format!("  {} {}/{}", self.label, done, self.total);
+        if width >= BAR_MIN_WIDTH {
+            line.push_str(&format!("  {}", progress_bar(fraction, 12)));
+        }
+        line.push_str(&format!(
+            "  {:>3}%  {}",
+            (fraction * 100.0) as u64,
+            format_eta(eta)
         ));
+
+        self.dirty.store(true, Ordering::Relaxed);
+        emit(&format!("\r\x1b[2K{}", clip(&line, width)));
     }
 
     /// Clears the live line and prints a closing summary in its place.
     pub fn finish(&self, summary: &str) {
         self.wipe();
         if !summary.is_empty() {
-            eprintln!("  {}", summary);
+            eprintln!("{}", clip(&format!("  {}", summary), draw_width()));
         }
     }
 
     /// Prints a line without leaving the progress line behind.
     pub fn note(&self, msg: &str) {
         self.wipe();
-        eprintln!("  {}", msg);
+        eprintln!("{}", clip(&format!("  {}", msg), draw_width()));
     }
 }
 
-// ── Directory scan spinner ──────────────────────────────────────────────────
+// ── Directory scan spinner ───────────────────────────────────────────
 
-/// Live counter for the scraper: one refreshing line instead of one printed
-/// line per directory (which used to bury the rest of the output).
+/// One refreshing line for the scraper instead of a line per directory.
 pub struct ScanSpinner {
     tty: bool,
     started: Instant,
@@ -805,24 +893,27 @@ impl ScanSpinner {
             *last = Instant::now();
         }
 
+        let width = draw_width();
         let frame = self.frame.fetch_add(1, Ordering::Relaxed) % SPINNER_FRAMES.len();
         let head = format!(
-            "  {} Scanning  {} dir(s) \u{b7} {} file(s) \u{b7} {}  ",
+            "  {} {} dirs  {} files  ",
             SPINNER_FRAMES[frame],
             self.dirs.load(Ordering::Relaxed),
             self.files.load(Ordering::Relaxed),
-            format_duration(self.started.elapsed().as_secs()),
         );
-        let room = term_width().saturating_sub(display_width(&head)).max(8);
+        let room = width.saturating_sub(display_width(&head));
 
         self.dirty.store(true, Ordering::Relaxed);
-        emit(&format!("\r\x1b[2K{}{}", head, ellipsize(label, room)));
+        emit(&format!(
+            "\r\x1b[2K{}",
+            clip(&format!("{}{}", head, clip(label, room)), width)
+        ));
     }
 
     /// Prints a warning without leaving the spinner line behind.
     pub fn note(&self, msg: &str) {
         self.wipe();
-        eprintln!("{}", msg);
+        eprintln!("{}", clip(msg, draw_width()));
     }
 
     pub fn finish(&self) {
@@ -830,42 +921,70 @@ impl ScanSpinner {
     }
 }
 
-// ── Formatting ──────────────────────────────────────────────────────────────
+// ── Line composition ──────────────────────────────────────────────
 
-/// Shared right-hand side of every progress line: bar, percent, sizes, speed,
-/// ETA. Kept in one place so the solo bar and the board stay in sync.
-fn progress_tail(done: u64, total: u64, speed: Option<u64>, started: Instant) -> String {
-    if total > 0 {
+/// The one place a per-file line is built, shared by the solo bar and the
+/// board so they can't drift apart. Always returns at most `width` columns.
+///
+/// Wide:   `name                 ▏███░░░░░░░▕  38%  1.2M/3.1M  4.2M/s  27s`
+/// Narrow: `name       38%  1.2M/3.1M  4.2M/s  27s`
+/// No size yet: `name       1.2M  4.2M/s  27s`
+/// Not started: `name       connecting`
+fn compose(
+    name: &str,
+    state: SlotState,
+    done: u64,
+    total: u64,
+    speed: Option<u64>,
+    started: Instant,
+    width: usize,
+) -> String {
+    let right = if done == 0 && state != SlotState::Downloading {
+        state.label().to_string()
+    } else if total > 0 {
         let fraction = (done as f64 / total as f64).clamp(0.0, 1.0);
         let eta = match speed {
             Some(s) if s > 0 => Some(total.saturating_sub(done) / s),
             _ => None,
         };
+        let bar = if width >= BAR_MIN_WIDTH {
+            format!("{}  ", progress_bar(fraction, 10))
+        } else {
+            String::new()
+        };
         format!(
-            "{} {:>4}  {:>9} / {:<9} {:>11}  {}",
-            progress_bar(fraction, 20),
-            format!("{}%", (fraction * 100.0) as u64),
-            format_size(done),
-            format_size(total),
-            format_speed(speed),
-            format_eta(eta),
+            "{}{:>3}%  {:>6}/{:<6} {:>8}  {:>6}",
+            bar,
+            (fraction * 100.0) as u64,
+            short_size(done),
+            short_size(total),
+            short_speed(speed),
+            eta.map(short_duration).unwrap_or_else(|| "--".into()),
         )
     } else {
-        // Unknown length: no bar, no fake ETA — just honest numbers.
+        // Unknown length: no bar, no fake percentage, no fake ETA.
         format!(
-            "{:>22}  {:>9} {:>11}  {}",
-            "size unknown",
-            format_size(done),
-            format_speed(speed),
-            format_duration(started.elapsed().as_secs()),
+            "{:>6} {:>8}  {:>6}",
+            short_size(done),
+            short_speed(speed),
+            short_duration(started.elapsed().as_secs()),
         )
-    }
+    };
+
+    let name_room = width
+        .saturating_sub(display_width(&right) + 4)
+        .clamp(6, 38);
+    clip(
+        &format!("  {}  {}", pad(&clip(name, name_room), name_room), right),
+        width,
+    )
 }
+
+// ── Formatting ─────────────────────────────────────────────────────
 
 pub fn progress_bar(fraction: f64, width: usize) -> String {
     let fraction = fraction.clamp(0.0, 1.0);
-    let filled = (fraction * width as f64).round() as usize;
-    let filled = filled.min(width);
+    let filled = ((fraction * width as f64).round() as usize).min(width);
     format!(
         "\u{2595}{}{}\u{258f}",
         "\u{2588}".repeat(filled),
@@ -873,7 +992,47 @@ pub fn progress_bar(fraction: f64, width: usize) -> String {
     )
 }
 
-/// Compact size: `1.4 GiB`, `937 KiB`, `512 B`.
+/// Tight size for progress lines: `512B`, `19.5K`, `142K`, `3.1G`.
+/// Never wider than six columns, which is what the layout budget assumes.
+pub fn short_size(bytes: u64) -> String {
+    const K: f64 = 1024.0;
+    let b = bytes as f64;
+    let (value, unit) = if b < K {
+        return format!("{}B", bytes);
+    } else if b < K * K {
+        (b / K, 'K')
+    } else if b < K * K * K {
+        (b / (K * K), 'M')
+    } else {
+        (b / (K * K * K), 'G')
+    };
+    if value < 10.0 {
+        format!("{:.1}{}", value, unit)
+    } else {
+        format!("{:.0}{}", value, unit)
+    }
+}
+
+/// Tight rate: `4.2M/s`, or `--` when we don't know yet.
+pub fn short_speed(bps: Option<u64>) -> String {
+    match bps {
+        Some(b) if b > 0 => format!("{}/s", short_size(b)),
+        _ => "--".to_string(),
+    }
+}
+
+/// Tight duration for progress lines: `47s`, `3m12s`, `1h04m`.
+pub fn short_duration(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Roomier size for summaries and listings: `1.4 GiB`, `937 KiB`, `512 B`.
 pub fn format_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     let b = bytes as f64;
@@ -895,7 +1054,7 @@ pub fn format_speed(bps: Option<u64>) -> String {
     }
 }
 
-/// `1h 04m`, `4m 12s`, `37s`.
+/// `1h 04m`, `4m 12s`, `37s`. Used in end-of-run summaries.
 pub fn format_duration(secs: u64) -> String {
     if secs >= 3600 {
         format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
@@ -906,41 +1065,11 @@ pub fn format_duration(secs: u64) -> String {
     }
 }
 
-/// `ETA 4m 12s`, or `ETA --` while we still have nothing to base it on.
+/// `ETA 4m12s`, or `ETA --` while we still have nothing to base it on.
 pub fn format_eta(secs: Option<u64>) -> String {
     match secs {
-        Some(s) => format!("ETA {}", format_duration(s)),
+        Some(s) => format!("ETA {}", short_duration(s)),
         None => "ETA --".to_string(),
-    }
-}
-
-/// Character count, used for layout. Wide glyphs are close enough here.
-fn display_width(s: &str) -> usize {
-    s.chars().count()
-}
-
-/// Truncates on a character boundary, with an ellipsis when it had to cut.
-pub fn ellipsize(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if display_width(s) <= max {
-        return s.to_string();
-    }
-    if max <= 1 {
-        return "\u{2026}".to_string();
-    }
-    let keep: String = s.chars().take(max - 1).collect();
-    format!("{}\u{2026}", keep)
-}
-
-/// Right-pads to `width` characters (`{:<width$}` counts bytes, not chars).
-fn pad(s: &str, width: usize) -> String {
-    let len = display_width(s);
-    if len >= width {
-        s.to_string()
-    } else {
-        format!("{}{}", s, " ".repeat(width - len))
     }
 }
 
@@ -957,48 +1086,128 @@ mod tests {
     }
 
     #[test]
-    fn format_duration_buckets() {
-        assert_eq!(format_duration(37), "37s");
+    fn short_size_never_exceeds_six_columns() {
+        for bytes in [0u64, 1, 999, 1024, 20_000, 999_999, 1 << 20, 1 << 30, u64::MAX] {
+            let s = short_size(bytes);
+            assert!(display_width(&s) <= 6, "{bytes} -> {s}");
+        }
+        assert_eq!(short_size(512), "512B");
+        assert_eq!(short_size(20_000), "20K");
+        assert_eq!(short_size(2 * 1024 * 1024), "2.0M");
+    }
+
+    #[test]
+    fn duration_buckets() {
         assert_eq!(format_duration(252), "4m 12s");
-        assert_eq!(format_duration(3900), "1h 05m");
+        assert_eq!(short_duration(37), "37s");
+        assert_eq!(short_duration(252), "4m12s");
+        assert_eq!(short_duration(3900), "1h05m");
     }
 
     #[test]
-    fn eta_is_honest_when_unknown() {
+    fn eta_and_speed_are_honest_when_unknown() {
         assert_eq!(format_eta(None), "ETA --");
-        assert_eq!(format_eta(Some(90)), "ETA 1m 30s");
-    }
-
-    #[test]
-    fn speed_is_honest_when_unknown() {
-        assert_eq!(format_speed(None), "--");
-        assert_eq!(format_speed(Some(0)), "--");
-        assert_eq!(format_speed(Some(1024 * 1024)), "1.0 MiB/s");
+        assert_eq!(format_eta(Some(90)), "ETA 1m30s");
+        assert_eq!(short_speed(None), "--");
+        assert_eq!(short_speed(Some(0)), "--");
+        assert_eq!(short_speed(Some(1024 * 1024)), "1.0M/s");
     }
 
     #[test]
     fn bar_endpoints() {
-        assert_eq!(progress_bar(0.0, 4), "\u{2595}\u{2591}\u{2591}\u{2591}\u{2591}\u{258f}");
-        assert_eq!(progress_bar(1.0, 4), "\u{2595}\u{2588}\u{2588}\u{2588}\u{2588}\u{258f}");
+        assert_eq!(progress_bar(0.0, 4).chars().count(), 6);
+        assert_eq!(progress_bar(1.0, 4).chars().count(), 6);
         // Out-of-range input must not panic or overflow the width.
         assert_eq!(progress_bar(9.0, 4).chars().count(), 6);
         assert_eq!(progress_bar(-1.0, 4).chars().count(), 6);
     }
 
     #[test]
-    fn ellipsize_respects_char_boundaries() {
-        assert_eq!(ellipsize("hello", 10), "hello");
-        assert_eq!(ellipsize("hello world", 8), "hello w\u{2026}");
-        // Multi-byte characters must not be sliced in half.
-        let s = "\u{e5}\u{e4}\u{f6}\u{e5}\u{e4}\u{f6}";
-        assert_eq!(ellipsize(s, 3).chars().count(), 3);
+    fn emoji_count_as_two_columns() {
+        // The bug that caused the redraw spam: these were counted as one.
+        assert_eq!(display_width("\u{1f50e}"), 2);
+        assert_eq!(display_width("\u{2705}"), 2);
+        assert_eq!(display_width("abc"), 3);
     }
 
     #[test]
-    fn pad_counts_characters() {
+    fn clip_respects_columns_and_boundaries() {
+        assert_eq!(clip("hello", 10), "hello");
+        assert_eq!(clip("hello world", 8), "hello w\u{2026}");
+        // Multi-byte characters must not be sliced in half.
+        let s = "\u{e5}\u{e4}\u{f6}\u{e5}\u{e4}\u{f6}";
+        assert_eq!(display_width(&clip(s, 3)), 3);
+        // A wide glyph that doesn't fit is dropped rather than half-drawn.
+        assert!(display_width(&clip("\u{1f50e}\u{1f50e}\u{1f50e}", 5)) <= 5);
+    }
+
+    #[test]
+    fn pad_counts_columns() {
         assert_eq!(pad("ab", 5), "ab   ");
-        assert_eq!(pad("\u{e5}\u{e4}", 4).chars().count(), 4);
+        assert_eq!(display_width(&pad("\u{e5}\u{e4}", 4)), 4);
         assert_eq!(pad("toolong", 3), "toolong");
+    }
+
+    #[test]
+    fn composed_lines_always_fit() {
+        let long = "Screenshot_20250812-114142_some_absurdly_long_name.webp";
+        for width in [20usize, 40, 60, 80, 120, 199] {
+            for (done, total) in [(0, 0), (0, 5_000_000), (1_234_567, 5_000_000), (999, 0)] {
+                for state in [
+                    SlotState::Waiting,
+                    SlotState::Inspecting,
+                    SlotState::Downloading,
+                    SlotState::Finishing,
+                ] {
+                    let line = compose(
+                        long,
+                        state,
+                        done,
+                        total,
+                        Some(4_200_000),
+                        Instant::now(),
+                        width,
+                    );
+                    assert!(
+                        display_width(&line) <= width,
+                        "width {width}: {} cols in {line:?}",
+                        display_width(&line)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn idle_lane_shows_a_word_not_fake_numbers() {
+        let line = compose(
+            "a.webp",
+            SlotState::Inspecting,
+            0,
+            0,
+            None,
+            Instant::now(),
+            80,
+        );
+        assert!(line.contains("connecting"), "{line}");
+        assert!(!line.contains("ETA"), "{line}");
+        assert!(!line.contains('%'), "{line}");
+    }
+
+    #[test]
+    fn summary_and_frame_fit_the_width() {
+        let board = Board::new("Queue", 12, 3);
+        let _a = board.claim(1, "first-file-with-a-long-name.iso").unwrap();
+        let _b = board.claim(2, "second.iso").unwrap();
+        board.file_completed(4096);
+        board.file_failed();
+
+        for width in [24usize, 40, 80, 160] {
+            let s = board.0.summary(width);
+            assert!(display_width(&s) <= width, "{width}: {s:?}");
+        }
+        // One line per active lane, plus the summary. Nothing else.
+        assert_eq!(board.0.frame().len(), 3);
     }
 
     #[test]
@@ -1006,7 +1215,6 @@ mod tests {
         let mut rate = Rate::new();
         let t0 = Instant::now();
         rate.record_at(t0, 0);
-        // Too little history to claim a speed.
         assert_eq!(rate.per_second(), None);
 
         rate.record_at(t0 + Duration::from_secs(2), 2 * 1024 * 1024);
@@ -1022,13 +1230,6 @@ mod tests {
             rate.record_at(t0 + Duration::from_secs(i), i * 1024);
         }
         assert!(rate.samples.len() <= 5, "window should stay small");
-    }
-
-    #[test]
-    fn progress_tail_without_total_has_no_fake_eta() {
-        let tail = progress_tail(1024, 0, Some(1024), Instant::now());
-        assert!(tail.contains("size unknown"));
-        assert!(!tail.contains("ETA"));
     }
 
     #[test]
