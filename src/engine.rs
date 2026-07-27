@@ -692,11 +692,11 @@ pub fn percent_decode(input: &str) -> String {
             let hi = chars.next();
             let lo = chars.next();
             if let (Some(h), Some(l)) = (hi, lo) {
-                if let Ok(s) = std::str::from_utf8(&[h, l]) {
-                    if let Ok(decoded) = u8::from_str_radix(s, 16) {
-                        bytes.push(decoded);
-                        continue;
-                    }
+                if let Ok(s) = std::str::from_utf8(&[h, l])
+                    && let Ok(decoded) = u8::from_str_radix(s, 16)
+                {
+                    bytes.push(decoded);
+                    continue;
                 }
                 // Failed decode — push all three bytes back
                 bytes.push(b'%');

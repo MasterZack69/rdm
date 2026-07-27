@@ -95,10 +95,10 @@ pub fn is_retryable(err: &anyhow::Error) -> bool {
             found_transient = true;
         }
 
-        if let Some(re) = cause.downcast_ref::<reqwest::Error>() {
-            if re.is_timeout() || re.is_connect() || re.is_body() {
-                found_transient = true;
-            }
+        if let Some(re) = cause.downcast_ref::<reqwest::Error>()
+            && (re.is_timeout() || re.is_connect() || re.is_body())
+        {
+            found_transient = true;
         }
     }
 
@@ -113,9 +113,9 @@ mod tests {
     fn test_exponential_backoff() {
         let config = RetryConfig::default();
         let d0 = config.delay_for_attempt(0).as_millis();
-        assert!(d0 >= 700 && d0 <= 1300, "attempt 0: {}ms", d0);
+        assert!((700..=1300).contains(&d0), "attempt 0: {}ms", d0);
         let d2 = config.delay_for_attempt(2).as_millis();
-        assert!(d2 >= 2800 && d2 <= 5200, "attempt 2: {}ms", d2);
+        assert!((2800..=5200).contains(&d2), "attempt 2: {}ms", d2);
     }
 
     #[test]
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_unknown_io_kind_not_retryable() {
-        let e = std::io::Error::new(std::io::ErrorKind::Other, "something weird");
+        let e = std::io::Error::other("something weird");
         assert!(!is_retryable(&anyhow::Error::new(e)));
     }
 }

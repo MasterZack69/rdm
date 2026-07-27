@@ -94,24 +94,24 @@ fn quick_download(
         if scan_for_listing {
             // A failed scan is not fatal: fall through and treat the URL as a
             // single file, which is what it usually turns out to be.
-            if let Ok(Some(files)) = scrape::discover_files(&url, true, opts.allow_private).await {
-                if !files.is_empty() {
-                    print_discovered(&files);
+            if let Ok(Some(files)) = scrape::discover_files(&url, true, opts.allow_private).await
+                && !files.is_empty()
+            {
+                print_discovered(&files);
 
-                    queue::Queue::locked(|q| {
-                        for file in &files {
-                            q.add(
-                                file.url.clone(),
-                                Some(file.relative_path.clone()),
-                                Some(connections),
-                            );
-                        }
-                        Ok(())
-                    })?;
+                queue::Queue::locked(|q| {
+                    for file in &files {
+                        q.add(
+                            file.url.clone(),
+                            Some(file.relative_path.clone()),
+                            Some(connections),
+                        );
+                    }
+                    Ok(())
+                })?;
 
-                    let parallel = parallel.unwrap_or(cfg.queue_parallel);
-                    return queue::start(cfg, cancel, parallel).await;
-                }
+                let parallel = parallel.unwrap_or(cfg.queue_parallel);
+                return queue::start(cfg, cancel, parallel).await;
             }
         }
 

@@ -24,6 +24,7 @@ use crate::ui;
 /// How many paths to show before collapsing the rest into a count.
 const SAMPLE: usize = 20;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     cfg: &Config,
     url: &str,
@@ -185,19 +186,19 @@ pub async fn run(
     to_download.sort_by(|a, b| a.1.cmp(&b.1));
 
     let mut to_delete: Vec<String> = Vec::new();
-    if delete {
-        if let SyncRoot::Ok(ref root) = sync_root_result {
-            let root_path = Path::new(root);
-            if root_path.is_dir() {
-                collect_orphan_files(
-                    root_path,
-                    root_path,
-                    &remote_decoded,
-                    &ext_filter,
-                    &mut to_delete,
-                );
-                to_delete.sort();
-            }
+    if delete
+        && let SyncRoot::Ok(ref root) = sync_root_result
+    {
+        let root_path = Path::new(root);
+        if root_path.is_dir() {
+            collect_orphan_files(
+                root_path,
+                root_path,
+                &remote_decoded,
+                &ext_filter,
+                &mut to_delete,
+            );
+            to_delete.sort();
         }
     }
 
@@ -428,10 +429,10 @@ fn collect_orphan_files(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.ends_with(".part") || name.ends_with(".rdm") {
-                continue;
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name.ends_with(".part") || name.ends_with(".rdm"))
+        {
+            continue;
         }
         if path.is_dir() {
             collect_orphan_files(&path, base, remote_decoded, ext_filter, out);

@@ -16,6 +16,7 @@ pub enum DownloadStatus {
     Cancelled { bytes_on_disk: u64 },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn download_range(
     client: &Client,
     url: &str,

@@ -236,10 +236,10 @@ fn atomic_write(path: &PathBuf, data: &[u8]) -> Result<()> {
     fs::rename(&tmp, path)
         .with_context(|| format!("Failed to rename {} → {}", tmp.display(), path.display()))?;
 
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
 
     Ok(())
@@ -454,12 +454,11 @@ impl Queue {
 
         eprintln!();
         eprintln!(
-            "  {:>4}  {:<14}  {:<name_col$}  {:>size_col$}  {}",
+            "  {:>4}  {:<14}  {:<name_col$}  {:>size_col$}  URL",
             "ID",
             "Status",
             "File",
             "Size",
-            "URL",
             name_col = name_col,
             size_col = size_col,
         );
@@ -684,10 +683,10 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             let name = next.display_name();
 
             let output = next.resolve_output(&cfg);
-            if let Some(parent) = std::path::Path::new(&output).parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent).ok();
-                }
+            if let Some(parent) = std::path::Path::new(&output).parent()
+                && !parent.exists()
+            {
+                std::fs::create_dir_all(parent).ok();
             }
 
             // A lane is a live progress line on the board. If the board is
@@ -918,7 +917,7 @@ mod tests {
 
         let mut q = queue_with(&["https://x.com/dir/track%2001.flac?token=1"]);
         assert_eq!(q.items[0].display_name(), "track 01.flac");
-        assert_eq!(q.remove(1), true);
+        assert!(q.remove(1));
     }
 
     #[test]
