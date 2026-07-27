@@ -11,9 +11,12 @@
 //!   - Cross-directory duplicates
 //!   - Windows-specific filename quirks (drive letters, reserved names, trailing dots)
 //!
+//! Progress is reported through a single [`ui::ScanSpinner`] line rather than
+//! one `Scanning ...` line per directory.
+//!
 //! Public API preserved:
 //!   - `pub struct DiscoveredFile { pub url: String, pub relative_path: String }`
-//!   - `pub async fn discover_files(url: &str, wrap_in_folder: bool)
+//!   - `pub async fn discover_files(url: &str, wrap_in_folder: bool, allow_private: bool)
 //!         -> Result<Option<Vec<DiscoveredFile>>>`
 
 use anyhow::{Context, Result};
@@ -25,7 +28,8 @@ use tokio::sync::Semaphore;
 
 use reqwest::Url; // change to `use url::Url;` if your reqwest version doesn't re-export it.
 
-use crate::cli;
+use crate::engine;
+use crate::ui;
 
 // ---------- Public types ----------
 
@@ -76,6 +80,9 @@ pub async fn discover_files(
     let mut current_level: Vec<(Url, u32)> = vec![(base_url.clone(), 0)];
     let sem = Arc::new(Semaphore::new(CONCURRENCY));
 
+    // One live line for the whole scan instead of a line per directory.
+    let spinner = ui::ScanSpinner::new();
+
     let mut hard_stopped = false;
 
     while !current_level.is_empty() && !hard_stopped {
@@ -91,12 +98,15 @@ pub async fn discover_files(
             }
 
             if visited.len() > MAX_DIRS {
-                eprintln!("   ⚠ Directory limit reached ({}), stopping scan", MAX_DIRS);
+                spinner.note(&format!(
+                    "   \u{26a0} Directory limit reached ({}), stopping scan",
+                    MAX_DIRS
+                ));
                 hard_stopped = true;
                 break;
             }
 
-            eprintln!("  📂 Scanning {}", directory_label(&base_url, &dir_url));
+            spinner.dir(&directory_label(&base_url, &dir_url));
 
             let client_c = client.clone();
             let sem_c = sem.clone();
@@ -125,7 +135,7 @@ pub async fn discover_files(
             let (result, depth, dir_url) = match joined {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("   ⚠ task join error: {}", e);
+                    spinner.note(&format!("   \u{26a0} task join error: {}", e));
                     continue;
                 }
             };
@@ -134,7 +144,7 @@ pub async fn discover_files(
                 Ok(Some(r)) => r,
                 Ok(None) => continue,
                 Err(e) => {
-                    eprintln!("   ⚠ failed to scan {}: {:#}", dir_url, e);
+                    spinner.note(&format!("   \u{26a0} failed to scan {}: {:#}", dir_url, e));
                     continue;
                 }
             };
@@ -164,9 +174,13 @@ pub async fn discover_files(
                     url: file_url,
                     relative_path: final_rel,
                 });
+                spinner.add_files(1);
 
                 if files.len() >= MAX_FILES {
-                    eprintln!("   ⚠ File limit reached ({}), stopping scan", MAX_FILES);
+                    spinner.note(&format!(
+                        "   \u{26a0} File limit reached ({}), stopping scan",
+                        MAX_FILES
+                    ));
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
                     hard_stopped = true;
@@ -188,6 +202,8 @@ pub async fn discover_files(
         current_level = next_level;
     }
 
+    spinner.finish();
+
     if files.is_empty() {
         return Ok(None);
     }
@@ -207,8 +223,8 @@ fn parse_and_validate_url(s: &str, allow_private: bool) -> Result<Url> {
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
 
-        let skip_private_check = allow_private || std::env::var_os("RDM_ALLOW_PRIVATE").is_some();
-        if !skip_private_check {
+    let skip_private_check = allow_private || std::env::var_os("RDM_ALLOW_PRIVATE").is_some();
+    if !skip_private_check {
         if let Some(ip) = parse_host_as_ip(host_str) {
             if is_disallowed_ip(ip) {
                 anyhow::bail!("Refusing to scan private/internal address: {}", ip);
@@ -274,14 +290,17 @@ fn derive_folder_name(base: &Url) -> String {
     let candidate = if last.is_empty() {
         base.host_str().unwrap_or("download").to_string()
     } else {
-        cli::percent_decode(last)
+        engine::percent_decode(last)
     };
     sanitize_path_component(&candidate).unwrap_or_else(|| "download".to_string())
 }
 
 fn directory_label(base: &Url, dir: &Url) -> String {
-    let rel = dir.as_str().strip_prefix(base.as_str()).unwrap_or(dir.as_str());
-    let decoded = cli::percent_decode(rel);
+    let rel = dir
+        .as_str()
+        .strip_prefix(base.as_str())
+        .unwrap_or(dir.as_str());
+    let decoded = engine::percent_decode(rel);
     let trimmed = decoded.trim_end_matches('/');
     let last = trimmed.rsplit('/').next().unwrap_or("");
     if last.is_empty() {
@@ -301,7 +320,7 @@ fn directory_label(base: &Url, dir: &Url) -> String {
 //   - Windows reserved device names
 //   - components that are only dots/spaces (Windows quirks)
 fn sanitize_relative_path(raw: &str) -> Option<String> {
-    let decoded = cli::percent_decode(raw);
+    let decoded = engine::percent_decode(raw);
     if decoded.is_empty() || decoded.len() > MAX_RELATIVE_PATH_LEN {
         return None;
     }
@@ -497,7 +516,7 @@ fn parse_links(html: &str, page_url: &Url, base: &Url) -> (Vec<String>, Vec<Url>
     (files, dirs)
 }
 
-// (10–14) Robust state-machine href extractor:
+// (10-14) Robust state-machine href extractor:
 //   - Skips <script>, <style>, and HTML comments
 //   - Requires an attribute boundary before `href` (rejects `data-href`)
 //   - Handles all HTML whitespace (space, tab, CR, LF, FF)
@@ -939,23 +958,22 @@ mod tests {
         assert!(parse_and_validate_url("javascript:alert(1)", false).is_err());
     }
 
-     #[test]
+    #[test]
     fn test_validate_url_allows_private_when_flag_set() {
-     unsafe { std::env::remove_var("RDM_ALLOW_PRIVATE"); }
-     assert!(parse_and_validate_url("http://10.214.89.214:8000/", true).is_ok());
-     assert!(parse_and_validate_url("http://192.168.1.1/", true).is_ok());
-     assert!(parse_and_validate_url("http://127.0.0.1/", true).is_ok());
+        unsafe { std::env::remove_var("RDM_ALLOW_PRIVATE"); }
+        assert!(parse_and_validate_url("http://10.214.89.214:8000/", true).is_ok());
+        assert!(parse_and_validate_url("http://192.168.1.1/", true).is_ok());
+        assert!(parse_and_validate_url("http://127.0.0.1/", true).is_ok());
     }
 
-   
     #[test]
     fn test_validate_url_rejects_private_ips() {
         unsafe {
             std::env::remove_var("RDM_ALLOW_PRIVATE");
         }
-    assert!(parse_and_validate_url("http://127.0.0.1/", false).is_err());
-    assert!(parse_and_validate_url("http://10.0.0.1/", false).is_err());
-    assert!(parse_and_validate_url("http://169.254.169.254/", false).is_err());
-    assert!(parse_and_validate_url("http://[::1]/", false).is_err());
+        assert!(parse_and_validate_url("http://127.0.0.1/", false).is_err());
+        assert!(parse_and_validate_url("http://10.0.0.1/", false).is_err());
+        assert!(parse_and_validate_url("http://169.254.169.254/", false).is_err());
+        assert!(parse_and_validate_url("http://[::1]/", false).is_err());
     }
 }
