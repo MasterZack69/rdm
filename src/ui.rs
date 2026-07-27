@@ -21,6 +21,11 @@
 //!    counting them as one re-introduces rule 1.
 //! 3. **A live block never ends with a newline.** The cursor stays parked on
 //!    the last drawn line so the next frame can move up exactly `lines - 1`.
+//! 4. **Never hold one of these mutexes across a call that might take it
+//!    again.** They are plain `std` mutexes, so they are not reentrant and a
+//!    second acquisition on the same thread deadlocks the whole download.
+//!    Beware of guards created inside a larger expression: they live until the
+//!    end of the *statement*, not the end of the sub-expression.
 //!
 //! Everything writes to stderr and degrades to plain, scroll-safe output when
 //! stderr is not a TTY.
@@ -309,17 +314,20 @@ impl SoloBar {
             *last = Instant::now();
         }
 
-        let width = draw_width();
+        // Each guard is released before the next line (rule 4).
+        let state = *lock(&self.state);
+        let speed = lock(&self.rate).per_second();
         let done = self.done.load(Ordering::Relaxed);
         let total = self.total.load(Ordering::Relaxed);
+
         let line = compose(
             &self.name,
-            *lock(&self.state),
+            state,
             done,
             total,
-            lock(&self.rate).per_second(),
+            speed,
             self.started,
-            width,
+            draw_width(),
         );
 
         self.dirty.store(true, Ordering::Relaxed);
@@ -435,6 +443,8 @@ impl BoardInner {
     /// files that have started, so queued files are projected from the average
     /// size of what has already finished. With no size information at all we
     /// fall back to seconds-per-finished-file.
+    ///
+    /// Takes the rate lock, so callers must not already hold it (rule 4).
     fn eta(&self) -> Option<u64> {
         let total_files = self.total_files.load(Ordering::Relaxed);
         let finished = self.finished_count();
@@ -471,20 +481,25 @@ impl BoardInner {
         None
     }
 
-    /// `  3/12  1.4G  38M/s  ETA 3m 12s` — no title, no word "files".
+    /// `  3/12  1.4G  38M/s  ETA 3m12s` — no title, no word "files".
     fn summary(&self, width: usize) -> String {
+        let finished = self.finished_count();
+        let total_files = self.total_files.load(Ordering::Relaxed);
         let failed = self.failed.load(Ordering::Relaxed);
         let skipped = self.skipped.load(Ordering::Relaxed);
+        let bytes = self.downloaded();
+
+        // Both of these must happen before the vec! below: a guard created
+        // inside the vec! expression would still be alive when eta() takes the
+        // same lock, which deadlocks the thread (rule 4).
+        let speed = lock(&self.rate).per_second();
+        let eta = self.eta();
 
         let mut parts = vec![
-            format!(
-                "{}/{}",
-                self.finished_count(),
-                self.total_files.load(Ordering::Relaxed)
-            ),
-            short_size(self.downloaded()),
-            short_speed(lock(&self.rate).per_second()),
-            format_eta(self.eta()),
+            format!("{}/{}", finished, total_files),
+            short_size(bytes),
+            short_speed(speed),
+            format_eta(eta),
         ];
         if failed > 0 {
             parts.push(format!("{} failed", failed));
@@ -497,12 +512,14 @@ impl BoardInner {
     }
 
     fn lane_line(&self, slot: &Slot, width: usize) -> String {
+        let state = *lock(&slot.state);
+        let speed = lock(&slot.rate).per_second();
         compose(
             &slot.name,
-            *lock(&slot.state),
+            state,
             slot.done.load(Ordering::Relaxed),
             slot.total.load(Ordering::Relaxed),
-            lock(&slot.rate).per_second(),
+            speed,
             slot.started,
             width,
         )
@@ -545,6 +562,7 @@ impl BoardInner {
             return;
         }
 
+        // Built before taking the `drawn` lock so the two are never nested.
         let lines = self.frame();
         let mut drawn = lock(&self.drawn);
 
@@ -622,7 +640,8 @@ impl Board {
                 if inner.stopped.load(Ordering::Relaxed) {
                     break;
                 }
-                lock(&inner.rate).record(inner.downloaded());
+                let bytes = inner.downloaded();
+                lock(&inner.rate).record(bytes);
 
                 if inner.tty {
                     inner.render();
@@ -737,7 +756,7 @@ impl Drop for Lane {
 
 // ── Counter progress (non-byte work) ───────────────────────────────────
 
-/// `Verifying 120/430  28%  12s` for work measured in items, not bytes.
+/// `Verifying 120/430  28%  ETA 12s` for work measured in items, not bytes.
 pub struct CountProgress {
     label: String,
     total: usize,
@@ -829,7 +848,6 @@ impl CountProgress {
 /// One refreshing line for the scraper instead of a line per directory.
 pub struct ScanSpinner {
     tty: bool,
-    started: Instant,
     dirs: AtomicUsize,
     files: AtomicUsize,
     frame: AtomicUsize,
@@ -852,7 +870,6 @@ impl ScanSpinner {
     pub fn new() -> Self {
         Self {
             tty: is_tty(),
-            started: Instant::now(),
             dirs: AtomicUsize::new(0),
             files: AtomicUsize::new(0),
             frame: AtomicUsize::new(0),
@@ -993,23 +1010,23 @@ pub fn progress_bar(fraction: f64, width: usize) -> String {
 }
 
 /// Tight size for progress lines: `512B`, `19.5K`, `142K`, `3.1G`.
-/// Never wider than six columns, which is what the layout budget assumes.
+///
+/// Walks the whole unit table — stopping at `G` meant anything past a
+/// terabyte grew without bound and blew the fixed layout budget.
 pub fn short_size(bytes: u64) -> String {
-    const K: f64 = 1024.0;
-    let b = bytes as f64;
-    let (value, unit) = if b < K {
-        return format!("{}B", bytes);
-    } else if b < K * K {
-        (b / K, 'K')
-    } else if b < K * K * K {
-        (b / (K * K), 'M')
+    const UNITS: [char; 7] = ['B', 'K', 'M', 'G', 'T', 'P', 'E'];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{}B", bytes)
+    } else if value < 10.0 {
+        format!("{:.1}{}", value, UNITS[unit])
     } else {
-        (b / (K * K * K), 'G')
-    };
-    if value < 10.0 {
-        format!("{:.1}{}", value, unit)
-    } else {
-        format!("{:.0}{}", value, unit)
+        format!("{:.0}{}", value, UNITS[unit])
     }
 }
 
@@ -1087,13 +1104,28 @@ mod tests {
 
     #[test]
     fn short_size_never_exceeds_six_columns() {
-        for bytes in [0u64, 1, 999, 1024, 20_000, 999_999, 1 << 20, 1 << 30, u64::MAX] {
+        for bytes in [
+            0u64,
+            1,
+            999,
+            1024,
+            20_000,
+            999_999,
+            1 << 20,
+            1 << 30,
+            1 << 40,
+            1 << 50,
+            u64::MAX,
+        ] {
             let s = short_size(bytes);
             assert!(display_width(&s) <= 6, "{bytes} -> {s}");
         }
         assert_eq!(short_size(512), "512B");
         assert_eq!(short_size(20_000), "20K");
         assert_eq!(short_size(2 * 1024 * 1024), "2.0M");
+        assert_eq!(short_size(1 << 40), "1.0T");
+        // The case that used to render as twelve columns of digits.
+        assert_eq!(short_size(u64::MAX), "16E");
     }
 
     #[test]
@@ -1152,7 +1184,13 @@ mod tests {
     fn composed_lines_always_fit() {
         let long = "Screenshot_20250812-114142_some_absurdly_long_name.webp";
         for width in [20usize, 40, 60, 80, 120, 199] {
-            for (done, total) in [(0, 0), (0, 5_000_000), (1_234_567, 5_000_000), (999, 0)] {
+            for (done, total) in [
+                (0, 0),
+                (0, 5_000_000),
+                (1_234_567, 5_000_000),
+                (999, 0),
+                (u64::MAX / 2, u64::MAX),
+            ] {
                 for state in [
                     SlotState::Waiting,
                     SlotState::Inspecting,
@@ -1194,6 +1232,9 @@ mod tests {
         assert!(!line.contains('%'), "{line}");
     }
 
+    /// Also a deadlock regression test: `summary()` used to hold the rate lock
+    /// while calling `eta()`, which takes it again. If that comes back, this
+    /// test hangs instead of failing.
     #[test]
     fn summary_and_frame_fit_the_width() {
         let board = Board::new("Queue", 12, 3);
