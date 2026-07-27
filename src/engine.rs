@@ -1,19 +1,19 @@
 //! The download engine.
 //!
-//! Inspects a URL, decides between a chunked parallel download and a plain
-//! stream, and drives it to completion with resume support.
+//! Formerly `cli.rs`, which was a misnomer: argument parsing lives in
+//! `args.rs` and the command dispatch lives in `main.rs`. This module knows
+//! how to turn a URL into a file on disk and nothing else.
 //!
-//! This module used to be called `cli.rs`, which fooled everyone — argument
-//! parsing lives in `args.rs`, and the command dispatch lives in `main.rs`.
-//!
-//! It never prints progress itself. Everything goes to a [`ProgressSink`], so
-//! one download can own the terminal while forty of them share a queue board.
+//! It never prints. Callers hand it a [`ProgressSink`] and receive an
+//! [`Outcome`]; a single download passes a [`ui::SoloBar`], the queue passes a
+//! lane of its live board. That is what makes per-file progress lines
+//! possible during parallel runs.
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
@@ -43,18 +43,17 @@ fn shared_config() -> &'static crate::config::Config {
     SHARED_CONFIG.get_or_init(crate::config::Config::load)
 }
 
-// ── Request / outcome ──────────────────────────────────────────────────────
+// ── Request / outcome ───────────────────────────────────────────────────
 
-/// What to do when the destination file already exists.
+/// What to do when the target file already exists on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExistingPolicy {
-    /// Prompt the user (interactive single downloads).
+    /// Prompt the user to overwrite / rename / cancel. Interactive only.
     Ask,
-    /// Resume if there is partial state, otherwise treat the file as already
-    /// downloaded. Batch runs use this: a queue of 500 files must never block
-    /// on a prompt.
+    /// Treat the existing file as done. Used by every batch path, so a queue
+    /// of 400 files never blocks on a hidden prompt behind the progress board.
     Reuse,
-    /// Delete whatever is there and start over.
+    /// Remove the file (and any `.part` / `.rdm` state) and download again.
     Overwrite,
 }
 
@@ -67,9 +66,9 @@ pub struct DownloadRequest {
 }
 
 impl DownloadRequest {
-    pub fn new(url: impl Into<String>, output: Option<String>, connections: usize) -> Self {
+    pub fn new(url: String, output: Option<String>, connections: usize) -> Self {
         Self {
-            url: url.into(),
+            url,
             output,
             connections,
             policy: ExistingPolicy::Ask,
@@ -82,17 +81,15 @@ impl DownloadRequest {
     }
 }
 
+/// How a download ended. Errors are still returned as `Err`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// Bytes landed on disk at `path`.
     Completed { path: String, bytes: u64 },
-    /// A finished copy was already there; nothing to do.
     AlreadyPresent { path: String },
-    /// The user declined to overwrite.
     Cancelled,
 }
 
-/// What [`resolve_existing_output`] decided about a pre-existing file.
+/// Result of reconciling the requested output path with what is on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputDecision {
     Use(String),
@@ -100,7 +97,7 @@ pub enum OutputDecision {
     Cancelled,
 }
 
-// ── Streaming resume helpers ───────────────────────────────────────────────
+// ── Streaming resume helpers ─────────────────────────────────────────────
 
 /// Describes what the streaming download should do after the initial response.
 #[derive(Debug, PartialEq)]
@@ -164,11 +161,9 @@ pub fn build_streaming_request(
     req
 }
 
-// ── Main download entry point ──────────────────────────────────────────────
+// ── Main download entry point ────────────────────────────────────────────
 
 /// Downloads one file, reporting everything through `sink`.
-///
-/// The caller owns presentation; this function never writes to the terminal.
 pub async fn download(
     req: DownloadRequest,
     cancel: CancellationToken,
@@ -180,11 +175,15 @@ pub async fn download(
     let output_path = match resolve_existing_output(&original_path, &url, req.policy).await? {
         OutputDecision::Use(p) => p,
         OutputDecision::AlreadyPresent => {
+            sink.finish();
             return Ok(Outcome::AlreadyPresent {
                 path: original_path,
             });
         }
-        OutputDecision::Cancelled => return Ok(Outcome::Cancelled),
+        OutputDecision::Cancelled => {
+            sink.finish();
+            return Ok(Outcome::Cancelled);
+        }
     };
 
     let user_explicitly_renamed = output_path != original_path;
@@ -196,8 +195,8 @@ pub async fn download(
 
     let info = inspect::inspect_url(client, &url).await?;
 
-    // Use server-suggested filename when URL has no extension,
-    // but only if the user didn't explicitly choose a name (via rename or -o).
+    // Use the server-suggested filename when the URL has no extension, but
+    // only if the user didn't explicitly choose a name (via rename or -o).
     let output_path = if user_explicitly_renamed {
         output_path
     } else if let Some(ref name) = info.suggested_filename {
@@ -217,28 +216,33 @@ pub async fn download(
         Some(0) => anyhow::bail!("Cannot download empty file (Content-Length: 0)"),
         Some(s) => s,
         None => {
-            sink.total(None);
             sink.detail("File size : unknown (streaming)");
             sink.detail(&format!("Output    : {}", output_path));
+            sink.total(None);
             sink.state(SlotState::Downloading);
 
-            let bytes = download_streaming(client, &url, &output_path, cancel, &sink).await?;
-            return Ok(Outcome::Completed {
-                path: output_path,
-                bytes,
-            });
+            let result =
+                download_streaming(client, &url, &output_path, cancel, Arc::clone(&sink)).await;
+            sink.finish();
+
+            return match result {
+                Ok(bytes) => Ok(Outcome::Completed {
+                    path: output_path,
+                    bytes,
+                }),
+                Err(e) => Err(e),
+            };
         }
     };
 
-    // Small files gain nothing from being split up.
+    // Small files gain nothing from parallel connections.
     let connections = if file_size < 4 * 1024 * 1024 {
         1
     } else {
         connections
     };
 
-    sink.total(Some(file_size));
-    sink.detail(&format!("File size : {}", format_bytes(file_size)));
+    sink.detail(&format!("File size : {}", ui::format_size(file_size)));
     sink.detail(&format!(
         "Range     : {}",
         if info.supports_range {
@@ -267,10 +271,12 @@ pub async fn download(
     }
 
     sink.detail(&format!("Chunks    : {}", chunks.len()));
+
+    sink.total(Some(file_size));
     sink.state(SlotState::Downloading);
 
-    // Throttling and rate maths now live in the ui layer, so the callback is
-    // just a pipe. It must stay cheap: it fires every 200ms per download.
+    // The sink owns throttling, smoothing, and ETA maths now, so the callback
+    // is just a forwarder.
     let progress_sink = Arc::clone(&sink);
     let progress_callback = move |downloaded: u64, _total: u64| {
         progress_sink.progress(downloaded);
@@ -293,19 +299,22 @@ pub async fn download(
         last_modified: info.last_modified.clone(),
     };
 
-    let bytes = parallel::download_parallel(&ctx, Some(progress_callback)).await?;
-    sink.state(SlotState::Finishing);
+    let download_result = parallel::download_parallel(&ctx, Some(progress_callback)).await;
 
-    Ok(Outcome::Completed {
-        path: output_path,
-        bytes,
-    })
+    sink.state(SlotState::Finishing);
+    sink.finish();
+
+    match download_result {
+        Ok(bytes) => Ok(Outcome::Completed {
+            path: output_path,
+            bytes,
+        }),
+        Err(e) => Err(e),
+    }
 }
 
-/// Single-file download with the interactive presentation attached.
-///
-/// Kept as the entry point for `rdm <url>` and `rdm download`; batch callers
-/// should use [`download`] with their own sink.
+/// Single-download convenience wrapper: renders its own progress bar and
+/// prints a summary line. Used by `rdm <url>` and `rdm download`.
 pub async fn run_download(
     url: String,
     output: Option<String>,
@@ -313,24 +322,30 @@ pub async fn run_download(
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<()> {
-    let label = extract_filename_from_url(&url).unwrap_or_else(|| url.clone());
+    let name = output
+        .clone()
+        .map(|o| o.rsplit('/').next().unwrap_or(&o).to_string())
+        .or_else(|| extract_filename_from_url(&url))
+        .unwrap_or_else(|| "download".to_string());
 
-    let bar = ui::SoloBar::new(&label);
-    let sink: Arc<dyn ProgressSink> = if quiet {
-        ui::silent()
+    let bar = if quiet {
+        None
     } else {
-        Arc::clone(&bar) as Arc<dyn ProgressSink>
+        Some(ui::SoloBar::new(&name))
+    };
+    let sink: Arc<dyn ProgressSink> = match &bar {
+        Some(b) => Arc::clone(b) as Arc<dyn ProgressSink>,
+        None => ui::silent(),
     };
 
-    let req = DownloadRequest::new(url, output, connections).with_policy(ExistingPolicy::Ask);
-    let started = Instant::now();
-    let result = download(req, cancel, Arc::clone(&sink)).await;
-    sink.finish();
+    let request = DownloadRequest::new(url, output, connections);
+    let result = download(request, cancel, sink).await;
+    let elapsed = bar.as_ref().map(|b| b.elapsed()).unwrap_or_default();
 
     match result {
         Ok(Outcome::Completed { path, bytes }) => {
             if !quiet {
-                let secs = started.elapsed().as_secs_f64();
+                let secs = elapsed.as_secs_f64();
                 let avg = if secs > 0.1 {
                     Some((bytes as f64 / secs) as u64)
                 } else {
@@ -338,10 +353,10 @@ pub async fn run_download(
                 };
                 eprintln!("  \u{2705} Download complete: {}", path);
                 eprintln!(
-                    "  {} in {:.1}s ({})",
-                    format_bytes(bytes),
-                    secs,
-                    ui::format_speed(avg)
+                    "  {} in {} ({})",
+                    ui::format_size(bytes),
+                    ui::format_duration(elapsed.as_secs()),
+                    ui::format_speed(avg),
                 );
             }
             Ok(())
@@ -373,7 +388,7 @@ async fn download_streaming(
     url: &str,
     output_path: &str,
     cancel: CancellationToken,
-    sink: &Arc<dyn ProgressSink>,
+    sink: Arc<dyn ProgressSink>,
 ) -> Result<u64> {
     let temp_path = format!("{}.part", output_path);
 
@@ -432,6 +447,12 @@ async fn download_streaming(
                 );
             }
         };
+
+    // A streaming response may still tell us how big it is; if so the sink can
+    // draw a real bar and ETA instead of a byte counter.
+    if let Some(len) = resp.content_length() {
+        sink.total(Some(len + resume_offset));
+    }
 
     // Phase 3: Open file and stream body
     let file = if append {
@@ -496,10 +517,10 @@ async fn download_streaming(
     Ok(downloaded)
 }
 
-/// Decides what to do about an existing destination file.
+/// Decides what to do about an already-existing output file.
 ///
-/// Resumable state (a `.part` file or valid resume metadata) always wins: it
-/// means an earlier run of this exact download was interrupted.
+/// A resumable download (a `.part` file, or valid `.rdm` metadata) always wins
+/// over the policy — there is nothing to ask about, we just continue.
 pub async fn resolve_existing_output(
     path: &str,
     url: &str,
@@ -507,24 +528,16 @@ pub async fn resolve_existing_output(
 ) -> Result<OutputDecision> {
     use std::io::{BufRead, IsTerminal, Write};
 
-    let part_path = format!("{}.part", path);
-    let meta_path = crate::resume::ResumeMetadata::meta_path(path);
-
-    if policy == ExistingPolicy::Overwrite {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(&part_path);
-        let _ = std::fs::remove_file(&meta_path);
-        return Ok(OutputDecision::Use(path.to_string()));
-    }
-
     if !std::path::Path::new(path).exists() {
         return Ok(OutputDecision::Use(path.to_string()));
     }
 
+    let part_path = format!("{}.part", path);
     if std::path::Path::new(&part_path).exists() {
         return Ok(OutputDecision::Use(path.to_string()));
     }
 
+    let meta_path = crate::resume::ResumeMetadata::meta_path(path);
     if let Ok(meta) = crate::resume::load(&meta_path).await {
         let chunks: Vec<crate::chunk::Chunk> = meta
             .chunks
@@ -540,10 +553,16 @@ pub async fn resolve_existing_output(
         }
     }
 
-    // A finished file with no partial state. Batch runs treat that as done
-    // instead of stopping the world for a prompt.
-    if policy == ExistingPolicy::Reuse {
-        return Ok(OutputDecision::AlreadyPresent);
+    match policy {
+        // Batch runs must never block on stdin.
+        ExistingPolicy::Reuse => return Ok(OutputDecision::AlreadyPresent),
+        ExistingPolicy::Overwrite => {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&part_path);
+            let _ = std::fs::remove_file(&meta_path);
+            return Ok(OutputDecision::Use(path.to_string()));
+        }
+        ExistingPolicy::Ask => {}
     }
 
     if !std::io::stdin().is_terminal() {
@@ -718,23 +737,7 @@ fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
     chunks
 }
 
-/// Verbose size, for one-file summaries where the exact byte count is useful.
-pub fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    if bytes >= GIB {
-        format!("{:.2} GiB ({} bytes)", bytes as f64 / GIB as f64, bytes)
-    } else if bytes >= MIB {
-        format!("{:.2} MiB ({} bytes)", bytes as f64 / MIB as f64, bytes)
-    } else if bytes >= KIB {
-        format!("{:.2} KiB ({} bytes)", bytes as f64 / KIB as f64, bytes)
-    } else {
-        format!("{} bytes", bytes)
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────
+// ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -767,57 +770,78 @@ mod tests {
         for i in 1..chunks.len() { assert_eq!(chunks[i].start, chunks[i-1].end + 1); }
     }
 
+    // ── Request builder ──
+
+    #[test]
+    fn request_defaults_to_asking_about_existing_files() {
+        let req = DownloadRequest::new("https://example.com/f.zip".into(), None, 8);
+        assert_eq!(req.policy, ExistingPolicy::Ask);
+        assert_eq!(req.with_policy(ExistingPolicy::Reuse).policy, ExistingPolicy::Reuse);
+    }
+
     // ── Existing-output policy ──
 
     #[tokio::test]
-    async fn missing_file_is_simply_used() {
+    async fn missing_file_is_always_used() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.bin").to_string_lossy().to_string();
-        let decision = resolve_existing_output(&path, "https://example.com/nope.bin", ExistingPolicy::Reuse)
-            .await
-            .unwrap();
-        assert_eq!(decision, OutputDecision::Use(path));
+        assert_eq!(
+            resolve_existing_output(&path, "https://example.com/nope.bin", ExistingPolicy::Ask)
+                .await
+                .unwrap(),
+            OutputDecision::Use(path),
+        );
     }
 
     #[tokio::test]
-    async fn batch_runs_never_prompt_for_a_finished_file() {
+    async fn reuse_policy_reports_existing_file_instead_of_prompting() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("done.bin");
         std::fs::write(&path, b"payload").unwrap();
         let path = path.to_string_lossy().to_string();
 
-        let decision = resolve_existing_output(&path, "https://example.com/done.bin", ExistingPolicy::Reuse)
-            .await
-            .unwrap();
-        assert_eq!(decision, OutputDecision::AlreadyPresent);
+        assert_eq!(
+            resolve_existing_output(&path, "https://example.com/done.bin", ExistingPolicy::Reuse)
+                .await
+                .unwrap(),
+            OutputDecision::AlreadyPresent,
+        );
     }
 
     #[tokio::test]
-    async fn partial_state_wins_over_already_present() {
+    async fn overwrite_policy_clears_the_file_and_its_state() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("half.bin");
-        std::fs::write(&path, b"payload").unwrap();
-        std::fs::write(dir.path().join("half.bin.part"), b"pay").unwrap();
+        let path = dir.path().join("stale.bin");
+        std::fs::write(&path, b"old").unwrap();
         let path = path.to_string_lossy().to_string();
 
-        let decision = resolve_existing_output(&path, "https://example.com/half.bin", ExistingPolicy::Reuse)
+        assert_eq!(
+            resolve_existing_output(
+                &path,
+                "https://example.com/stale.bin",
+                ExistingPolicy::Overwrite
+            )
             .await
-            .unwrap();
-        assert_eq!(decision, OutputDecision::Use(path));
+            .unwrap(),
+            OutputDecision::Use(path.clone()),
+        );
+        assert!(!std::path::Path::new(&path).exists());
     }
 
     #[tokio::test]
-    async fn overwrite_clears_the_old_file() {
+    async fn a_partial_download_resumes_regardless_of_policy() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.bin");
-        std::fs::write(&path, b"payload").unwrap();
-        let path_str = path.to_string_lossy().to_string();
+        let path = dir.path().join("half.bin");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::write(dir.path().join("half.bin.part"), b"partial").unwrap();
+        let path = path.to_string_lossy().to_string();
 
-        let decision = resolve_existing_output(&path_str, "https://example.com/old.bin", ExistingPolicy::Overwrite)
-            .await
-            .unwrap();
-        assert_eq!(decision, OutputDecision::Use(path_str));
-        assert!(!path.exists(), "overwrite should remove the stale file");
+        assert_eq!(
+            resolve_existing_output(&path, "https://example.com/half.bin", ExistingPolicy::Reuse)
+                .await
+                .unwrap(),
+            OutputDecision::Use(path),
+        );
     }
 
     // ── Streaming resume helper tests ──
