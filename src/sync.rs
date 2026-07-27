@@ -1,18 +1,28 @@
+//! `rdm sync` — mirror a remote directory listing into a local folder.
+//!
+//! Scanning, verification, and deletion all report through [`crate::ui`], and
+//! the actual downloading is handed to [`crate::queue`], so a sync shows the
+//! same live per-file board as `rdm queue start`.
+
 use anyhow::{Context, Result};
 use reqwest::header::CONTENT_LENGTH;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::cli;
 use crate::config::Config;
+use crate::engine;
 use crate::queue;
 use crate::scrape;
+use crate::ui;
+
+/// How many paths to show before collapsing the rest into a count.
+const SAMPLE: usize = 20;
 
 pub async fn run(
     cfg: &Config,
@@ -42,13 +52,13 @@ pub async fn run(
     let files = match files {
         Some(f) if !f.is_empty() => f,
         _ => {
-            eprintln!("  ❌ No files found at {}", url);
+            eprintln!("  \u{274c} No files found at {}", url);
             return Ok(());
         }
     };
 
     if cancel.is_cancelled() {
-        eprintln!("  ⚠ Cancelled during scan.");
+        eprintln!("  \u{26a0} Cancelled during scan.");
         return Ok(());
     }
 
@@ -69,7 +79,7 @@ pub async fn run(
         let mut sorted: Vec<&str> = exts.iter().map(|s| s.as_str()).collect();
         sorted.sort();
         eprintln!(
-            "  🔎 Filter: {} → {} file(s) matching .{}",
+            "  \u{1f50e} Filter: {} → {} file(s) matching .{}",
             total_before_filter,
             files.len(),
             sorted.join(", ."),
@@ -77,13 +87,13 @@ pub async fn run(
     }
 
     if files.is_empty() {
-        eprintln!("  ❌ No files match the extension filter");
+        eprintln!("  \u{274c} No files match the extension filter");
         return Ok(());
     }
 
     let remote_decoded: HashSet<String> = files
         .iter()
-        .map(|f| cli::percent_decode(&f.relative_path))
+        .map(|f| engine::percent_decode(&f.relative_path))
         .collect();
 
     let sync_root_result = derive_sync_root(cfg, &files);
@@ -91,17 +101,15 @@ pub async fn run(
     if delete {
         match &sync_root_result {
             SyncRoot::MixedRoots => {
-                eprintln!("  ⚠ Cannot use --delete: files have mixed folder roots.");
+                eprintln!("  \u{26a0} Cannot use --delete: files have mixed folder roots.");
                 eprintln!("    Delete must be performed manually.");
             }
             SyncRoot::Empty => {
-                eprintln!("  ⚠ Cannot use --delete: unable to determine sync root.");
+                eprintln!("  \u{26a0} Cannot use --delete: unable to determine sync root.");
             }
             SyncRoot::Ok(_) => {}
         }
     }
-
-    eprintln!("  🔍 Checking {} file(s)...", files.len());
 
     let mut needs_head: Vec<(String, String, PathBuf, u64)> = Vec::new();
     let mut to_download: Vec<(String, String)> = Vec::new();
@@ -121,8 +129,6 @@ pub async fn run(
     let mut up_to_date = 0u64;
 
     if !needs_head.is_empty() {
-        eprintln!("  📡 Verifying {} existing file(s)...", needs_head.len());
-
         let client = reqwest::Client::builder()
             .user_agent("rdm")
             .connect_timeout(Duration::from_secs(10))
@@ -133,10 +139,8 @@ pub async fn run(
         let sem = Arc::new(Semaphore::new(8));
         let mut tasks = JoinSet::new();
 
-        // Capture total before needs_head is moved into the spawn loop.
-        let verify_total = needs_head.len();
-        let verify_started = Instant::now();
-        let mut verified = 0usize;
+        // Capture the total before needs_head is moved into the spawn loop.
+        let progress = ui::CountProgress::new("Verifying local files", needs_head.len());
 
         for (file_url, relative, path, size) in needs_head {
             let client = client.clone();
@@ -156,17 +160,15 @@ pub async fn run(
         while let Some(joined) = tasks.join_next().await {
             if cancel.is_cancelled() {
                 tasks.abort_all();
-                clear_progress();
-                eprintln!("  ⚠ Cancelled during verification.");
+                progress.finish("cancelled");
+                eprintln!("  \u{26a0} Cancelled during verification.");
                 return Ok(());
             }
-            let (file_url, relative, _path, status) =
-                match joined.context("Task panicked")? {
-                    Some(v) => v,
-                    None => continue,
-                };
-            verified += 1;
-            print_progress("Verify", verified, verify_total, verify_started);
+            let (file_url, relative, _path, status) = match joined.context("Task panicked")? {
+                Some(v) => v,
+                None => continue,
+            };
+            progress.tick();
             match status {
                 HeadStatus::UpToDate | HeadStatus::HeadFailed => {
                     up_to_date += 1;
@@ -176,7 +178,8 @@ pub async fn run(
                 }
             }
         }
-        clear_progress();
+
+        progress.finish(&format!("{} already up to date", up_to_date));
     }
 
     to_download.sort_by(|a, b| a.1.cmp(&b.1));
@@ -208,22 +211,24 @@ pub async fn run(
 
     if to_download.is_empty() && to_delete.is_empty() {
         eprintln!();
-        eprintln!("  ✅ Everything is up to date!");
+        eprintln!("  \u{2705} Everything is up to date!");
         return Ok(());
     }
 
     if !to_download.is_empty() {
         eprintln!();
-        for (_, relative) in &to_download {
-            eprintln!("     + {}", cli::percent_decode(relative));
-        }
+        print_sample(
+            "+",
+            to_download
+                .iter()
+                .map(|(_, relative)| engine::percent_decode(relative)),
+            to_download.len(),
+        );
     }
 
     if !to_delete.is_empty() {
         eprintln!();
-        for path in &to_delete {
-            eprintln!("     - {}", path);
-        }
+        print_sample("-", to_delete.iter().cloned(), to_delete.len());
     }
 
     eprintln!();
@@ -246,31 +251,24 @@ pub async fn run(
 
         queue::Queue::locked(|q| {
             for (file_url, relative) in &to_download {
-                let decoded = cli::percent_decode(relative);
+                let decoded = engine::percent_decode(relative);
                 q.add(file_url.clone(), Some(decoded), Some(connections));
             }
             Ok(())
         })?;
 
-        eprintln!(
-            "  📥 Starting download ({} file(s), {} parallel)...",
-            to_download.len(),
-            parallel,
-        );
-        eprintln!();
-
         let result = queue::start(cfg, cancel.clone(), parallel).await;
         let _ = queue::Queue::locked(|q| Ok(q.clear_finished()));
 
         if let Err(e) = result {
-            eprintln!("  ⚠ Some downloads failed — skipping delete phase.");
+            eprintln!("  \u{26a0} Some downloads failed — skipping delete phase.");
             return Err(e);
         }
 
         let q = queue::Queue::load_readonly();
         if q.failed_count() > 0 {
             eprintln!(
-                "  ⚠ {} download(s) failed — skipping delete phase.",
+                "  \u{26a0} {} download(s) failed — skipping delete phase.",
                 q.failed_count()
             );
             return Ok(());
@@ -279,7 +277,7 @@ pub async fn run(
 
     if !to_delete.is_empty() {
         if cancel.is_cancelled() {
-            eprintln!("  ⚠ Cancelled before delete phase.");
+            eprintln!("  \u{26a0} Cancelled before delete phase.");
             return Ok(());
         }
 
@@ -288,7 +286,7 @@ pub async fn run(
             let pct = (to_delete.len() as f64 / total_local as f64) * 100.0;
             if to_delete.len() > 10 && pct > 50.0 {
                 eprintln!(
-                    "  ⚠ Warning: about to delete {} of {} local files ({:.0}%)",
+                    "  \u{26a0} Warning: about to delete {} of {} local files ({:.0}%)",
                     to_delete.len(),
                     total_local,
                     pct,
@@ -299,7 +297,7 @@ pub async fn run(
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input).ok();
                 if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
-                    eprintln!("  ⛔ Aborted.");
+                    eprintln!("  \u{26d4} Aborted.");
                     return Ok(());
                 }
             }
@@ -308,71 +306,49 @@ pub async fn run(
         let mut deleted = 0u64;
         let mut delete_failed = 0u64;
 
-        let delete_total = to_delete.len();
-        let delete_started = Instant::now();
-        let mut delete_done = 0usize;
-
         if let SyncRoot::Ok(ref root) = sync_root_result {
+            let progress = ui::CountProgress::new("Deleting orphans", to_delete.len());
+
             for relative in &to_delete {
                 let full_path = Path::new(root).join(relative);
                 match std::fs::remove_file(&full_path) {
                     Ok(_) => {
                         deleted += 1;
-                        let _ =
-                            std::fs::remove_file(format!("{}.part", full_path.display()));
-                        let meta = crate::resume::ResumeMetadata::meta_path(
-                            &full_path.to_string_lossy(),
-                        );
+                        let _ = std::fs::remove_file(format!("{}.part", full_path.display()));
+                        let meta =
+                            crate::resume::ResumeMetadata::meta_path(&full_path.to_string_lossy());
                         let _ = std::fs::remove_file(&meta);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
                         delete_failed += 1;
-                        clear_progress();
-                        eprintln!("  ⚠ Failed to delete {}: {}", relative, e);
+                        progress.note(&format!("  \u{26a0} Failed to delete {}: {}", relative, e));
                     }
                 }
-                delete_done += 1;
-                print_progress("Delete", delete_done, delete_total, delete_started);
+                progress.tick();
             }
-            clear_progress();
+
+            progress.finish(&format!("{} file(s) deleted", deleted));
             remove_empty_dirs(Path::new(root));
         }
 
-        eprintln!("  🗑  Deleted {} file(s)", deleted);
         if delete_failed > 0 {
-            eprintln!("  ⚠  Failed to delete {} file(s)", delete_failed);
+            eprintln!("  \u{26a0} Failed to delete {} file(s)", delete_failed);
         }
     }
 
     eprintln!();
-    eprintln!("  ✅ Sync complete!");
+    eprintln!("  \u{2705} Sync complete!");
     Ok(())
 }
 
-fn print_progress(label: &str, done: usize, total: usize, started: Instant) {
-    let eta = format_eta(done, total, started.elapsed());
-    eprint!("\r\x1b[2K  {}: {}/{} | {}", label, done, total, eta);
-    let _ = std::io::stderr().flush();
-}
-
-fn clear_progress() {
-    eprint!("\r\x1b[2K");
-    let _ = std::io::stderr().flush();
-}
-
-fn format_eta(done: usize, total: usize, elapsed: Duration) -> String {
-    if done == 0 {
-        return "ETA --:--".to_string();
+/// Prints at most [`SAMPLE`] entries, then says how many were left out.
+fn print_sample<I: Iterator<Item = String>>(marker: &str, items: I, total: usize) {
+    for item in items.take(SAMPLE) {
+        eprintln!("     {} {}", marker, item);
     }
-    let remaining = total.saturating_sub(done);
-    let secs = (elapsed.as_secs_f64() / done as f64 * remaining as f64).round() as u64;
-    if secs >= 3600 {
-        format!("ETA {}h {:02}m", secs / 3600, (secs % 3600) / 60)
-    } else if secs >= 60 {
-        format!("ETA {}m {:02}s", secs / 60, secs % 60)
-    } else {
-        format!("ETA {}s", secs)
+    if total > SAMPLE {
+        eprintln!("     \u{2026} and {} more", total - SAMPLE);
     }
 }
 
@@ -390,7 +366,7 @@ enum SyncRoot {
 }
 
 fn local_path(cfg: &Config, relative: &str) -> PathBuf {
-    let decoded = cli::percent_decode(relative);
+    let decoded = engine::percent_decode(relative);
     PathBuf::from(cfg.resolve_output_path(&decoded))
 }
 
@@ -403,11 +379,7 @@ fn file_has_ext(filename: &str, exts: &HashSet<String>) -> bool {
     exts.iter().any(|ext| lower.ends_with(&format!(".{}", ext)))
 }
 
-async fn head_compare(
-    client: &reqwest::Client,
-    url: &str,
-    local_size: u64,
-) -> HeadStatus {
+async fn head_compare(client: &reqwest::Client, url: &str, local_size: u64) -> HeadStatus {
     let resp = match client.head(url).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return HeadStatus::HeadFailed,
@@ -439,7 +411,7 @@ fn derive_sync_root(cfg: &Config, files: &[scrape::DiscoveredFile]) -> SyncRoot 
     {
         return SyncRoot::MixedRoots;
     }
-    let decoded_prefix = cli::percent_decode(prefix);
+    let decoded_prefix = engine::percent_decode(prefix);
     SyncRoot::Ok(cfg.resolve_output_path(&decoded_prefix))
 }
 
@@ -465,10 +437,7 @@ fn collect_orphan_files(
             collect_orphan_files(&path, base, remote_decoded, ext_filter, out);
         } else if path.is_file() {
             if let Some(exts) = ext_filter.as_ref() {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if !file_has_ext(name, exts) {
                     continue;
                 }
