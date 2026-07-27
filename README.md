@@ -72,6 +72,35 @@ rdm queue clear [pending|done]           Clear queue (all by default)   [c]
 
 Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything it finds and starts downloading, and `rdm queue add <URL>` enqueues without starting.
 
+## Progress output
+
+The queue draws a live board instead of scrolling a wall of text. Every worker
+gets its own line that stays in place, and the bottom line aggregates real
+throughput and a byte-based ETA:
+
+```
+Queue — 12 files
+
+  ⬇ ubuntu-24.04-desktop-amd64.iso   [████████████░░░░░░░░]  61%   2.9 GB/4.7 GB   38.2 MB/s   47s
+  ⬇ debian-13.1.0-amd64-netinst.iso  [████░░░░░░░░░░░░░░░░]  22%   142 MB/633 MB   11.4 MB/s   43s
+  ◌ archlinux-x86_64.iso             inspecting…
+
+  5/12 done · 1 failed · 3.1 GB · 49.6 MB/s · ETA 3m12s · elapsed 1m04s
+```
+
+Completed, skipped and failed files scroll above the board, so the board itself
+never grows. Non-TTY output (pipes, logs, `nohup`) falls back to one plain line
+every few seconds instead of redrawing, and `-q` silences it entirely.
+
+The same layer is used everywhere the queue system is:
+
+- **sync** shows `Verifying 128/512` and `Deleting 3/17` counters with an ETA
+  rather than a silent stall, and truncates huge add/delete listings.
+- **scrape** collapses the per-directory scan log into a single spinner line
+  (`⠼ Scanning music/lossless/ · 214 dirs · 3,481 files`).
+- **single downloads** use the same bar, so `rdm <url>` and a queued file look
+  identical.
+
 # Example Config File
 
 ```
@@ -87,6 +116,21 @@ max_retries = 69
 # multi-file download at once
 queue_parallel = 5
 ```
+
+# Layout
+
+```
+src/
+  engine.rs   single-file download engine (was cli.rs)
+  ui.rs       shared progress layer: board, per-file lines, rates, ETA
+  queue.rs    persistent queue + parallel runner
+  sync.rs     remote directory mirroring
+  scrape.rs   directory listing discovery
+  parallel.rs chunked/ranged transfers
+```
+
+`cli.rs` was never a CLI — clap owns the CLI in `args.rs` — so it is now
+`engine.rs`, and it takes a progress sink instead of printing directly.
 
 # Release
 Zack encourages you to build from source. As some random internet person once said, "Always build from source"
