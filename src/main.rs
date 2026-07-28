@@ -32,7 +32,7 @@ fn main() -> Result<()> {
             // Before `normalize_download_url`: a MEGA link's `#key` fragment is
             // load-bearing and must reach the parser untouched.
             if mega::is_mega_url(&url) {
-                return mega_download(&cfg, &url, &opts);
+                return mega_route(&cfg, &url, &opts);
             }
 
             let url = engine::normalize_download_url(&url);
@@ -101,7 +101,7 @@ fn quick_download(
         if parallel.is_some() && !opts.quiet {
             eprintln!("  \u{26a0} -p applies to directory listings; MEGA uses mega_workers.");
         }
-        return mega_download(cfg, url, opts);
+        return mega_route(cfg, url, opts);
     }
 
     let url = engine::normalize_download_url(url);
@@ -144,6 +144,19 @@ fn quick_download(
     })
 }
 
+/// Sends a MEGA link to the file downloader or the folder downloader.
+///
+/// The two share everything below the API call but differ completely above it:
+/// a folder link has no file handle and no file key until its node tree has
+/// been fetched and decrypted.
+fn mega_route(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    if mega::folder::is_folder_link(url) {
+        mega_folder_download(cfg, url, opts)
+    } else {
+        mega_download(cfg, url, opts)
+    }
+}
+
 /// `rdm <mega link>` — fetch, decrypt and verify a MEGA file.
 ///
 /// Kept separate from the normal download path on purpose: MEGA needs its own
@@ -176,6 +189,42 @@ fn mega_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result
         .await?;
 
         report_mega(&outcome, quiet);
+        Ok(())
+    })
+}
+
+/// `rdm <mega folder link>` — walk the share and download everything in it.
+///
+/// `-o` names the destination directory here, not a file: a share holds many
+/// files and its own directory structure, so there is nothing sensible for a
+/// single output filename to mean.
+fn mega_folder_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    let url = url.trim().to_string();
+    let options = mega_options(cfg, opts);
+    let quiet = opts.quiet;
+
+    let output = opts.output.as_deref().map(|o| {
+        let trimmed = o.trim_end_matches('/').trim_end_matches('\\');
+        resolve_relative_to_config(trimmed, cfg)
+    });
+    let download_dir = cfg.download_dir.clone();
+
+    run_async(|cancel| async move {
+        let client = reqwest::Client::new();
+        let make_sink = |name: &str, _size: u64| progress_sink(quiet, name);
+
+        let summary = mega::folder::download_folder(
+            client,
+            &url,
+            output,
+            &download_dir,
+            options,
+            cancel,
+            &make_sink,
+        )
+        .await?;
+
+        report_mega_folder(&summary, quiet);
         Ok(())
     })
 }
@@ -262,6 +311,15 @@ fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
 
 /// `rdm queue add` — enqueue a single file, or every file behind a listing.
 fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    // A folder share is N files with no individual URLs to store, so it cannot
+    // be represented as one queue item. Say so instead of accepting it and
+    // failing later, in the runner, where the message would be less useful.
+    if mega::folder::is_folder_link(url) {
+        anyhow::bail!(
+            "MEGA folder links cannot be queued \u{2014} run `rdm <folder link>` to download the whole share"
+        );
+    }
+
     // MEGA links go in verbatim: `normalize_download_url` would touch the
     // `#key` fragment, and there is no listing behind a file link to scrape.
     // The queue runner recognises them and dispatches to the MEGA downloader.
@@ -415,6 +473,40 @@ fn report_mega(outcome: &mega::MegaOutcome, quiet: bool) {
     }
 }
 
+/// Folder downloads report per file, because a share with one dead node in it
+/// is still a successful download of everything else.
+fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
+    if quiet {
+        return;
+    }
+
+    eprintln!();
+    eprintln!("  \u{1f4c1} {}", summary.root.display());
+    eprintln!(
+        "     {} of {} file(s), {}",
+        summary.completed,
+        summary.total,
+        ui::format_size(summary.bytes)
+    );
+
+    if summary.skipped > 0 {
+        eprintln!("     {} already on disk", summary.skipped);
+    }
+
+    if !summary.failed.is_empty() {
+        eprintln!();
+        eprintln!("  \u{26a0} {} file(s) failed:", summary.failed.len());
+        for (path, reason) in &summary.failed {
+            eprintln!("     - {path}: {reason}");
+        }
+    }
+
+    if summary.cancelled {
+        eprintln!();
+        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
+    }
+}
+
 /// Shows what was found without burying the terminal: a listing of 4000 files
 /// used to print 4000 lines before a single byte was downloaded.
 fn print_discovered(files: &[scrape::DiscoveredFile]) {
@@ -552,6 +644,22 @@ mod tests {
     fn ordinary_links_are_not_sent_to_mega() {
         assert!(!mega::is_mega_url("https://example.com/mega.nz/file.zip"));
         assert!(!mega::is_mega_url("https://example.com/song.flac"));
+    }
+
+    /// Both link shapes are MEGA, but only one of them has a file key in it.
+    /// Sending a folder link down the file path gets a -9 from the API rather
+    /// than anything the user could act on.
+    #[test]
+    fn folder_links_and_file_links_take_different_paths() {
+        let folder = "https://mega.nz/folder/s6lVFYbI#XKN8d1JVkhLYqpd9WPNQzA";
+        let file = "https://mega.nz/file/AbCdEfGh#thekey";
+
+        assert!(mega::is_mega_url(folder));
+        assert!(mega::folder::is_folder_link(folder));
+        assert!(!mega::folder::is_folder_link(file));
+
+        // The file parser must not silently accept a folder link.
+        assert!(mega::parse_link(folder).is_err());
     }
 
     #[test]
