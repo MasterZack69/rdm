@@ -18,6 +18,9 @@
 //!    key. Recomputing it is the only way to know the file is intact;
 //!    Content-Length matching proves nothing here.
 //!
+//! Folder links take a fifth step (fetching the node tree) and live in
+//! [`folder`]; everything below the tree walk comes back here.
+//!
 //! ## What was taken from MegaBasterd, and what wasn't
 //!
 //! The failure modes this module guards against are the ones that MegaBasterd
@@ -73,6 +76,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ui::{ProgressSink, SlotState, format_size};
 
+/// Folder links: node tree, key unwrapping, and per-file orchestration.
+pub mod folder;
+
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 
 /// MEGA's API endpoint. `g.api` is the one that hands out download URLs.
@@ -102,6 +108,9 @@ const MAX_URL_RETRY: u32 = 32;
 /// Read buffer per worker.
 const BUFFER_SIZE: usize = 64 * 1024;
 
+/// How long a worker parked on someone else's 509 waits between re-checks.
+const QUOTA_POLL: Duration = Duration::from_millis(500);
+
 // ── Link parsing ─────────────────────────────────────────────────────
 
 /// Does this look like something only the MEGA path can handle?
@@ -118,6 +127,18 @@ pub fn is_mega_url(url: &str) -> bool {
         || host == "mega.co.nz"
         || host.ends_with(".mega.nz")
         || host.ends_with(".mega.co.nz")
+}
+
+/// Everything after `mega.nz/`, with the scheme and host removed.
+///
+/// Shared with the folder parser so both agree on where a link's path starts.
+pub(crate) fn link_path(url: &str) -> &str {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split_once('/')
+        .map(|(_, rest)| rest)
+        .unwrap_or("")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,18 +164,12 @@ pub fn parse_link(url: &str) -> Result<MegaLink> {
         bail!("Not a mega.nz link: {url}");
     }
 
-    let after_host = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url)
-        .split_once('/')
-        .map(|(_, rest)| rest)
-        .unwrap_or("");
+    let after_host = link_path(url);
 
-    // Folder links need a whole extra API surface (the folder node tree).
-    // Say so plainly instead of failing later with something cryptic.
-    if after_host.starts_with("folder/") || after_host.starts_with("#F!") {
-        bail!("MEGA folder links are not supported yet — use a file link");
+    // Folder links go through `folder::download_folder`, which needs the node
+    // tree before it has anything resembling a file handle.
+    if folder::is_folder_link(url) {
+        bail!("This is a MEGA folder link — it is handled by the folder path, not parse_link");
     }
 
     let (handle, key) = if let Some(rest) = after_host.strip_prefix("file/") {
@@ -203,7 +218,7 @@ pub struct FileKey {
 
 /// URL-safe base64, tolerant of the standard alphabet and stray padding —
 /// links get mangled by chat clients constantly.
-fn b64_decode(input: &str) -> Result<Vec<u8>> {
+pub(crate) fn b64_decode(input: &str) -> Result<Vec<u8>> {
     let normalised: String = input
         .trim()
         .chars()
@@ -219,16 +234,16 @@ fn b64_decode(input: &str) -> Result<Vec<u8>> {
         .context("MEGA key is not valid base64")
 }
 
-/// Unpacks a file key.
+/// Unpacks the 32 raw bytes of a file key.
 ///
-/// The 32 bytes are four 64-bit words: `k0 k1 | nonce | meta_mac`. The actual
-/// AES key is the *xor* of the first and second halves — MEGA stores the key
-/// obfuscated by the very MAC it protects.
-pub fn decode_file_key(key_b64: &str) -> Result<FileKey> {
-    let raw = b64_decode(key_b64)?;
+/// Four 64-bit words: `k0 k1 | nonce | meta_mac`. The actual AES key is the
+/// *xor* of the first and second halves — MEGA stores the key obfuscated by
+/// the very MAC it protects. Folder nodes carry these same 32 bytes inside
+/// their node key, which is why this is split out from the link parser.
+pub fn file_key_from_bytes(raw: &[u8]) -> Result<FileKey> {
     if raw.len() < 32 {
         bail!(
-            "MEGA file key must decode to 32 bytes, got {} — is this a folder link?",
+            "MEGA file key must be 32 bytes, got {} — is this a folder key?",
             raw.len()
         );
     }
@@ -247,6 +262,18 @@ pub fn decode_file_key(key_b64: &str) -> Result<FileKey> {
         nonce,
         meta_mac,
     })
+}
+
+/// Decodes the `#key` fragment of a file link.
+pub fn decode_file_key(key_b64: &str) -> Result<FileKey> {
+    let raw = b64_decode(key_b64)?;
+    if raw.len() < 32 {
+        bail!(
+            "MEGA file key must decode to 32 bytes, got {} — is this a folder link?",
+            raw.len()
+        );
+    }
+    file_key_from_bytes(&raw)
 }
 
 /// The CTR IV for a byte offset: nonce, then the 16-byte block index.
@@ -330,6 +357,22 @@ fn decrypt_block(cipher: &Aes128, block: &mut [u8; 16]) {
     let mut b = GenericArray::clone_from_slice(block);
     cipher.decrypt_block(&mut b);
     block.copy_from_slice(&b);
+}
+
+/// AES-128-ECB decrypt, in place, over whole blocks.
+///
+/// ECB is indefensible for data, but MEGA uses it for key wrapping, where
+/// every "message" is exactly one or two blocks of high-entropy key material.
+pub(crate) fn ecb_decrypt(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
+    let cipher = Aes128::new(key.into());
+    let mut out = Vec::with_capacity(data.len());
+    for block_start in (0..data.len() / 16 * 16).step_by(16) {
+        let mut block = [0u8; 16];
+        block.copy_from_slice(&data[block_start..block_start + 16]);
+        decrypt_block(&cipher, &mut block);
+        out.extend_from_slice(&block);
+    }
+    out
 }
 
 /// Rolling CBC-MAC over one MAC chunk of plaintext.
@@ -497,33 +540,45 @@ struct GetResponse {
 
 /// Talks to `/cs`. Keeps its own sequence counter, which MEGA uses to dedupe
 /// retried requests.
-struct MegaApi {
+pub(crate) struct MegaApi {
     client: Client,
     seq: AtomicU64,
 }
 
 impl MegaApi {
-    fn new(client: Client) -> Self {
+    pub(crate) fn new(client: Client) -> Self {
         Self {
             client,
             seq: AtomicU64::new(rand_seq()),
         }
     }
 
-    /// Fetches a temp download URL plus metadata for `handle`.
-    async fn fetch(&self, handle: &str, key: &FileKey) -> Result<FileInfo> {
+    /// POSTs one command and returns the first element of the result array.
+    ///
+    /// `folder` scopes the request to a public folder share. That scope is a
+    /// query parameter (`n`), not part of the command, and it changes what
+    /// handles inside the command mean — which is why it is threaded through
+    /// everywhere rather than baked into a second API type.
+    pub(crate) async fn call(
+        &self,
+        command: serde_json::Value,
+        folder: Option<&str>,
+    ) -> Result<serde_json::Value> {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
-        let body = json!([{ "a": "g", "g": 1, "p": handle }]);
 
         // Built by hand rather than with `RequestBuilder::query`, which lives
-        // behind reqwest's urlencoded feature. `id` is a u64, so there is
-        // nothing here that needs escaping.
-        let endpoint = format!("{API_URL}?id={id}");
+        // behind reqwest's urlencoded feature. `id` is a u64 and a folder
+        // handle is base64url, so there is nothing here that needs escaping.
+        let mut endpoint = format!("{API_URL}?id={id}");
+        if let Some(folder) = folder {
+            endpoint.push_str("&n=");
+            endpoint.push_str(folder);
+        }
 
         let response = self
             .client
             .post(&endpoint)
-            .json(&body)
+            .json(&json!([command]))
             .send()
             .await
             .context("Cannot reach the MEGA API")?;
@@ -553,6 +608,22 @@ impl MegaApi {
             bail!(api_error_message(code));
         }
 
+        Ok(first)
+    }
+
+    /// Fetches a temp download URL plus metadata for `handle`.
+    ///
+    /// Inside a folder share the node is addressed by `n`; a standalone file
+    /// link uses `p`. Sending the wrong one gets you -9, not a clear error.
+    async fn fetch(&self, handle: &str, key: &FileKey, folder: Option<&str>) -> Result<FileInfo> {
+        let command = if folder.is_some() {
+            json!({ "a": "g", "g": 1, "n": handle })
+        } else {
+            json!({ "a": "g", "g": 1, "p": handle })
+        };
+
+        let first = self.call(command, folder).await?;
+
         let result: GetResponse =
             serde_json::from_value(first).context("Unexpected MEGA API result shape")?;
 
@@ -566,23 +637,29 @@ impl MegaApi {
         let url = result
             .g
             .ok_or_else(|| anyhow!("MEGA did not return a download URL"))?;
-        let name = result.at.as_deref().and_then(|at| decrypt_attributes(at, key));
+        let name = result
+            .at
+            .as_deref()
+            .and_then(|at| decrypt_attributes(at, &key.aes));
 
         Ok(FileInfo { size, name, url })
     }
 }
 
-/// Decrypts the `at` blob (AES-128-CBC, zero IV) and pulls `n` out of it.
+/// Decrypts an `at` blob (AES-128-CBC, zero IV) and pulls `n` out of it.
+///
+/// Takes a bare AES key rather than a [`FileKey`] because folder nodes have
+/// attributes too, and a folder's key is 16 bytes with no nonce or MAC.
 ///
 /// Best effort by design: a garbled filename is not a reason to refuse to
 /// download the file, we just fall back to the handle.
-fn decrypt_attributes(at: &str, key: &FileKey) -> Option<String> {
+pub(crate) fn decrypt_attributes(at: &str, aes: &[u8; 16]) -> Option<String> {
     let mut data = b64_decode(at).ok()?;
     if data.len() < 16 || data.len() % 16 != 0 {
         return None;
     }
 
-    let cipher = Aes128::new(&key.aes.into());
+    let cipher = Aes128::new(aes.into());
     let mut previous = [0u8; 16];
     for block_start in (0..data.len()).step_by(16) {
         let mut block = [0u8; 16];
@@ -727,6 +804,8 @@ struct Shared {
     api: MegaApi,
     client: Client,
     handle: String,
+    /// Public folder share this node belongs to, if any.
+    folder: Option<String>,
     key: FileKey,
     size: u64,
     part_path: PathBuf,
@@ -762,7 +841,11 @@ impl Shared {
             if self.cancel.is_cancelled() {
                 return Ok(guard.0.clone());
             }
-            match self.api.fetch(&self.handle, &self.key).await {
+            match self
+                .api
+                .fetch(&self.handle, &self.key, self.folder.as_deref())
+                .await
+            {
                 Ok(info) => {
                     *guard = (info.url.clone(), generation + 1);
                     return Ok(info.url);
@@ -777,6 +860,21 @@ impl Shared {
                     tokio::time::sleep(backoff_delay(attempt)).await;
                 }
             }
+        }
+    }
+
+    /// Parks a worker for as long as another worker is sitting out a 509.
+    ///
+    /// The quota is per-IP, so it applies to every slot at once. Without this
+    /// the flag would be write-only: the other five workers would each go and
+    /// collect their own 509, which is both pointless and the thing most
+    /// likely to get an IP temp-banned.
+    async fn wait_out_quota(&self) {
+        while self.quota_hit.load(Ordering::Relaxed) {
+            if self.cancel.is_cancelled() {
+                return;
+            }
+            tokio::time::sleep(QUOTA_POLL).await;
         }
     }
 
@@ -828,7 +926,7 @@ async fn quota_backoff(shared: &Shared, attempt: u32, quota: bool) -> bool {
 
     if quota {
         shared.sink.note(&format!(
-            "MEGA bandwidth quota (HTTP 509) — waiting {total}s{}",
+            "MEGA bandwidth quota (HTTP 509) — all slots waiting {total}s{}",
             if start_ip.is_some() {
                 ", will resume early if your IP changes"
             } else {
@@ -867,10 +965,12 @@ async fn run_task(shared: Arc<Shared>, task: Task) -> Result<()> {
             return Ok(());
         }
 
+        // Somebody else may be in the middle of a quota backoff.
+        shared.wait_out_quota().await;
+
         let (url, generation) = shared.current_url().await;
         match attempt_task(&shared, &task, &url).await {
             Ok(()) => {
-                shared.quota_hit.store(false, Ordering::Relaxed);
                 shared.mark_done(task.id).await;
                 return Ok(());
             }
@@ -880,11 +980,16 @@ async fn run_task(shared: Arc<Shared>, task: Task) -> Result<()> {
                 shared.refresh_url(generation).await?;
             }
             Err(TaskError::Quota) => {
-                shared.quota_hit.store(true, Ordering::Relaxed);
                 attempt += 1;
-                let woke_early = quota_backoff(&shared, attempt, true).await;
-                if woke_early {
-                    attempt = 0;
+                // Whoever raises the flag owns the wait and owns clearing it.
+                // Every other worker parks in `wait_out_quota` meanwhile, so
+                // exactly one of them is talking to MEGA during a 509.
+                if !shared.quota_hit.swap(true, Ordering::Relaxed) {
+                    let woke_early = quota_backoff(&shared, attempt, true).await;
+                    shared.quota_hit.store(false, Ordering::Relaxed);
+                    if woke_early {
+                        attempt = 0;
+                    }
                 }
             }
             Err(TaskError::Fatal(err)) => return Err(err),
@@ -1021,15 +1126,47 @@ pub async fn download(
     let link = parse_link(url)?;
     let key = decode_file_key(&link.key)?;
 
+    run_download(
+        client,
+        &link.handle,
+        None,
+        &key,
+        output,
+        download_dir,
+        options,
+        cancel,
+        sink,
+    )
+    .await
+}
+
+/// The actual download, once a handle and key exist.
+///
+/// Split out from [`download`] so that a node discovered inside a public
+/// folder — which has no link of its own to parse — gets the same chunking,
+/// resume, quota handling and MAC verification rather than a second-class
+/// copy of it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_download(
+    client: Client,
+    handle: &str,
+    folder: Option<String>,
+    key: &FileKey,
+    output: Option<String>,
+    download_dir: &str,
+    options: MegaOptions,
+    cancel: CancellationToken,
+    sink: Arc<dyn ProgressSink>,
+) -> Result<MegaOutcome> {
     sink.state(SlotState::Inspecting);
 
     let api = MegaApi::new(client.clone());
-    let info = api.fetch(&link.handle, &key).await?;
+    let info = api.fetch(handle, key, folder.as_deref()).await?;
 
     let name = info
         .name
         .clone()
-        .unwrap_or_else(|| sanitize_filename(&link.handle));
+        .unwrap_or_else(|| sanitize_filename(handle));
 
     let final_path = match output {
         Some(path) => PathBuf::from(path),
@@ -1064,7 +1201,7 @@ pub async fn download(
     let target = CHUNK_SIZE_MULTI * 1024 * 1024;
     let tasks = plan_tasks(&chunks, target);
 
-    let state = ResumeState::load(&state_path, &link.handle, info.size, target);
+    let state = ResumeState::load(&state_path, handle, info.size, target);
     let already_done = state.done.clone();
 
     // Preallocate so workers can seek anywhere. Sparse on every filesystem
@@ -1095,7 +1232,8 @@ pub async fn download(
     let shared = Arc::new(Shared {
         api,
         client,
-        handle: link.handle.clone(),
+        handle: handle.to_string(),
+        folder,
         key: key.clone(),
         size: info.size,
         part_path: part_path.clone(),
@@ -1147,7 +1285,7 @@ pub async fn download(
     if options.verify_mac {
         sink.detail("Checking file integrity…");
         sink.progress(0);
-        let ok = verify_file(&part_path, &key, shared.size, &cancel, &sink).await?;
+        let ok = verify_file(&part_path, key, shared.size, &cancel, &sink).await?;
         if cancel.is_cancelled() {
             sink.finish();
             return Ok(MegaOutcome::Cancelled { path: part_path });
@@ -1425,6 +1563,27 @@ mod tests {
         // Names that are nothing but dots are traversal, not dotfiles.
         assert_eq!(sanitize_filename("."), "mega-download");
         assert_eq!(sanitize_filename("..."), "mega-download");
+    }
+
+    /// ECB is only ever used to unwrap keys, so the property that matters is
+    /// that it round-trips whole blocks independently.
+    #[test]
+    fn ecb_unwraps_whole_blocks() {
+        let key = [3u8; 16];
+        let cipher = Aes128::new(&key.into());
+        let plain: Vec<u8> = (0..32u8).collect();
+
+        let mut wrapped = plain.clone();
+        for block_start in (0..32).step_by(16) {
+            let mut block = [0u8; 16];
+            block.copy_from_slice(&wrapped[block_start..block_start + 16]);
+            encrypt_block(&cipher, &mut block);
+            wrapped[block_start..block_start + 16].copy_from_slice(&block);
+        }
+
+        assert_eq!(ecb_decrypt(&key, &wrapped), plain);
+        // Trailing bytes that do not fill a block are dropped, not padded.
+        assert_eq!(ecb_decrypt(&key, &wrapped[..20]).len(), 16);
     }
 
     #[test]
