@@ -30,6 +30,14 @@
 //! "can we read this node's name?" a reliable test of "is this the right
 //! key?", and a free one, since the name is needed anyway.
 //!
+//! ## Where files land
+//!
+//! Paths are relative to the share root, and the root's own name is not part
+//! of them. A share holding `folder/one.jpg` and `two.jpg` unpacks into the
+//! destination directory as exactly that, so `-o` and the configured download
+//! directory behave identically instead of one of them nesting an extra level
+//! named after the share.
+//!
 //! ## Path safety
 //!
 //! Directory structure is reconstructed by walking `p` (parent) pointers, so
@@ -199,7 +207,8 @@ impl Entry {
 /// The contents of a share.
 #[derive(Debug, Clone)]
 pub struct Listing {
-    /// Name of the share root, used as the destination directory.
+    /// Name of the share root. Informational only — it is deliberately not
+    /// part of any destination path.
     pub root_name: String,
     pub entries: Vec<Entry>,
     /// Handles of file nodes this share key cannot open.
@@ -285,12 +294,12 @@ fn choose_file_key(candidates: &[Vec<u8>], attributes: Option<&str>) -> Option<(
     fallback.map(|key| (key, String::new()))
 }
 
-/// Joins sanitised components under `root`.
+/// Joins sanitised components under `base`.
 ///
 /// Sanitising again here is deliberate belt-and-braces: this is the last point
 /// before a MEGA-supplied name becomes a real filesystem path.
-fn join_path(root: &Path, components: &[String]) -> PathBuf {
-    let mut path = root.to_path_buf();
+fn join_path(base: &Path, components: &[String]) -> PathBuf {
+    let mut path = base.to_path_buf();
     for part in components {
         path.push(sanitize_filename(part));
     }
@@ -458,6 +467,7 @@ pub async fn list_folder(client: &Client, link: &FolderLink) -> Result<Listing> 
 /// What became of a folder download.
 #[derive(Debug, Clone, Default)]
 pub struct FolderSummary {
+    /// Directory the share was unpacked into.
     pub root: PathBuf,
     pub total: usize,
     pub completed: usize,
@@ -469,6 +479,13 @@ pub struct FolderSummary {
 }
 
 /// Downloads every file in a folder share, one after another.
+///
+/// Files are written to `output` when given and the configured download
+/// directory otherwise, each at its path relative to the share root. The
+/// share's own name is not inserted: a link is a handle to *contents*, and
+/// wrapping those in a directory the user did not ask for is doubly unhelpful
+/// when the share root has no readable name and that directory ends up called
+/// something like `s6lVFYbI`.
 ///
 /// Sequential on purpose: each file already spreads itself across several
 /// chunk workers sharing one per-IP quota, so running whole files in parallel
@@ -504,13 +521,13 @@ pub async fn download_folder(
         bail!("That node is not in this MEGA folder, or holds no files");
     }
 
-    let root = match output {
+    let base = match output {
         Some(path) => PathBuf::from(path),
-        None => PathBuf::from(download_dir).join(sanitize_filename(&listing.root_name)),
+        None => PathBuf::from(download_dir),
     };
 
     let mut summary = FolderSummary {
-        root: root.clone(),
+        root: base.clone(),
         total: entries.len() + listing.undecryptable.len(),
         ..FolderSummary::default()
     };
@@ -531,7 +548,7 @@ pub async fn download_folder(
         }
 
         let relative = entry.display_path();
-        let destination = join_path(&root, &entry.path);
+        let destination = join_path(&base, &entry.path);
         let sink = make_sink(&relative, entry.size);
 
         let outcome = run_download(
@@ -732,9 +749,9 @@ mod tests {
     /// filenames.
     #[test]
     fn folder_names_cannot_climb_out_of_the_destination() {
-        let root = Path::new("/tmp/dl");
+        let base = Path::new("/tmp/dl");
         let path = join_path(
-            root,
+            base,
             &[
                 "..".to_string(),
                 "safe".to_string(),
@@ -743,11 +760,28 @@ mod tests {
             ],
         );
 
-        assert!(path.starts_with(root), "{path:?}");
+        assert!(path.starts_with(base), "{path:?}");
         assert!(!path.to_string_lossy().contains(".."), "{path:?}");
         assert_eq!(
             path,
             PathBuf::from("/tmp/dl/mega-download/safe/etc/passwd")
+        );
+    }
+
+    /// Structure inside the share is kept; the share's own name is not part of
+    /// it, so a file at the top of the share lands directly in the
+    /// destination.
+    #[test]
+    fn paths_are_relative_to_the_share_root() {
+        let base = Path::new("/home/zack/test");
+
+        assert_eq!(
+            join_path(base, &["bakchodi".to_string(), "one.jpg".to_string()]),
+            PathBuf::from("/home/zack/test/bakchodi/one.jpg")
+        );
+        assert_eq!(
+            join_path(base, &["two.jpg".to_string()]),
+            PathBuf::from("/home/zack/test/two.jpg")
         );
     }
 
