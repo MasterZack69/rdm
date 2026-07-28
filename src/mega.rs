@@ -608,13 +608,19 @@ fn decrypt_attributes(at: &str, key: &FileKey) -> Option<String> {
 ///
 /// The filename comes from inside an encrypted blob controlled by whoever
 /// uploaded the file, so `../../.bashrc` is entirely possible.
+///
+/// Note what this does *not* do: strip leading dots. `.bashrc` is a perfectly
+/// ordinary filename, and rewriting it to `bashrc` would quietly write a
+/// different file than the one the user asked for. Only a name made entirely
+/// of dots (`.`, `..`) is traversal, and those are replaced wholesale.
 pub fn sanitize_filename(name: &str) -> String {
     let base = name
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(name)
-        .trim()
-        .trim_matches('.');
+        .trim();
+
+    let base = if base.chars().all(|c| c == '.') { "" } else { base };
 
     let cleaned: String = base
         .chars()
@@ -1410,6 +1416,17 @@ mod tests {
         assert_eq!(sanitize_filename("  "), "mega-download");
         assert_eq!(sanitize_filename(".."), "mega-download");
         assert!(!sanitize_filename("bad\nname").contains('\n'));
+    }
+
+    /// Dotfiles are real filenames. Stripping the leading dot would write a
+    /// different file than the one in the link.
+    #[test]
+    fn dotfiles_keep_their_leading_dot() {
+        assert_eq!(sanitize_filename(".bashrc"), ".bashrc");
+        assert_eq!(sanitize_filename(".config.tar.gz"), ".config.tar.gz");
+        // Names that are nothing but dots are traversal, not dotfiles.
+        assert_eq!(sanitize_filename("."), "mega-download");
+        assert_eq!(sanitize_filename("..."), "mega-download");
     }
 
     #[test]
