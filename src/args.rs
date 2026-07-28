@@ -234,12 +234,12 @@ pub fn parse_url(value: &str) -> Result<String, String> {
         return Err("URL must not be empty".to_string());
     }
 
-    // The suggested URL is wrapped in backticks and nothing else. Doubled
-    // braces in a format string emit literal braces, which produced a hint
-    // nobody could paste into a shell.
-    let hint = format!("https://{trimmed}");
+    // Concatenated rather than formatted: the suggestion must come out as a
+    // URL the user can paste, and earlier versions of this line wrapped it in
+    // literal braces by way of format-string escapes.
+    let suggestion = String::from("https://") + trimmed;
     Err(format!(
-        "`{trimmed}` is not an http(s) URL \u{2014} did you mean `{hint}`?"
+        "`{trimmed}` is not an http(s) URL \u{2014} did you mean `{suggestion}`?"
     ))
 }
 
