@@ -234,11 +234,12 @@ pub fn parse_url(value: &str) -> Result<String, String> {
         return Err("URL must not be empty".to_string());
     }
 
-    // The suggestion is meant to be copy-pasteable, so no doubled braces here:
-    // in a format string those emit literal braces and the hint came out as
-    // `{https://example.com/f.zip}`.
+    // The suggested URL is wrapped in backticks and nothing else. Doubled
+    // braces in a format string emit literal braces, which produced a hint
+    // nobody could paste into a shell.
+    let hint = format!("https://{trimmed}");
     Err(format!(
-        "`{trimmed}` is not an http(s) URL \u{2014} did you mean `https://{trimmed}`?"
+        "`{trimmed}` is not an http(s) URL \u{2014} did you mean `{hint}`?"
     ))
 }
 
