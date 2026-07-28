@@ -13,8 +13,8 @@
 //!
 //! ## Flag scoping
 //!
-//! `-o/--output`, `-c/--connections`, `--allow-private` and `-q/--quiet` are
-//! shared by every download path via [`DownloadOpts`].
+//! `-o/--output`, `-c/--connections`, `--allow-private` (short form: `--ap`)
+//! and `-q/--quiet` are shared by every download path via [`DownloadOpts`].
 //!
 //! `-p/--parallel` is scoped to the three places where more than one file can
 //! be in flight: `sync`, `queue start`, and the root `rdm <URL>` form when the
@@ -75,7 +75,11 @@ pub struct DownloadOpts {
     pub connections: Option<usize>,
 
     /// Allow scanning private, loopback and link-local addresses
-    #[arg(long)]
+    ///
+    /// `visible_alias` rather than `alias`: this flag is long and gets typed
+    /// constantly on LAN hosts, and an alias nobody can find in `--help` is
+    /// not really a shortcut.
+    #[arg(long, visible_alias = "ap")]
     pub allow_private: bool,
 
     /// Suppress progress output
@@ -231,7 +235,7 @@ pub fn parse_url(value: &str) -> Result<String, String> {
     }
 
     Err(format!(
-        "`{trimmed}` is not an http(s) URL \u{2014} did you mean `https://{trimmed}`?"
+        "`{trimmed}` is not an http(s) URL \u{2014} did you mean `{{https://{trimmed}}}`?"
     ))
 }
 
@@ -404,6 +408,44 @@ mod tests {
         assert!(cli.opts.quiet);
     }
 
+    // \u{2500}\u{2500} --ap \u{2500}\u{2500}
+
+    /// `--ap` must mean exactly `--allow-private`, everywhere the shared
+    /// options are flattened in.
+    #[test]
+    fn ap_is_an_alias_for_allow_private() {
+        assert!(parse(&["rdm", "https://example.com/f.zip", "--ap"]).opts.allow_private);
+
+        match parse(&["rdm", "download", "https://example.com/f.zip", "--ap"]).command {
+            Some(Command::Download { opts, .. }) => assert!(opts.allow_private),
+            other => panic!("expected download, got {other:?}"),
+        }
+
+        match parse(&["rdm", "sync", "https://example.com/d/", "--ap"]).command {
+            Some(Command::Sync { opts, .. }) => assert!(opts.allow_private),
+            other => panic!("expected sync, got {other:?}"),
+        }
+
+        match parse(&["rdm", "queue", "add", "https://example.com/f.zip", "--ap"]).command {
+            Some(Command::Queue { command: QueueCommand::Add { opts, .. } }) => {
+                assert!(opts.allow_private)
+            }
+            other => panic!("expected queue add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allow_private_defaults_to_off() {
+        assert!(!parse(&["rdm", "https://example.com/f.zip"]).opts.allow_private);
+    }
+
+    /// An alias the user cannot discover is not worth having.
+    #[test]
+    fn ap_is_advertised_in_help() {
+        assert!(render_help(&["rdm"]).contains("--ap"));
+        assert!(render_help(&["rdm", "download"]).contains("--ap"));
+    }
+
     #[test]
     fn root_accepts_parallel_for_listings() {
         for flag in ["-p", "--parallel"] {
@@ -429,6 +471,15 @@ mod tests {
     fn non_http_url_is_rejected() {
         assert!(Cli::try_parse_from(["rdm", "example.com/f.zip"]).is_err());
         assert!(Cli::try_parse_from(["rdm", "dowload"]).is_err());
+    }
+
+    /// MEGA links are ordinary https URLs as far as parsing is concerned \u{2014}
+    /// the routing happens in `main`, so the parser must not reject them.
+    #[test]
+    fn mega_links_survive_url_parsing() {
+        let link = "https://mega.nz/file/AbCdEfGh#somekey";
+        assert_eq!(parse_url(link).as_deref(), Ok(link));
+        assert_eq!(parse(&["rdm", link]).url.as_deref(), Some(link));
     }
 
     // \u{2500}\u{2500} download \u{2500}\u{2500}
