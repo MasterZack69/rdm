@@ -543,7 +543,7 @@ mod tests {
     fn folder_names_cannot_climb_out_of_the_destination() {
         let root = Path::new("/tmp/dl");
         let path = join_path(
-            &root,
+root,
             &[
                 "..".to_string(),
                 "safe".to_string(),
