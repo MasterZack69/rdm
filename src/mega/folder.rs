@@ -16,6 +16,20 @@
 //!    is scoped to the share (`?n=<folder>`, and `n` rather than `p` in the
 //!    command).
 //!
+//! ## Picking the right key
+//!
+//! `k` can hold several wrappings separated by `/`, one per share the node is
+//! reachable through. Only one of them is ours. The others do not *fail* to
+//! decrypt — AES-ECB happily turns them into 32 bytes of noise that passes
+//! every structural check there is. Choosing wrong is therefore silent: the
+//! download runs to completion and only dies at the CBC-MAC, having spent the
+//! bandwidth.
+//!
+//! So the attribute blob is used as an oracle. It decrypts to plaintext
+//! beginning with the literal `MEGA` only under the correct key, which makes
+//! "can we read this node's name?" a reliable test of "is this the right
+//! key?", and a free one, since the name is needed anyway.
+//!
 //! ## Path safety
 //!
 //! Directory structure is reconstructed by walking `p` (parent) pointers, so
@@ -188,6 +202,8 @@ pub struct Listing {
     /// Name of the share root, used as the destination directory.
     pub root_name: String,
     pub entries: Vec<Entry>,
+    /// Handles of file nodes this share key cannot open.
+    pub undecryptable: Vec<String>,
 }
 
 impl Listing {
@@ -196,21 +212,77 @@ impl Listing {
     }
 }
 
-/// Unwraps a node key with the share key.
+/// Every plausible unwrapping of a node key, best candidate first.
 ///
-/// `k` can list several wrappings separated by `/`, one per share the node is
-/// reachable through. Only one of them is ours, and the wrong ones decrypt to
-/// garbage rather than failing, so the caller validates by length.
-fn unwrap_node_key(share: &[u8; 16], k: &str) -> Option<Vec<u8>> {
-    k.split('/').find_map(|part| {
-        let encoded = part.split_once(':').map(|(_, key)| key).unwrap_or(part);
-        let raw = b64_decode(encoded).ok()?;
+/// `k` lists one wrapping per share the node is reachable through. The part
+/// before `:` names that share, so when it matches ours that candidate is
+/// tried first — but it is only a hint, not a guarantee, and nodes do turn up
+/// with no prefix at all. Everything is kept and the caller decides which one
+/// actually works.
+fn unwrap_candidates(share: &[u8; 16], k: &str, share_handle: &str) -> Vec<Vec<u8>> {
+    let mut preferred = Vec::new();
+    let mut rest = Vec::new();
+
+    for part in k.split('/') {
+        let (owner, encoded) = match part.split_once(':') {
+            Some((owner, encoded)) => (Some(owner), encoded),
+            None => (None, part),
+        };
+
+        let Ok(raw) = b64_decode(encoded) else {
+            continue;
+        };
         if raw.len() < 16 {
-            return None;
+            continue;
         }
+
         let decrypted = ecb_decrypt(share, &raw);
-        (!decrypted.is_empty()).then_some(decrypted)
-    })
+        if decrypted.is_empty() {
+            continue;
+        }
+
+        if owner == Some(share_handle) {
+            preferred.push(decrypted);
+        } else {
+            rest.push(decrypted);
+        }
+    }
+
+    preferred.extend(rest);
+    preferred
+}
+
+/// Picks the file key that actually opens this node.
+///
+/// The attribute blob is the oracle: it only decrypts to a `MEGA`-prefixed
+/// payload under the right key. Without this check a wrong candidate is
+/// indistinguishable from a right one until the MAC fails at 100%.
+///
+/// A node with no attributes at all has nothing to test against, so the first
+/// candidate is taken on faith — the MAC remains the backstop.
+fn choose_file_key(candidates: &[Vec<u8>], attributes: Option<&str>) -> Option<(FileKey, String)> {
+    let mut fallback = None;
+
+    for raw in candidates {
+        let Ok(key) = file_key_from_bytes(raw) else {
+            continue;
+        };
+
+        match attributes {
+            Some(at) => {
+                if let Some(name) = decrypt_attributes(at, &key.aes) {
+                    return Some((key, name));
+                }
+            }
+            None => {
+                if fallback.is_none() {
+                    fallback = Some(key);
+                }
+            }
+        }
+    }
+
+    fallback.map(|key| (key, String::new()))
 }
 
 /// Joins sanitised components under `root`.
@@ -245,7 +317,7 @@ pub async fn list_folder(client: &Client, link: &FolderLink) -> Result<Listing> 
     let mut names: HashMap<String, String> = HashMap::new();
     let mut parents: HashMap<String, String> = HashMap::new();
     let mut files: Vec<(String, u64, FileKey)> = Vec::new();
-    let mut undecryptable = 0usize;
+    let mut undecryptable: Vec<String> = Vec::new();
 
     for node in &tree.f {
         let Some(handle) = node.h.clone() else {
@@ -258,42 +330,63 @@ pub async fn list_folder(client: &Client, link: &FolderLink) -> Result<Listing> 
             parents.insert(handle.clone(), parent);
         }
 
-        let unwrapped = node.k.as_deref().and_then(|k| unwrap_node_key(&share, k));
+        let candidates = node
+            .k
+            .as_deref()
+            .map(|k| unwrap_candidates(&share, k, &link.handle))
+            .unwrap_or_default();
 
         if node.t.unwrap_or(0) == 0 {
-            // A file we cannot decrypt is not a reason to abandon the folder;
-            // it is usually a node shared through a different key.
-            let Some(raw) = unwrapped else {
-                undecryptable += 1;
+            // A file whose key we cannot establish is left alone rather than
+            // downloaded into a MAC failure. It is usually a node shared
+            // through a key we were not given.
+            let Some((key, name)) = choose_file_key(&candidates, node.a.as_deref()) else {
+                undecryptable.push(handle);
                 continue;
             };
-            let Ok(key) = file_key_from_bytes(&raw) else {
-                undecryptable += 1;
-                continue;
+
+            let name = if name.is_empty() {
+                sanitize_filename(&handle)
+            } else {
+                name
             };
-            let name = node
-                .a
-                .as_deref()
-                .and_then(|at| decrypt_attributes(at, &key.aes))
-                .unwrap_or_else(|| sanitize_filename(&handle));
+
             names.insert(handle.clone(), name);
             files.push((handle, node.s.unwrap_or(0), key));
         } else {
             // The share root's own key *is* the share key, and it is often
-            // absent from `k` entirely.
-            let aes: [u8; 16] = match unwrapped {
-                Some(raw) if raw.len() >= 16 => {
-                    let mut key = [0u8; 16];
-                    key.copy_from_slice(&raw[..16]);
-                    key
+            // absent from `k` entirely. Folder keys are 16 bytes, and the same
+            // attribute-blob oracle picks between candidates.
+            let mut chosen: Option<(([u8; 16]), String)> = None;
+
+            for raw in &candidates {
+                if raw.len() < 16 {
+                    continue;
                 }
-                _ => share,
+                let mut aes = [0u8; 16];
+                aes.copy_from_slice(&raw[..16]);
+
+                if let Some(at) = node.a.as_deref()
+                    && let Some(name) = decrypt_attributes(at, &aes)
+                {
+                    chosen = Some((aes, name));
+                    break;
+                }
+                if chosen.is_none() {
+                    chosen = Some((aes, String::new()));
+                }
+            }
+
+            let (aes, name) = chosen.unwrap_or((share, String::new()));
+            let name = if name.is_empty() {
+                node.a
+                    .as_deref()
+                    .and_then(|at| decrypt_attributes(at, &aes))
+                    .unwrap_or_else(|| sanitize_filename(&handle))
+            } else {
+                name
             };
-            let name = node
-                .a
-                .as_deref()
-                .and_then(|at| decrypt_attributes(at, &aes))
-                .unwrap_or_else(|| sanitize_filename(&handle));
+
             names.insert(handle, name);
         }
     }
@@ -348,11 +441,16 @@ pub async fn list_folder(client: &Client, link: &FolderLink) -> Result<Listing> 
 
     if entries.is_empty() {
         bail!(
-            "No downloadable files in this MEGA folder ({undecryptable} node(s) could not be decrypted with this key)"
+            "No downloadable files in this MEGA folder ({} node(s) could not be decrypted with this key)",
+            undecryptable.len()
         );
     }
 
-    Ok(Listing { root_name, entries })
+    Ok(Listing {
+        root_name,
+        entries,
+        undecryptable,
+    })
 }
 
 // ── Download ──────────────────────────────────────────────────────
@@ -413,9 +511,18 @@ pub async fn download_folder(
 
     let mut summary = FolderSummary {
         root: root.clone(),
-        total: entries.len(),
+        total: entries.len() + listing.undecryptable.len(),
         ..FolderSummary::default()
     };
+
+    // Reported rather than attempted: without a working key these would just
+    // download, fail the MAC and delete themselves.
+    for handle in &listing.undecryptable {
+        summary.failed.push((
+            handle.clone(),
+            "no key in this share link opens this node".to_string(),
+        ));
+    }
 
     for entry in entries {
         if cancel.is_cancelled() {
@@ -461,8 +568,49 @@ pub async fn download_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes::Aes128;
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockEncrypt, KeyInit};
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    /// AES-128-ECB encrypt, the inverse of what key unwrapping does.
+    fn wrap(share: &[u8; 16], plain: &[u8]) -> String {
+        let cipher = Aes128::new(share.into());
+        let mut out = plain.to_vec();
+        for start in (0..plain.len() / 16 * 16).step_by(16) {
+            let mut block = GenericArray::clone_from_slice(&out[start..start + 16]);
+            cipher.encrypt_block(&mut block);
+            out[start..start + 16].copy_from_slice(&block);
+        }
+        URL_SAFE_NO_PAD.encode(&out)
+    }
+
+    /// Builds an `a` blob the way MEGA does: AES-128-CBC, zero IV, over
+    /// `MEGA{"n":"..."}` zero-padded to a block boundary.
+    fn seal_attributes(aes: &[u8; 16], name: &str) -> String {
+        let mut plain = format!("MEGA{{\"n\":\"{name}\"}}").into_bytes();
+        while plain.len() % 16 != 0 {
+            plain.push(0);
+        }
+
+        let cipher = Aes128::new(aes.into());
+        let mut previous = [0u8; 16];
+        let mut out = Vec::with_capacity(plain.len());
+
+        for chunk in plain.chunks(16) {
+            let mut block = [0u8; 16];
+            for i in 0..16 {
+                block[i] = chunk[i] ^ previous[i];
+            }
+            let mut ga = GenericArray::clone_from_slice(&block);
+            cipher.encrypt_block(&mut ga);
+            previous.copy_from_slice(&ga);
+            out.extend_from_slice(&ga);
+        }
+
+        URL_SAFE_NO_PAD.encode(&out)
+    }
 
     #[test]
     fn folder_links_are_told_apart_from_file_links() {
@@ -514,27 +662,70 @@ mod tests {
 
     #[test]
     fn node_keys_are_unwrapped_from_the_share_key() {
-        use aes::Aes128;
-        use aes::cipher::generic_array::GenericArray;
-        use aes::cipher::{BlockEncrypt, KeyInit};
-
         let share = [5u8; 16];
         let node_key: Vec<u8> = (0..32u8).collect();
+        let k = format!("s6lVFYbI:{}", wrap(&share, &node_key));
 
-        let cipher = Aes128::new(&share.into());
-        let mut wrapped = node_key.clone();
-        for block_start in (0..32).step_by(16) {
-            let mut block = GenericArray::clone_from_slice(&wrapped[block_start..block_start + 16]);
-            cipher.encrypt_block(&mut block);
-            wrapped[block_start..block_start + 16].copy_from_slice(&block);
-        }
+        let candidates = unwrap_candidates(&share, &k, "s6lVFYbI");
+        assert_eq!(candidates[0], node_key);
 
-        let k = format!("AbCdEfGh:{}", URL_SAFE_NO_PAD.encode(&wrapped));
-        assert_eq!(unwrap_node_key(&share, &k).unwrap(), node_key);
+        // Some nodes omit the handle prefix entirely.
+        let bare = wrap(&share, &node_key);
+        assert_eq!(unwrap_candidates(&share, &bare, "s6lVFYbI")[0], node_key);
+    }
 
-        // Without the handle prefix it still works: some nodes omit it.
-        let bare = URL_SAFE_NO_PAD.encode(&wrapped);
-        assert_eq!(unwrap_node_key(&share, &bare).unwrap(), node_key);
+    /// Our own share handle is tried first when `k` lists several wrappings.
+    #[test]
+    fn our_share_is_preferred_among_several_wrappings() {
+        let share = [5u8; 16];
+        let theirs: Vec<u8> = vec![0xAA; 32];
+        let ours: Vec<u8> = (0..32u8).collect();
+
+        let k = format!(
+            "OtHeRsHr:{}/s6lVFYbI:{}",
+            wrap(&share, &theirs),
+            wrap(&share, &ours)
+        );
+
+        let candidates = unwrap_candidates(&share, &k, "s6lVFYbI");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], ours, "our own wrapping must be tried first");
+    }
+
+    /// The regression this module was fixed for: a wrong wrapping decrypts to
+    /// 32 perfectly structural bytes, so only the attribute blob can tell the
+    /// candidates apart. Picking the wrong one used to surface as a failed
+    /// integrity check after the whole file had been downloaded.
+    #[test]
+    fn the_attribute_blob_picks_the_working_key() {
+        let wrong = vec![0xAAu8; 32];
+        let right: Vec<u8> = (0..32u8).collect();
+        let right_key = file_key_from_bytes(&right).unwrap();
+        let attributes = seal_attributes(&right_key.aes, "holiday.jpg");
+
+        // Wrong candidate first: order must not decide the outcome.
+        let candidates = vec![wrong.clone(), right.clone()];
+        let (key, name) = choose_file_key(&candidates, Some(&attributes)).unwrap();
+
+        assert_eq!(key.aes, right_key.aes);
+        assert_eq!(name, "holiday.jpg");
+
+        // With no candidate that opens the attributes, there is no answer —
+        // downloading on a guess is what produced the corrupt file.
+        assert!(choose_file_key(&[wrong], Some(&attributes)).is_none());
+    }
+
+    /// No attributes means no oracle, so the first structurally valid
+    /// candidate is used and the MAC stays the backstop.
+    #[test]
+    fn a_node_without_attributes_falls_back_to_the_first_key() {
+        let raw: Vec<u8> = (0..32u8).collect();
+        let (key, name) = choose_file_key(&[raw.clone()], None).unwrap();
+        assert_eq!(key, file_key_from_bytes(&raw).unwrap());
+        assert!(name.is_empty());
+
+        // Too short to be a file key at all.
+        assert!(choose_file_key(&[vec![1u8; 16]], None).is_none());
     }
 
     /// The whole point of the tree walk is that folder names are as hostile as
@@ -543,7 +734,7 @@ mod tests {
     fn folder_names_cannot_climb_out_of_the_destination() {
         let root = Path::new("/tmp/dl");
         let path = join_path(
-root,
+            root,
             &[
                 "..".to_string(),
                 "safe".to_string(),
