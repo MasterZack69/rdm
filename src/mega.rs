@@ -45,6 +45,10 @@
 //! exist because the Java writer is a single sequential stream. We can write
 //! decrypted plaintext straight into the sparse `.mctemp` at its final offset,
 //! so resume state is just "which tasks finished", kept in a small sidecar.
+//!
+//! MegaBasterd (<https://github.com/tonikelope/megabasterd>, GPLv3) is prior
+//! art for the behaviour above, not a source of code: everything here is
+//! original Rust.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -468,7 +472,7 @@ pub fn api_error_message(code: i64) -> String {
 }
 
 /// Errors that will never clear no matter how long we wait.
-fn is_fatal_api_error(code: i64) -> bool {
+pub fn is_fatal_api_error(code: i64) -> bool {
     matches!(code, -2 | -8 | -9 | -11 | -13 | -14 | -15 | -16)
 }
 
@@ -511,10 +515,14 @@ impl MegaApi {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         let body = json!([{ "a": "g", "g": 1, "p": handle }]);
 
+        // Built by hand rather than with `RequestBuilder::query`, which lives
+        // behind reqwest's urlencoded feature. `id` is a u64, so there is
+        // nothing here that needs escaping.
+        let endpoint = format!("{API_URL}?id={id}");
+
         let response = self
             .client
-            .post(API_URL)
-            .query(&[("id", id.to_string())])
+            .post(&endpoint)
             .json(&body)
             .send()
             .await
