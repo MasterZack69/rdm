@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
@@ -10,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 use rdm::args::{
     Cli, ClearTarget, Command, DownloadOpts, QueueCommand, RetryTarget, normalize_extensions,
 };
-use rdm::{config, engine, queue, scrape, signal, sync};
+use rdm::ui::{self, ProgressSink};
+use rdm::{config, engine, mega, queue, scrape, signal, sync};
 
 fn main() -> Result<()> {
     let args = Cli::parse();
@@ -27,6 +29,12 @@ fn main() -> Result<()> {
         }
 
         Some(Command::Download { url, opts }) => {
+            // Before `normalize_download_url`: a MEGA link's `#key` fragment is
+            // load-bearing and must reach the parser untouched.
+            if mega::is_mega_url(&url) {
+                return mega_download(&cfg, &url, &opts);
+            }
+
             let url = engine::normalize_download_url(&url);
             let connections = opts.connections.unwrap_or(cfg.connections);
             let output_path = resolve_output(opts.output.clone(), &url, &cfg);
@@ -86,6 +94,16 @@ fn quick_download(
     opts: &DownloadOpts,
     parallel: Option<usize>,
 ) -> Result<()> {
+    // MEGA first: `looks_like_directory` sees `/file/AbCdEfGh#key` as an
+    // extensionless segment and would hand the link to the scraper, which
+    // finds nothing there.
+    if mega::is_mega_url(url) {
+        if parallel.is_some() && !opts.quiet {
+            eprintln!("  \u{26a0} -p applies to directory listings; MEGA uses mega_workers.");
+        }
+        return mega_download(cfg, url, opts);
+    }
+
     let url = engine::normalize_download_url(url);
     let connections = opts.connections.unwrap_or(cfg.connections);
     let scan_for_listing = opts.output.is_none() && looks_like_directory(&url);
@@ -123,6 +141,42 @@ fn quick_download(
 
         let output_path = resolve_output(opts.output.clone(), &url, cfg);
         engine::run_download(url, Some(output_path), connections, cancel, opts.quiet).await
+    })
+}
+
+/// `rdm <mega link>` — fetch, decrypt and verify a MEGA file.
+///
+/// Kept separate from the normal download path on purpose: MEGA needs its own
+/// API round trip, its own chunk ladder and its own quota handling, and none
+/// of that belongs in the generic engine.
+fn mega_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    let url = url.trim().to_string();
+    let (output, download_dir) = mega_destination(opts.output.clone(), cfg);
+    let options = mega_options(cfg, opts);
+    let quiet = opts.quiet;
+
+    // The name is only known after the API call decrypts the attributes, so
+    // the bar starts out labelled with the link's handle.
+    let label = mega::parse_link(&url)
+        .map(|link| link.handle)
+        .unwrap_or_else(|_| "mega".to_string());
+
+    run_async(|cancel| async move {
+        let sink = progress_sink(quiet, &label);
+        let client = reqwest::Client::new();
+        let outcome = mega::download(
+            client,
+            &url,
+            output,
+            &download_dir,
+            options,
+            cancel,
+            sink,
+        )
+        .await?;
+
+        report_mega(&outcome, quiet);
+        Ok(())
     })
 }
 
@@ -208,6 +262,13 @@ fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
 
 /// `rdm queue add` — enqueue a single file, or every file behind a listing.
 fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    // The queue worker downloads through the generic engine, which cannot
+    // decrypt a MEGA stream. Refusing here beats enqueueing an item that is
+    // guaranteed to fail later.
+    if mega::is_mega_url(url) {
+        anyhow::bail!("MEGA links cannot be queued yet — download it directly with `rdm <link>`");
+    }
+
     let url = engine::normalize_download_url(url);
 
     let discovered = if looks_like_directory(&url) {
@@ -273,6 +334,76 @@ where
             handler.abort();
             result
         })
+}
+
+/// A single-file progress bar, or nothing at all under `-q`.
+fn progress_sink(quiet: bool, label: &str) -> Arc<dyn ProgressSink> {
+    if quiet {
+        ui::silent()
+    } else {
+        let bar: Arc<dyn ProgressSink> = ui::SoloBar::new(label);
+        bar
+    }
+}
+
+/// Splits `-o` into the (exact path, fallback directory) pair MEGA needs.
+///
+/// MEGA is the one source where we do not know the filename up front — it
+/// arrives encrypted in the file attributes. So a directory-ish `-o` means
+/// "use the real name, in here", and only a concrete path overrides it.
+fn mega_destination(output: Option<String>, cfg: &config::Config) -> (Option<String>, String) {
+    match output {
+        Some(o) => {
+            let path = Path::new(&o);
+            if o.ends_with('/') || o.ends_with('\\') || path.is_dir() {
+                let dir = o.trim_end_matches('/').trim_end_matches('\\').to_string();
+                (None, dir)
+            } else {
+                (
+                    Some(resolve_relative_to_config(&o, cfg)),
+                    cfg.download_dir.clone(),
+                )
+            }
+        }
+        None => (None, cfg.download_dir.clone()),
+    }
+}
+
+/// `-c` doubles as the MEGA worker count: to the user it is still "how many
+/// connections do I want to this file".
+fn mega_options(cfg: &config::Config, opts: &DownloadOpts) -> mega::MegaOptions {
+    mega::MegaOptions {
+        workers: opts.connections.unwrap_or(cfg.mega_workers),
+        verify_mac: cfg.mega_verify_mac,
+        resume_on_ip_change: cfg.mega_resume_on_ip_change,
+        max_retries: u32::try_from(cfg.max_retries).unwrap_or(6),
+        overwrite: false,
+    }
+}
+
+fn report_mega(outcome: &mega::MegaOutcome, quiet: bool) {
+    if quiet {
+        return;
+    }
+
+    match outcome {
+        mega::MegaOutcome::Completed { path, bytes } => {
+            eprintln!(
+                "  \u{2705} {} ({})",
+                path.display(),
+                ui::format_size(*bytes)
+            );
+        }
+        mega::MegaOutcome::AlreadyPresent { path } => {
+            eprintln!("  \u{2713} Already downloaded: {}", path.display());
+        }
+        mega::MegaOutcome::Cancelled { path } => {
+            eprintln!(
+                "  \u{23f8} Stopped \u{2014} partial file kept at {}, rerun to resume.",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Shows what was found without burying the terminal: a listing of 4000 files
@@ -391,5 +522,61 @@ mod tests {
     fn query_string_is_ignored() {
         assert!(!looks_like_directory("https://example.com/song.flac?token=1"));
         assert!(looks_like_directory("https://example.com/music?page=2"));
+    }
+
+    // -- MEGA routing --
+
+    /// The reason the MEGA check has to come first: the listing heuristic
+    /// genuinely reads a MEGA link as a directory, so any code path that tests
+    /// for a listing before testing for MEGA sends the link to the scraper.
+    #[test]
+    fn mega_links_would_be_mistaken_for_listings() {
+        let link = "https://mega.nz/file/AbCdEfGh#thekey";
+        assert!(mega::is_mega_url(link));
+        assert!(
+            looks_like_directory(link),
+            "if this ever stops being true the ordering comment above is stale, not wrong"
+        );
+    }
+
+    #[test]
+    fn ordinary_links_are_not_sent_to_mega() {
+        assert!(!mega::is_mega_url("https://example.com/mega.nz/file.zip"));
+        assert!(!mega::is_mega_url("https://example.com/song.flac"));
+    }
+
+    #[test]
+    fn mega_destination_prefers_the_real_filename() {
+        let cfg = config::Config::default();
+
+        // No -o: let MEGA name the file, inside the download dir.
+        let (output, dir) = mega_destination(None, &cfg);
+        assert_eq!(output, None);
+        assert_eq!(dir, cfg.download_dir);
+
+        // Directory-ish -o: same, but somewhere else.
+        let (output, dir) = mega_destination(Some("/data/mega/".to_string()), &cfg);
+        assert_eq!(output, None);
+        assert_eq!(dir, "/data/mega");
+
+        // Concrete -o: the user's name wins.
+        let (output, _) = mega_destination(Some("/data/movie.mkv".to_string()), &cfg);
+        assert_eq!(output.as_deref(), Some("/data/movie.mkv"));
+    }
+
+    #[test]
+    fn mega_workers_come_from_connections_then_config() {
+        let cfg = config::Config::default();
+
+        let defaults = mega_options(&cfg, &DownloadOpts::default());
+        assert_eq!(defaults.workers, cfg.mega_workers);
+        assert_eq!(defaults.verify_mac, cfg.mega_verify_mac);
+        assert!(!defaults.overwrite);
+
+        let opts = DownloadOpts {
+            connections: Some(3),
+            ..DownloadOpts::default()
+        };
+        assert_eq!(mega_options(&cfg, &opts).workers, 3);
     }
 }
