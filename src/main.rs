@@ -262,16 +262,17 @@ fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
 
 /// `rdm queue add` — enqueue a single file, or every file behind a listing.
 fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
-    // The queue worker downloads through the generic engine, which cannot
-    // decrypt a MEGA stream. Refusing here beats enqueueing an item that is
-    // guaranteed to fail later.
-    if mega::is_mega_url(url) {
-        anyhow::bail!("MEGA links cannot be queued yet — download it directly with `rdm <link>`");
-    }
+    // MEGA links go in verbatim: `normalize_download_url` would touch the
+    // `#key` fragment, and there is no listing behind a file link to scrape.
+    // The queue runner recognises them and dispatches to the MEGA downloader.
+    let is_mega = mega::is_mega_url(url);
+    let url = if is_mega {
+        url.trim().to_string()
+    } else {
+        engine::normalize_download_url(url)
+    };
 
-    let url = engine::normalize_download_url(url);
-
-    let discovered = if looks_like_directory(&url) {
+    let discovered = if !is_mega && looks_like_directory(&url) {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
@@ -303,7 +304,15 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
                 .as_deref()
                 .map(|o| resolve_relative_to_config(o, cfg));
             let id = queue::Queue::locked(|q| Ok(q.add(url.clone(), output, opts.connections)))?;
-            eprintln!("  \u{2705} Added #{}: {}", id, engine::percent_decode(&url));
+            let label = if is_mega {
+                // Never echo the link back: the fragment is the decryption key.
+                mega::parse_link(&url)
+                    .map(|link| format!("MEGA {}", link.handle))
+                    .unwrap_or_else(|_| "MEGA link".to_string())
+            } else {
+                engine::percent_decode(&url)
+            };
+            eprintln!("  \u{2705} Added #{}: {}", id, label);
         }
     }
 
@@ -376,7 +385,7 @@ fn mega_options(cfg: &config::Config, opts: &DownloadOpts) -> mega::MegaOptions 
         workers: opts.connections.unwrap_or(cfg.mega_workers),
         verify_mac: cfg.mega_verify_mac,
         resume_on_ip_change: cfg.mega_resume_on_ip_change,
-        max_retries: u32::try_from(cfg.max_retries).unwrap_or(6),
+        max_retries: cfg.max_retries,
         overwrite: false,
     }
 }
