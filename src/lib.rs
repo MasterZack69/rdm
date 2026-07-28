@@ -3,6 +3,7 @@ pub mod chunk;
 pub mod config;
 pub mod engine;
 pub mod inspect;
+pub mod mega;
 pub mod parallel;
 pub mod queue;
 pub mod range_download;
