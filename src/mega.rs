@@ -843,17 +843,15 @@ async fn quota_backoff(shared: &Shared, attempt: u32, quota: bool) -> bool {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        if let Some(ref before) = start_ip {
-            if (tick + 1) % IP_RECHECK_TICKS == 0 {
-                if let Some(now) = public_ip(&shared.client).await {
-                    if &now != before {
-                        shared
-                            .sink
-                            .note("Public IP changed — retrying MEGA download now");
-                        return true;
-                    }
-                }
-            }
+        if let Some(ref before) = start_ip
+            && (tick + 1) % IP_RECHECK_TICKS == 0
+            && let Some(now) = public_ip(&shared.client).await
+            && &now != before
+        {
+            shared
+                .sink
+                .note("Public IP changed — retrying MEGA download now");
+            return true;
         }
     }
     false
@@ -1043,21 +1041,20 @@ pub async fn download(
 
     // A finished file of exactly the right size is the common "already have
     // it" case; anything else gets overwritten via the .mctemp path.
-    if !options.overwrite {
-        if let Ok(meta) = tokio::fs::metadata(&final_path).await {
-            if meta.is_file() && meta.len() == info.size {
-                sink.finish();
-                return Ok(MegaOutcome::AlreadyPresent { path: final_path });
-            }
-        }
+    if !options.overwrite
+        && let Ok(meta) = tokio::fs::metadata(&final_path).await
+        && meta.is_file() && meta.len() == info.size
+    {
+        sink.finish();
+        return Ok(MegaOutcome::AlreadyPresent { path: final_path });
     }
 
-    if let Some(parent) = final_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("Cannot create {}", parent.display()))?;
-        }
+    if let Some(parent) = final_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("Cannot create {}", parent.display()))?;
     }
 
     let part_path = with_suffix(&final_path, ".mctemp");
@@ -1074,6 +1071,7 @@ pub async fn download(
     // that matters, so this is not actually writing `size` bytes.
     let part = tokio::fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .open(&part_path)
         .await

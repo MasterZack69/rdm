@@ -141,9 +141,11 @@ queue_parallel = 5
 
     #[test]
     fn mega_settings_round_trip() {
-        let mut cfg = Config::default();
-        cfg.mega_workers = 12;
-        cfg.mega_verify_mac = false;
+        let cfg = Config {
+            mega_workers: 12,
+            mega_verify_mac: false,
+            ..Default::default()
+        };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.mega_workers, 12);
