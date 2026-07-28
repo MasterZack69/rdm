@@ -234,8 +234,10 @@ pub fn parse_url(value: &str) -> Result<String, String> {
         return Err("URL must not be empty".to_string());
     }
 
+    // The suggestion is meant to be copy-pasteable, so no braces around it:
+    // `{{` and `}}` in a format string are literal braces, not grouping.
     Err(format!(
-        "`{trimmed}` is not an http(s) URL \u{2014} did you mean `{{https://{trimmed}}}`?"
+        "`{trimmed}` is not an http(s) URL \u{2014} did you mean `https://{trimmed}`?"
     ))
 }
 
