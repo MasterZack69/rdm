@@ -234,8 +234,9 @@ pub fn parse_url(value: &str) -> Result<String, String> {
         return Err("URL must not be empty".to_string());
     }
 
-    // No `{{`/`}}` around the suggestion: those are literal braces in a format
-    // string, and they turned the hint into a URL nobody can paste.
+    // The suggestion is meant to be copy-pasteable, so no doubled braces here:
+    // in a format string those emit literal braces and the hint came out as
+    // `{https://example.com/f.zip}`.
     Err(format!(
         "`{trimmed}` is not an http(s) URL \u{2014} did you mean `https://{trimmed}`?"
     ))
