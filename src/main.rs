@@ -109,7 +109,7 @@ fn quick_download(
     // finds nothing there.
     if mega::is_mega_url(url) {
         if parallel.is_some() && !opts.quiet {
-            eprintln!("  \\u{{26a0}} -p applies to directory listings; MEGA uses mega_workers.");
+            eprintln!("  \u{26a0} -p applies to directory listings; MEGA uses mega_workers.");
         }
         return mega_route(cfg, url, opts);
     }
@@ -145,7 +145,7 @@ fn quick_download(
 
         if parallel.is_some() && !opts.quiet {
             eprintln!(
-                "  \\u{{26a0}} -p applies to directory listings; ignoring it for a single file."
+                "  \u{26a0} -p applies to directory listings; ignoring it for a single file."
             );
         }
 
@@ -255,13 +255,13 @@ fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
 
         QueueCommand::Stop => {
             queue::send_signal("stop")?;
-            eprintln!("  \\u{{23f9}}  Stop signal sent. Queue will stop after current download.");
+            eprintln!("  \u{23f9}  Stop signal sent. Queue will stop after current download.");
             Ok(())
         }
 
         QueueCommand::Skip => {
             queue::send_signal("skip")?;
-            eprintln!("  \\u{{23ed}}  Skip signal sent.");
+            eprintln!("  \u{23ed}  Skip signal sent.");
             Ok(())
         }
 
@@ -286,7 +286,7 @@ fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
                 }
                 Some(RetryTarget::Id(id)) => {
                     if queue::Queue::locked(|q| Ok(q.retry_item(id)))? {
-                        eprintln!("  \\u{{2705}} #{id} requeued.");
+                        eprintln!("  \u{2705} #{id} requeued.");
                     } else {
                         eprintln!("  #{id} is not failed or skipped.");
                     }
@@ -326,7 +326,7 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
     // failing later, in the runner, where the message would be less useful.
     if mega::folder::is_folder_link(url) {
         anyhow::bail!(
-            "MEGA folder links cannot be queued \\u{{2014}} run `rdm <folder link>` to download the whole share"
+            "MEGA folder links cannot be queued \u{2014} run `rdm <folder link>` to download the whole share"
         );
     }
 
@@ -380,7 +380,7 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
             } else {
                 engine::percent_decode(&url)
             };
-            eprintln!("  \\u{{2705}} Added #{}: {}", id, label);
+            eprintln!("  \u{2705} Added #{}: {}", id, label);
         }
     }
 
@@ -466,17 +466,17 @@ fn report_mega(outcome: &mega::MegaOutcome, quiet: bool) {
     match outcome {
         mega::MegaOutcome::Completed { path, bytes } => {
             eprintln!(
-                "  \\u{{2705}} {} ({})",
+                "  \u{2705} {} ({})",
                 path.display(),
                 ui::format_size(*bytes)
             );
         }
         mega::MegaOutcome::AlreadyPresent { path } => {
-            eprintln!("  \\u{{2713}} Already downloaded: {}", path.display());
+            eprintln!("  \u{2713} Already downloaded: {}", path.display());
         }
         mega::MegaOutcome::Cancelled { path } => {
             eprintln!(
-                "  \\u{{23f8}} Stopped \\u{{2014}} partial file kept at {}, rerun to resume.",
+                "  \u{23f8} Stopped \u{2014} partial file kept at {}, rerun to resume.",
                 path.display()
             );
         }
@@ -491,7 +491,7 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
     }
 
     eprintln!();
-    eprintln!("  \\u{{1f4c1}} {}", summary.root.display());
+    eprintln!("  \u{1f4c1} {}", summary.root.display());
 
     // Where files land is the one thing this report exists to state, so an
     // absorbed folder level has to be visible rather than inferred.
@@ -513,7 +513,7 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
 
     if !summary.failed.is_empty() {
         eprintln!();
-        eprintln!("  \\u{{26a0}} {} file(s) failed:", summary.failed.len());
+        eprintln!("  \u{26a0} {} file(s) failed:", summary.failed.len());
         for (path, reason) in &summary.failed {
             eprintln!("     - {path}: {reason}");
         }
@@ -521,7 +521,7 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
 
     if summary.cancelled {
         eprintln!();
-        eprintln!("  \\u{{23f8}} Stopped \\u{{2014}} rerun the same link to pick up where this left off.");
+        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
     }
 }
 
@@ -530,13 +530,13 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
 fn print_discovered(files: &[scrape::DiscoveredFile]) {
     const SAMPLE: usize = 20;
 
-    eprintln!("  \\u{{1f4c1}} Found {} file(s):", files.len());
+    eprintln!("  \u{1f4c1} Found {} file(s):", files.len());
     eprintln!();
     for file in files.iter().take(SAMPLE) {
         eprintln!("     + {}", engine::percent_decode(&file.relative_path));
     }
     if files.len() > SAMPLE {
-        eprintln!("     \\u{{2026}} and {} more", files.len() - SAMPLE);
+        eprintln!("     \u{2026} and {} more", files.len() - SAMPLE);
     }
     eprintln!();
 }
