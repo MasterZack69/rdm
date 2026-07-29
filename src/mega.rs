@@ -60,7 +60,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use aes::Aes128;
-use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit, KeyIvInit, StreamCipher};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -77,8 +77,6 @@ use crate::ui::{ProgressSink, SlotState, format_size};
 
 /// Folder links: node tree, key unwrapping, and per-file orchestration.
 pub mod folder;
-
-type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 
 /// MEGA's API endpoint. `g.api` is the one that hands out download URLs.
 const API_URL: &str = "https://g.api.mega.co.nz/cs";
@@ -344,7 +342,7 @@ pub fn plan_tasks(chunks: &[(u64, u64)], target: u64) -> Vec<Task> {
     tasks
 }
 
-// ── CBC-MAC ──────────────────────────────────────────────────────
+// ── Block cipher ───────────────────────────────────────────────────
 
 fn encrypt_block(cipher: &Aes128, block: &mut [u8; 16]) {
     let mut b = aes::Block::from(*block);
@@ -373,6 +371,80 @@ pub(crate) fn ecb_decrypt(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+// ── CTR ──────────────────────────────────────────────────────────
+
+/// AES-128-CTR with a big-endian 128-bit counter.
+///
+/// This used to be `ctr::Ctr128BE<Aes128>`, and is written out here because
+/// the `ctr` crate has no release that works with a current `aes`: the latest
+/// stable `ctr` (0.9.2, 2022) is built on `cipher` 0.4, while `aes` 0.9 is on
+/// `cipher` 0.5. Depending on a pre-release to bridge that, in the one code
+/// path where a subtle error means silently corrupt files, is a worse trade
+/// than the forty lines below.
+///
+/// To be clear about what is and is not being hand-rolled: AES itself is
+/// still the `aes` crate. CTR mode on top of it is a counter, a block
+/// encryption and an XOR. The tests pin it to the NIST SP 800-38A CTR-AES128
+/// vectors, so "it matches `Ctr128BE`" is checked rather than assumed.
+struct Aes128Ctr {
+    cipher: Aes128,
+    counter: [u8; 16],
+    /// Keystream for `counter - 1`, i.e. the block currently being consumed.
+    keystream: [u8; 16],
+    /// How much of `keystream` is spent. Starts "empty" so the first byte
+    /// forces a refill.
+    used: usize,
+}
+
+impl Aes128Ctr {
+    fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
+        Self {
+            cipher: Aes128::new(key.into()),
+            counter: *iv,
+            keystream: [0u8; 16],
+            used: 16,
+        }
+    }
+
+    /// Encrypts the current counter block and increments it.
+    fn refill(&mut self) {
+        self.keystream = self.counter;
+        encrypt_block(&self.cipher, &mut self.keystream);
+
+        // Big-endian increment across the whole 16 bytes, so a counter that
+        // rolls over its low word carries into the nonce exactly as Ctr128BE
+        // does. MEGA never gets near that boundary in practice (it needs a
+        // file of 2^64 blocks), but matching the reference behaviour costs
+        // nothing and means the NIST vectors below are a real test.
+        for byte in self.counter.iter_mut().rev() {
+            let (next, carried) = byte.overflowing_add(1);
+            *byte = next;
+            if !carried {
+                break;
+            }
+        }
+
+        self.used = 0;
+    }
+
+    /// XORs the keystream over `data`, in place.
+    ///
+    /// Byte-wise on purpose: the caller feeds this whatever the socket
+    /// returned, which is rarely a multiple of the block size, and the
+    /// keystream has to carry across those boundaries.
+    fn apply_keystream(&mut self, data: &mut [u8]) {
+        for byte in data.iter_mut() {
+            if self.used == 16 {
+                self.refill();
+            }
+            *byte ^= self.keystream[self.used];
+            self.used += 1;
+        }
+    }
+}
+
+// ── CBC-MAC ──────────────────────────────────────────────────────
 
 /// Rolling CBC-MAC over one MAC chunk of plaintext.
 ///
@@ -1061,8 +1133,8 @@ async fn attempt_task(shared: &Shared, task: &Task, url: &str) -> Result<(), Tas
         .map_err(|e| TaskError::Fatal(e.into()))?;
 
     let mut cipher = Aes128Ctr::new(
-        &shared.key.aes.into(),
-        &ctr_iv(&shared.key.nonce, task.offset).into(),
+        &shared.key.aes,
+        &ctr_iv(&shared.key.nonce, task.offset),
     );
 
     let mut written = 0u64;
@@ -1457,6 +1529,80 @@ mod tests {
         assert_eq!(&ctr_iv(&nonce, 4096)[..8], &nonce);
     }
 
+    /// NIST SP 800-38A, F.5.1 (CTR-AES128.Encrypt). These are the reference
+    /// vectors for exactly the construction the `ctr` crate used to provide,
+    /// so passing them is what makes replacing it safe.
+    #[test]
+    fn ctr_matches_the_nist_vectors() {
+        let key: [u8; 16] = [
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
+            0x4f, 0x3c,
+        ];
+        let iv: [u8; 16] = [
+            0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd,
+            0xfe, 0xff,
+        ];
+
+        let plaintext: [u8; 32] = [
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a, 0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac,
+            0x45, 0xaf, 0x8e, 0x51,
+        ];
+        let expected: [u8; 32] = [
+            0x87, 0x4d, 0x61, 0x91, 0xb6, 0x20, 0xe3, 0x26, 0x1b, 0xef, 0x68, 0x64, 0x99, 0x0d,
+            0xb6, 0xce, 0x98, 0x06, 0xf6, 0x6b, 0x79, 0x70, 0xfd, 0xff, 0x86, 0x17, 0x18, 0x7b,
+            0xb9, 0xff, 0xfd, 0xff,
+        ];
+
+        let mut buffer = plaintext;
+        Aes128Ctr::new(&key, &iv).apply_keystream(&mut buffer);
+        assert_eq!(buffer, expected);
+
+        // CTR is its own inverse.
+        Aes128Ctr::new(&key, &iv).apply_keystream(&mut buffer);
+        assert_eq!(buffer, plaintext);
+    }
+
+    /// The counter is 128-bit big-endian, so incrementing past 0xff must carry
+    /// into the next byte rather than wrapping in place.
+    #[test]
+    fn ctr_counter_carries_across_byte_boundaries() {
+        let key = [1u8; 16];
+        let mut iv = [0u8; 16];
+        iv[15] = 0xff;
+
+        let mut cipher = Aes128Ctr::new(&key, &iv);
+        cipher.refill();
+        // 0x...ff + 1 == 0x...0100, not 0x...00.
+        assert_eq!(cipher.counter[15], 0x00);
+        assert_eq!(cipher.counter[14], 0x01);
+
+        // And the same one block further on.
+        cipher.refill();
+        assert_eq!(cipher.counter[15], 0x01);
+        assert_eq!(cipher.counter[14], 0x01);
+    }
+
+    /// The download feeds this whatever the socket returned, so the keystream
+    /// has to be indifferent to how the data is sliced.
+    #[test]
+    fn ctr_is_independent_of_write_boundaries() {
+        let key = [17u8; 16];
+        let iv = [4u8; 16];
+        let data: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+
+        let mut all_at_once = data.clone();
+        Aes128Ctr::new(&key, &iv).apply_keystream(&mut all_at_once);
+
+        let mut dribbled = data.clone();
+        let mut cipher = Aes128Ctr::new(&key, &iv);
+        for piece in dribbled.chunks_mut(7) {
+            cipher.apply_keystream(piece);
+        }
+
+        assert_eq!(all_at_once, dribbled);
+    }
+
     /// Decrypting a chunk in isolation must match decrypting the whole stream,
     /// which is the property the entire parallel design rests on.
     #[test]
@@ -1469,12 +1615,10 @@ mod tests {
         let plaintext: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
 
         let mut whole = plaintext.clone();
-        Aes128Ctr::new(&key.aes.into(), &ctr_iv(&key.nonce, 0).into())
-            .apply_keystream(&mut whole);
+        Aes128Ctr::new(&key.aes, &ctr_iv(&key.nonce, 0)).apply_keystream(&mut whole);
 
         let mut second_half = whole[2048..].to_vec();
-        Aes128Ctr::new(&key.aes.into(), &ctr_iv(&key.nonce, 2048).into())
-            .apply_keystream(&mut second_half);
+        Aes128Ctr::new(&key.aes, &ctr_iv(&key.nonce, 2048)).apply_keystream(&mut second_half);
 
         assert_eq!(second_half, plaintext[2048..]);
     }
