@@ -26,9 +26,9 @@
             doCheck = false;
 
             meta = {
-              description = "High-performance MEGA & HTTP/HTTPS download manager";
+              description = "Rust Download Manager - CLI";
               homepage = "https://github.com/MasterZack69/rdm";
-              license = pkgs.lib.licenses.mit;
+              license = pkgs.lib.licenses.agpl3Only;
               mainProgram = "rdm";
             };
           };
