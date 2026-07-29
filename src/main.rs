@@ -92,7 +92,7 @@ fn main() -> Result<()> {
 
 // -- Command handlers ------------------------------------------------
 
-/// `rdm <URL>` — download a file, or expand a directory listing into the queue
+/// `rdm <URL>` \u{2014} download a file, or expand a directory listing into the queue
 /// and immediately start working through it.
 ///
 /// `parallel` only takes effect on the listing path, where several files are
@@ -109,7 +109,7 @@ fn quick_download(
     // finds nothing there.
     if mega::is_mega_url(url) {
         if parallel.is_some() && !opts.quiet {
-            eprintln!("  \u{26a0} -p applies to directory listings; MEGA uses mega_workers.");
+            eprintln!("  \\u{26a0} -p applies to directory listings; MEGA uses mega_workers.");
         }
         return mega_route(cfg, url, opts);
     }
@@ -145,7 +145,7 @@ fn quick_download(
 
         if parallel.is_some() && !opts.quiet {
             eprintln!(
-                "  \u{26a0} -p applies to directory listings; ignoring it for a single file."
+                "  \\u{26a0} -p applies to directory listings; ignoring it for a single file."
             );
         }
 
@@ -167,7 +167,7 @@ fn mega_route(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()
     }
 }
 
-/// `rdm <mega link>` — fetch, decrypt and verify a MEGA file.
+/// `rdm <mega link>` \u{2014} fetch, decrypt and verify a MEGA file.
 ///
 /// Kept separate from the normal download path on purpose: MEGA needs its own
 /// API round trip, its own chunk ladder and its own quota handling, and none
@@ -203,7 +203,7 @@ fn mega_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result
     })
 }
 
-/// `rdm <mega folder link>` — walk the share and download everything in it.
+/// `rdm <mega folder link>` \u{2014} walk the share and download everything in it.
 ///
 /// `-o` names the destination directory here, not a file: a share holds many
 /// files and its own directory structure, so there is nothing sensible for a
@@ -214,7 +214,7 @@ fn mega_folder_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) ->
     let quiet = opts.quiet;
 
     let output = opts.output.as_deref().map(|o| {
-        let trimmed = o.trim_end_matches('/').trim_end_matches('\\');
+        let trimmed = o.trim_end_matches('/').trim_end_matches('\\\\');
         resolve_relative_to_config(trimmed, cfg)
     });
     let download_dir = cfg.download_dir.clone();
@@ -255,13 +255,13 @@ fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
 
         QueueCommand::Stop => {
             queue::send_signal("stop")?;
-            eprintln!("  \u{23f9}  Stop signal sent. Queue will stop after current download.");
+            eprintln!("  \\u{23f9}  Stop signal sent. Queue will stop after current download.");
             Ok(())
         }
 
         QueueCommand::Skip => {
             queue::send_signal("skip")?;
-            eprintln!("  \u{23ed}  Skip signal sent.");
+            eprintln!("  \\u{23ed}  Skip signal sent.");
             Ok(())
         }
 
@@ -286,7 +286,7 @@ fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
                 }
                 Some(RetryTarget::Id(id)) => {
                     if queue::Queue::locked(|q| Ok(q.retry_item(id)))? {
-                        eprintln!("  \u{2705} #{id} requeued.");
+                        eprintln!("  \\u{2705} #{id} requeued.");
                     } else {
                         eprintln!("  #{id} is not failed or skipped.");
                     }
@@ -319,14 +319,14 @@ fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
     }
 }
 
-/// `rdm queue add` — enqueue a single file, or every file behind a listing.
+/// `rdm queue add` \u{2014} enqueue a single file, or every file behind a listing.
 fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
     // A folder share is N files with no individual URLs to store, so it cannot
     // be represented as one queue item. Say so instead of accepting it and
     // failing later, in the runner, where the message would be less useful.
     if mega::folder::is_folder_link(url) {
         anyhow::bail!(
-            "MEGA folder links cannot be queued \u{2014} run `rdm <folder link>` to download the whole share"
+            "MEGA folder links cannot be queued \\u{2014} run `rdm <folder link>` to download the whole share"
         );
     }
 
@@ -380,7 +380,7 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
             } else {
                 engine::percent_decode(&url)
             };
-            eprintln!("  \u{2705} Added #{}: {}", id, label);
+            eprintln!("  \\u{2705} Added #{}: {}", id, label);
         }
     }
 
@@ -425,15 +425,15 @@ fn progress_sink(quiet: bool, label: &str) -> Arc<dyn ProgressSink> {
 
 /// Splits `-o` into the (exact path, fallback directory) pair MEGA needs.
 ///
-/// MEGA is the one source where we do not know the filename up front — it
+/// MEGA is the one source where we do not know the filename up front \u{2014} it
 /// arrives encrypted in the file attributes. So a directory-ish `-o` means
 /// "use the real name, in here", and only a concrete path overrides it.
 fn mega_destination(output: Option<String>, cfg: &config::Config) -> (Option<String>, String) {
     match output {
         Some(o) => {
             let path = Path::new(&o);
-            if o.ends_with('/') || o.ends_with('\\') || path.is_dir() {
-                let dir = o.trim_end_matches('/').trim_end_matches('\\').to_string();
+            if o.ends_with('/') || o.ends_with('\\\\') || path.is_dir() {
+                let dir = o.trim_end_matches('/').trim_end_matches('\\\\').to_string();
                 (None, dir)
             } else {
                 (
@@ -466,17 +466,17 @@ fn report_mega(outcome: &mega::MegaOutcome, quiet: bool) {
     match outcome {
         mega::MegaOutcome::Completed { path, bytes } => {
             eprintln!(
-                "  \u{2705} {} ({})",
+                "  \\u{2705} {} ({})",
                 path.display(),
                 ui::format_size(*bytes)
             );
         }
         mega::MegaOutcome::AlreadyPresent { path } => {
-            eprintln!("  \u{2713} Already downloaded: {}", path.display());
+            eprintln!("  \\u{2713} Already downloaded: {}", path.display());
         }
         mega::MegaOutcome::Cancelled { path } => {
             eprintln!(
-                "  \u{23f8} Stopped \u{2014} partial file kept at {}, rerun to resume.",
+                "  \\u{23f8} Stopped \\u{2014} partial file kept at {}, rerun to resume.",
                 path.display()
             );
         }
@@ -491,7 +491,15 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
     }
 
     eprintln!();
-    eprintln!("  \u{1f4c1} {}", summary.root.display());
+    eprintln!("  \\u{1f4c1} {}", summary.root.display());
+
+    // Where files land is the one thing this report exists to state, so an
+    // absorbed folder level has to be visible rather than inferred.
+    if let Some(folder) = summary.collapsed.as_deref() {
+        eprintln!("     (already the share's '{folder}' folder, so its contents went");
+        eprintln!("      straight in rather than into a second '{folder}' inside it)");
+    }
+
     eprintln!(
         "     {} of {} file(s), {}",
         summary.completed,
@@ -505,7 +513,7 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
 
     if !summary.failed.is_empty() {
         eprintln!();
-        eprintln!("  \u{26a0} {} file(s) failed:", summary.failed.len());
+        eprintln!("  \\u{26a0} {} file(s) failed:", summary.failed.len());
         for (path, reason) in &summary.failed {
             eprintln!("     - {path}: {reason}");
         }
@@ -513,7 +521,7 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
 
     if summary.cancelled {
         eprintln!();
-        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
+        eprintln!("  \\u{23f8} Stopped \\u{2014} rerun the same link to pick up where this left off.");
     }
 }
 
@@ -522,13 +530,13 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
 fn print_discovered(files: &[scrape::DiscoveredFile]) {
     const SAMPLE: usize = 20;
 
-    eprintln!("  \u{1f4c1} Found {} file(s):", files.len());
+    eprintln!("  \\u{1f4c1} Found {} file(s):", files.len());
     eprintln!();
     for file in files.iter().take(SAMPLE) {
         eprintln!("     + {}", engine::percent_decode(&file.relative_path));
     }
     if files.len() > SAMPLE {
-        eprintln!("     \u{2026} and {} more", files.len() - SAMPLE);
+        eprintln!("     \\u{2026} and {} more", files.len() - SAMPLE);
     }
     eprintln!();
 }
@@ -546,8 +554,8 @@ fn resolve_output(output: Option<String>, url: &str, cfg: &config::Config) -> St
     match output {
         Some(o) => {
             let path = Path::new(&o);
-            if o.ends_with('/') || o.ends_with('\\') || path.is_dir() {
-                let dir = o.trim_end_matches('/').trim_end_matches('\\');
+            if o.ends_with('/') || o.ends_with('\\\\') || path.is_dir() {
+                let dir = o.trim_end_matches('/').trim_end_matches('\\\\');
                 format!("{}/{}", dir, filename_from_url())
             } else if path.is_absolute() {
                 o
