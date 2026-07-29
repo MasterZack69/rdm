@@ -45,10 +45,19 @@ fn main() -> Result<()> {
         }
 
         Some(Command::Sync { url, opts, parallel, delete, ext }) => {
-            let connections = opts.connections.unwrap_or(cfg.connections);
             let parallel = parallel.unwrap_or(cfg.queue_parallel);
             let ext_filter = normalize_extensions(&ext);
             let allow_private = opts.allow_private;
+
+            // Sync resolves the connection count itself: `-c` means MEGA
+            // workers on a share and HTTP connections everywhere else, and
+            // only sync knows which it is dealing with.
+            let requested_connections = opts.connections;
+
+            // Kept separate from the download_dir override below so sync can
+            // tell an explicit destination from the configured default. That
+            // distinction gates --delete on the MEGA path.
+            let output_dir = opts.output.clone();
 
             // `-o` names the destination directory for a sync, not a file.
             let mut cfg = cfg;
@@ -60,11 +69,12 @@ fn main() -> Result<()> {
                 sync::run(
                     &cfg,
                     &url,
-                    connections,
+                    requested_connections,
                     parallel,
                     delete,
                     ext_filter,
                     allow_private,
+                    output_dir,
                     cancel,
                 )
                 .await
