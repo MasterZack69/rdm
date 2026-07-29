@@ -376,7 +376,7 @@ pub async fn run(
 /// * **Sequential downloads.** `parallel` is not honoured. Each file already
 ///   spreads across `workers` slots that share one per-IP quota, so running
 ///   whole files concurrently earns 509s rather than throughput.
-/// * **`--delete` needs `-o`.** See below.
+/// * **`--delete` needs `-o`, and a fully readable share.** See below.
 async fn run_mega(
     cfg: &Config,
     url: &str,
@@ -464,6 +464,20 @@ async fn run_mega(
     let mut to_delete: Vec<String> = Vec::new();
     if delete {
         match explicit_dir {
+            // A node this key cannot open has no readable name, so nothing
+            // here can match it against a file on disk — which makes "the key
+            // stopped resolving" indistinguishable from "it was removed from
+            // the share". One of those means the local file is an orphan; the
+            // other means it is a complete, MAC-verified file we would be
+            // destroying. Refusing is the only safe reading.
+            Some(_) if !listing.undecryptable.is_empty() => {
+                eprintln!(
+                    "  \u{26a0} Skipping --delete: {} node(s) in this share cannot be",
+                    listing.undecryptable.len()
+                );
+                eprintln!("    decrypted with this key, so their local copies cannot be told");
+                eprintln!("    apart from orphans. Nothing will be deleted this run.");
+            }
             Some(_) => {
                 let keep: HashSet<String> = entries.iter().map(|e| e.display_path()).collect();
                 if base.is_dir() {
@@ -498,6 +512,16 @@ async fn run_mega(
     eprintln!("  To download: {}", to_download.len());
     if delete {
         eprintln!("  To delete  : {}", to_delete.len());
+    }
+
+    // Unreadable nodes are stated whether or not --delete was asked for: a
+    // "complete" mirror that is quietly missing files is worse than a noisy
+    // one.
+    if !listing.undecryptable.is_empty() {
+        eprintln!(
+            "  Unreadable : {} node(s) this share key cannot open",
+            listing.undecryptable.len()
+        );
     }
 
     if to_download.is_empty() && to_delete.is_empty() {
@@ -661,6 +685,10 @@ fn join_relative(base: &Path, components: &[String]) -> PathBuf {
 /// is a kept path plus a dot-suffix (`a.jpg.part`, `a.jpg.mctemp`, whatever
 /// the downloader happens to use) belongs to a file we are keeping, so it is
 /// left alone without this function needing to know the naming scheme.
+///
+/// Callers must not reach here when part of the share is undecryptable: `keep`
+/// would be missing those files' names and their local copies would be
+/// reported as orphans.
 fn collect_mega_orphans(
     dir: &Path,
     base: &Path,
@@ -949,6 +977,31 @@ mod tests {
 
         // notes.txt was never in scope for this sync, so it is not an orphan.
         assert_eq!(out, vec!["gone.jpg"]);
+    }
+
+    /// The hazard the undecryptable guard in `run_mega` exists for: a file
+    /// whose node key stops resolving drops out of `keep`, and this function
+    /// then cannot tell it from a file the share genuinely dropped. Proving
+    /// that here is what makes the guard load-bearing rather than decorative.
+    #[test]
+    fn a_file_missing_from_keep_is_indistinguishable_from_an_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        touch(&base.join("readable.jpg"));
+        touch(&base.join("key-no-longer-opens-this.jpg"));
+
+        // Only the readable node made it into the listing.
+        let keep = keep_set(&["readable.jpg"]);
+        let mut out = Vec::new();
+        collect_mega_orphans(base, base, &keep, &None, &mut out);
+
+        assert_eq!(
+            out,
+            vec!["key-no-longer-opens-this.jpg"],
+            "a perfectly good file looks like an orphan, which is why run_mega \
+             refuses to delete when any node is undecryptable"
+        );
     }
 
     #[test]
