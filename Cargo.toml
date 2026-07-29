@@ -16,11 +16,12 @@ toml = "1.0.3"
 libc = "0.2"
 dirs = "6"
 
-# aes and ctr have to sit on the same cipher generation: aes 0.9 and
-# ctr 0.9.2 are both cipher 0.5. Pairing aes 0.8 (cipher 0.4) with ctr 0.9
-# leaves Aes128 without the traits Ctr128BE needs.
+# MEGA's crypto: AES-CTR for the payload, AES-ECB for key unwrapping and an
+# AES-CBC-MAC for integrity. All three are built on this one primitive, so aes
+# is the only cipher dependency. CTR mode itself lives in src/mega.rs rather
+# than coming from the ctr crate, whose latest release (0.9.2) is still on
+# cipher 0.4 and cannot be combined with a current aes.
 aes = "0.9"
-ctr = "0.9"
 base64 = "0.22"
 
 [profile.release]
