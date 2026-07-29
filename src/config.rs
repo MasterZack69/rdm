@@ -2,12 +2,40 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Every field added after 0.2.1 needs a `#[serde(default = ...)]`.
+///
+/// [`Config::load`] falls back to `Config::default()` for *any* parse error,
+/// so a missing field in an older `config.toml` would silently throw away the
+/// user's whole configuration instead of just filling in the new value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub connections: usize,
     pub download_dir: String,
     pub max_retries: u32,
     pub queue_parallel: usize,
+
+    /// Parallel chunk workers for a MEGA download.
+    #[serde(default = "default_mega_workers")]
+    pub mega_workers: usize,
+
+    /// Verify the CBC-MAC of a finished MEGA file against the meta-MAC in the
+    /// link. Catches silent corruption that plain HTTP downloads cannot see.
+    #[serde(default = "default_true")]
+    pub mega_verify_mac: bool,
+
+    /// While waiting out a MEGA HTTP 509 (bandwidth quota), poll the public IP
+    /// and retry immediately when it changes — i.e. when the user turns on a
+    /// VPN. Turn this off on NAT-behind-NAT setups where detection misfires.
+    #[serde(default = "default_true")]
+    pub mega_resume_on_ip_change: bool,
+}
+
+fn default_mega_workers() -> usize {
+    crate::mega::WORKERS_DEFAULT
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -23,6 +51,9 @@ impl Default for Config {
             download_dir,
             max_retries: 6,
             queue_parallel: 3,
+            mega_workers: default_mega_workers(),
+            mega_verify_mac: true,
+            mega_resume_on_ip_change: true,
         }
     }
 }
@@ -78,5 +109,46 @@ impl Config {
         eprintln!("  Connections: {}", self.connections);
         eprintln!("  Max retries: {}", self.max_retries);
         eprintln!("  Queue par. : {}", self.queue_parallel);
+        eprintln!("  MEGA slots : {}", self.mega_workers);
+        eprintln!("  MEGA verify: {}", self.mega_verify_mac);
+        eprintln!("  MEGA VPN   : {}", self.mega_resume_on_ip_change);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 0.2.1 config file has none of the mega_* keys. It must still load,
+    /// keeping the values the user did set.
+    #[test]
+    fn older_config_files_still_parse() {
+        let old = r#"
+connections = 12
+download_dir = "/tmp/dl"
+max_retries = 69
+queue_parallel = 5
+"#;
+        let cfg: Config = toml::from_str(old).expect("old config should still parse");
+        assert_eq!(cfg.connections, 12);
+        assert_eq!(cfg.download_dir, "/tmp/dl");
+        assert_eq!(cfg.max_retries, 69);
+        assert_eq!(cfg.queue_parallel, 5);
+        assert_eq!(cfg.mega_workers, crate::mega::WORKERS_DEFAULT);
+        assert!(cfg.mega_verify_mac);
+        assert!(cfg.mega_resume_on_ip_change);
+    }
+
+    #[test]
+    fn mega_settings_round_trip() {
+        let cfg = Config {
+            mega_workers: 12,
+            mega_verify_mac: false,
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.mega_workers, 12);
+        assert!(!back.mega_verify_mac);
     }
 }

@@ -27,7 +27,7 @@ Arguments:
 Options:
   -o, --output <PATH>     Output file or directory [default: download_dir from config]
   -c, --connections <N>   Connections per file [default: connections from config]
-      --allow-private     Allow scanning private, loopback and link-local addresses
+      --allow-private     Allow scanning private, loopback and link-local addresses [aliases: --ap]
   -q, --quiet             Suppress progress output
   -h, --help              Print help
   -V, --version           Print version
@@ -42,6 +42,8 @@ sync and queue have options of their own — see `rdm sync --help` and
 If you have set up the path variable like a normal person then you can reproduce the above wall of text by typing 'rdm', assuming the variable is rdm.
 
 `-o`, `-c`, `--allow-private` and `-q` work on every download path: bare `rdm <URL>`, `rdm download`, `rdm sync` and `rdm queue add`. The flags below are specific to the commands they belong to, so they won't show up in the root help above.
+
+`--ap` is a shorthand for `--allow-private`. Same flag, less typing.
 
 ## Sync
 
@@ -72,6 +74,28 @@ rdm queue clear [pending|done]           Clear queue (all by default)   [c]
 
 Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything it finds and starts downloading, and `rdm queue add <URL>` enqueues without starting.
 
+## MEGA
+
+mega.nz file links work anywhere a normal URL does:
+
+```
+rdm 'https://mega.nz/file/AbCdEfGh#your-key-here'
+rdm queue add 'https://mega.nz/file/AbCdEfGh#your-key-here'
+```
+
+**Quote the link.** The `#` starts a comment in every shell you are likely to be using, and everything after it is the decryption key — an unquoted link silently becomes an unusable one.
+
+What happens under the hood: the key is unpacked from the fragment and never leaves your machine, MEGA hands out a short-lived temporary URL, the file is fetched in parallel chunks and decrypted as it streams to disk, and the result is checked against the MAC embedded in the link before the `.mctemp` file is renamed into place. A failed check is a failed download — you get an error, not a corrupt file.
+
+A few things worth knowing:
+
+- **You do not name the file.** The real filename is encrypted inside the link, so `-o` is optional and only needed to override it. Without `-o` the file lands in `download_dir` under its actual name.
+- **`-c` sets the number of chunk workers**, same as it sets connections everywhere else.
+- **Interrupted downloads resume.** Progress lives in `<file>.mctemp` plus a small sidecar; rerun the same command and it picks up where it stopped.
+- **Queued MEGA links run one at a time**, regardless of `-p`. MEGA's bandwidth quota is per-IP, so downloading three at once is not faster — it just hits the limit three times as often.
+- **If you hit the quota** (HTTP 509), rdm backs off and waits rather than failing. Connect a VPN and it notices the new IP and resumes early instead of sitting out the rest of the timer. Turn that off with `mega_resume_on_ip_change = false`.
+- **Folder links are not supported yet** — only `/file/` links. A folder link gets a clear error rather than a confusing one.
+
 # Example Config File
 
 ```
@@ -86,7 +110,19 @@ max_retries = 69
 
 # multi-file download at once
 queue_parallel = 5
+
+# MEGA: chunk workers per file
+mega_workers = 6
+
+# MEGA: verify the MAC after downloading. Costs a full reread of the file.
+# Turning this off means silent corruption stays silent.
+mega_verify_mac = true
+
+# MEGA: when quota-blocked, resume early if your public IP changes
+mega_resume_on_ip_change = true
 ```
+
+Every key is optional — anything you leave out falls back to the default, and a config file written before these keys existed still loads.
 
 # Release
 Zack encourages you to build from source. As some random internet person once said, "Always build from source"
@@ -110,3 +146,7 @@ cargo test
 - Claude Opus 4.7 - Here to do everything better
 - Claude Opus 5 - Clap Migration & Queue System
 - DeepSeek V4 Flash - Clippy error fixer
+
+## Prior art
+
+[MegaBasterd](https://github.com/tonikelope/megabasterd) by tonikelope (GPLv3) — the MEGA support here is a clean-room Rust implementation, but MegaBasterd is where the non-obvious parts came from: that the 509 quota is per-IP rather than per-connection, that backoff should end early when your IP changes, that chunk workers must not share a keep-alive socket, and that a 403 means an expired temp URL rather than a missing file. Years of bug reports, distilled. No MegaBasterd code was copied.

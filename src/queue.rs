@@ -5,6 +5,14 @@
 //! hands each worker a lane, so every in-flight file gets its own progress
 //! line with a real per-file ETA, and finished items scroll above the live
 //! block instead of fighting with it.
+//!
+//! ## Two downloaders, one runner
+//!
+//! An item is either an ordinary HTTP download or a MEGA link, and the two
+//! need completely different machinery — MEGA has its own API handshake, key
+//! schedule and quota rules. [`run_item`] picks between them and flattens both
+//! into [`ItemOutcome`], so everything downstream (status writing, skip
+//! detection, board logging) stays written once.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -19,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::engine::{self, DownloadRequest, ExistingPolicy, Outcome};
+use crate::mega;
 use crate::ui;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,21 +53,38 @@ pub struct Item {
 }
 
 impl Item {
+    /// Does this item need the MEGA downloader rather than the engine?
+    pub fn is_mega(&self) -> bool {
+        mega::is_mega_url(&self.url)
+    }
+
     /// Human-friendly name for progress lines: the output path if we have one,
     /// otherwise the last URL segment.
     pub fn display_name(&self) -> String {
-        let raw = match &self.output {
-            Some(o) => o.rsplit('/').next().unwrap_or(o),
-            None => self
-                .url
-                .split('?')
-                .next()
-                .unwrap_or(&self.url)
-                .rsplit('/')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(&self.url),
-        };
+        if let Some(o) = &self.output {
+            let raw = o.rsplit('/').next().unwrap_or(o);
+            return engine::percent_decode(raw);
+        }
+
+        // A MEGA link's last segment is `<handle>#<key>`, which is both
+        // meaningless to the user and a secret we should not be printing. The
+        // real filename only arrives once the API decrypts the attributes, so
+        // until then the handle alone is the honest label.
+        if self.is_mega() {
+            return mega::parse_link(&self.url)
+                .map(|link| format!("MEGA {}", link.handle))
+                .unwrap_or_else(|_| "MEGA link".to_string());
+        }
+
+        let raw = self
+            .url
+            .split('?')
+            .next()
+            .unwrap_or(&self.url)
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.url);
         engine::percent_decode(raw)
     }
 
@@ -78,6 +104,22 @@ impl Item {
             }
         };
         cfg.resolve_output_path(&raw_path)
+    }
+
+    /// The `(exact path, fallback directory)` pair the MEGA downloader takes.
+    ///
+    /// Unlike every other source, MEGA knows the filename and we do not: it is
+    /// encrypted in the file attributes. So an item with no explicit output
+    /// deliberately passes `None` and lets MEGA name the file, instead of
+    /// [`Self::resolve_output`] inventing one out of the link.
+    pub fn mega_destination(&self, cfg: &Config) -> (Option<String>, String) {
+        match &self.output {
+            Some(o) => (
+                Some(cfg.resolve_output_path(&engine::percent_decode(o))),
+                cfg.download_dir.clone(),
+            ),
+            None => (None, cfg.download_dir.clone()),
+        }
     }
 }
 
@@ -415,6 +457,15 @@ impl Queue {
             .count()
     }
 
+    /// How many pending items need the MEGA path. Used only to warn about the
+    /// serialisation up front, so a stalled-looking board makes sense.
+    pub fn pending_mega_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| i.status == Status::Pending && i.is_mega())
+            .count()
+    }
+
     pub fn failed_count(&self) -> usize {
         self.items
             .iter()
@@ -546,6 +597,82 @@ fn clear_signal() {
     let _ = fs::remove_file(signal_file());
 }
 
+// ── Per-item dispatch ───────────────────────────────────────────────────
+
+/// What happened to one item, with the differences between the two
+/// downloaders already flattened out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemOutcome {
+    Completed { bytes: u64 },
+    AlreadyPresent,
+    Cancelled,
+}
+
+/// Runs one queue item on whichever downloader it needs.
+///
+/// `mega_gate` serialises MEGA items. MEGA's bandwidth limit is enforced per
+/// IP, not per file, so running three of them at once does not go three times
+/// faster — all three hit the same 509 wall and each sits out its own backoff,
+/// while the file already has `mega_workers` parallel connections inside it.
+async fn run_item(
+    cfg: &Config,
+    item: &Item,
+    cancel: CancellationToken,
+    sink: Arc<dyn ui::ProgressSink>,
+    mega_client: reqwest::Client,
+    mega_gate: Arc<tokio::sync::Semaphore>,
+) -> Result<ItemOutcome> {
+    if item.is_mega() {
+        let _permit = mega_gate.acquire_owned().await;
+
+        if cancel.is_cancelled() {
+            return Ok(ItemOutcome::Cancelled);
+        }
+
+        let (output, download_dir) = item.mega_destination(cfg);
+        let options = mega::MegaOptions {
+            workers: item.connections.unwrap_or(cfg.mega_workers),
+            verify_mac: cfg.mega_verify_mac,
+            resume_on_ip_change: cfg.mega_resume_on_ip_change,
+            max_retries: cfg.max_retries,
+            // The queue never stops to ask, and an existing file of the right
+            // size is treated as already downloaded.
+            overwrite: false,
+        };
+
+        let outcome = mega::download(
+            mega_client,
+            &item.url,
+            output,
+            &download_dir,
+            options,
+            cancel,
+            sink,
+        )
+        .await?;
+
+        return Ok(match outcome {
+            mega::MegaOutcome::Completed { bytes, .. } => ItemOutcome::Completed { bytes },
+            mega::MegaOutcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent,
+            mega::MegaOutcome::Cancelled { .. } => ItemOutcome::Cancelled,
+        });
+    }
+
+    let request = DownloadRequest::new(
+        item.url.clone(),
+        Some(item.resolve_output(cfg)),
+        item.connections.unwrap_or(cfg.connections),
+    )
+    // Never stop a batch run to ask about an existing file.
+    .with_policy(ExistingPolicy::Reuse);
+
+    Ok(match engine::download(request, cancel, sink).await? {
+        Outcome::Completed { bytes, .. } => ItemOutcome::Completed { bytes },
+        Outcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent,
+        Outcome::Cancelled => ItemOutcome::Cancelled,
+    })
+}
+
 // ── Queue processor ─────────────────────────────────────────────────────
 
 /// Works through every pending item, `parallel` files at a time.
@@ -564,7 +691,9 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
         Ok(())
     })?;
 
-    let pending = Queue::load_readonly().pending_count();
+    let snapshot = Queue::load_readonly();
+    let pending = snapshot.pending_count();
+    let pending_mega = snapshot.pending_mega_count();
     if pending == 0 {
         eprintln!("  Queue is empty — nothing to do.");
         return Ok(());
@@ -577,9 +706,19 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
         "  \u{1f680} {} file(s) queued \u{b7} {} at a time",
         pending, parallel
     ));
+    if pending_mega > 1 {
+        board.log(&format!(
+            "  \u{2139} {} MEGA link(s) \u{b7} run one at a time \u{2014} the quota is per-IP, not per-file",
+            pending_mega
+        ));
+    }
     let renderer = board.spawn_renderer();
 
     let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel));
+    // Separate from `semaphore`: this one is about MEGA's quota, not about how
+    // many files the user wants in flight.
+    let mega_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let mega_client = reqwest::Client::new();
     let completed = Arc::new(AtomicU32::new(0));
     let failed = Arc::new(AtomicU32::new(0));
     let skipped = Arc::new(AtomicU32::new(0));
@@ -676,17 +815,23 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
         let bytes_total = Arc::clone(&bytes_total);
         let active_children = Arc::clone(&active_children);
         let cancel_main = cancel.clone();
+        let mega_gate = Arc::clone(&mega_gate);
+        let mega_client = mega_client.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = permit; // held until the task completes
             let item_id = next.id;
             let name = next.display_name();
 
-            let output = next.resolve_output(&cfg);
-            if let Some(parent) = std::path::Path::new(&output).parent()
-                && !parent.exists()
-            {
-                std::fs::create_dir_all(parent).ok();
+            // MEGA creates its own parent directories once it knows the real
+            // filename; for engine downloads the path is known up front.
+            if !next.is_mega() {
+                let output = next.resolve_output(&cfg);
+                if let Some(parent) = std::path::Path::new(&output).parent()
+                    && !parent.exists()
+                {
+                    std::fs::create_dir_all(parent).ok();
+                }
             }
 
             // A lane is a live progress line on the board. If the board is
@@ -697,16 +842,16 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                 None => ui::silent(),
             };
 
-            let request = DownloadRequest::new(
-                next.url.clone(),
-                Some(output),
-                next.connections.unwrap_or(cfg.connections),
-            )
-            // Never stop a batch run to ask about an existing file.
-            .with_policy(ExistingPolicy::Reuse);
-
             let elapsed_before = lane.as_ref().map(|l| l.elapsed());
-            let result = engine::download(request, child.clone(), sink).await;
+            let result = run_item(
+                &cfg,
+                &next,
+                child.clone(),
+                sink,
+                mega_client,
+                mega_gate,
+            )
+            .await;
             let elapsed = elapsed_before
                 .map(|_| lane.as_ref().map(|l| l.elapsed()).unwrap_or_default())
                 .unwrap_or_default();
@@ -724,7 +869,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             let was_skipped = child.is_cancelled() && !cancel_main.is_cancelled();
 
             let downloaded = match &result {
-                Ok(Outcome::Completed { bytes, .. }) => Some(*bytes),
+                Ok(ItemOutcome::Completed { bytes }) => Some(*bytes),
                 _ => None,
             };
 
@@ -732,7 +877,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             let _ = Queue::locked(|q| {
                 if cancel_main.is_cancelled() {
                     match &result {
-                        Ok(Outcome::Completed { .. }) | Ok(Outcome::AlreadyPresent { .. }) => {
+                        Ok(ItemOutcome::Completed { .. }) | Ok(ItemOutcome::AlreadyPresent) => {
                             q.finish_item(item_id, Status::Complete, downloaded)
                         }
                         _ => q.set_status(item_id, Status::Pending),
@@ -741,10 +886,10 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                     q.set_status(item_id, Status::Skipped);
                 } else {
                     match &result {
-                        Ok(Outcome::Completed { .. }) | Ok(Outcome::AlreadyPresent { .. }) => {
+                        Ok(ItemOutcome::Completed { .. }) | Ok(ItemOutcome::AlreadyPresent) => {
                             q.finish_item(item_id, Status::Complete, downloaded);
                         }
-                        Ok(Outcome::Cancelled) => q.set_status(item_id, Status::Skipped),
+                        Ok(ItemOutcome::Cancelled) => q.set_status(item_id, Status::Skipped),
                         Err(e) => {
                             let attempts = q.attempts_so_far(item_id) + 1;
                             q.set_status(
@@ -772,7 +917,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             }
 
             match result {
-                Ok(Outcome::Completed { bytes, .. }) => {
+                Ok(ItemOutcome::Completed { bytes }) => {
                     completed.fetch_add(1, Ordering::Relaxed);
                     bytes_total.fetch_add(bytes, Ordering::Relaxed);
                     board.file_completed(bytes);
@@ -792,7 +937,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                         ui::format_speed(avg),
                     ));
                 }
-                Ok(Outcome::AlreadyPresent { .. }) => {
+                Ok(ItemOutcome::AlreadyPresent) => {
                     completed.fetch_add(1, Ordering::Relaxed);
                     board.file_completed(0);
                     board.log(&format!(
@@ -800,7 +945,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                         item_id, name
                     ));
                 }
-                Ok(Outcome::Cancelled) => {
+                Ok(ItemOutcome::Cancelled) => {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     board.file_skipped();
                     board.log(&format!("  \u{23ed} #{}  {} — skipped", item_id, name));
@@ -886,6 +1031,8 @@ fn print_summary(completed: u32, failed: u32, skipped: u32, bytes: u64, elapsed:
 mod tests {
     use super::*;
 
+    const MEGA_LINK: &str = "https://mega.nz/file/AbCdEfGh#thekey";
+
     fn queue_with(urls: &[&str]) -> Queue {
         let mut q = Queue::default();
         for url in urls {
@@ -918,6 +1065,52 @@ mod tests {
         let mut q = queue_with(&["https://x.com/dir/track%2001.flac?token=1"]);
         assert_eq!(q.items[0].display_name(), "track 01.flac");
         assert!(q.remove(1));
+    }
+
+    // ── MEGA items ──
+
+    #[test]
+    fn mega_items_are_recognised() {
+        let q = queue_with(&[MEGA_LINK, "https://x.com/a.bin"]);
+        assert!(q.items[0].is_mega());
+        assert!(!q.items[1].is_mega());
+        assert_eq!(q.pending_mega_count(), 1);
+    }
+
+    /// The link's last segment is `<handle>#<key>` — printing that on the
+    /// progress line would leak the decryption key into logs and scrollback.
+    #[test]
+    fn mega_display_name_never_shows_the_key() {
+        let q = queue_with(&[MEGA_LINK]);
+        let name = q.items[0].display_name();
+        assert_eq!(name, "MEGA AbCdEfGh");
+        assert!(!name.contains("thekey"));
+
+        // An explicit output still wins — that is a real filename.
+        let mut q = Queue::default();
+        q.add(MEGA_LINK.into(), Some("movies/holiday.mkv".into()), None);
+        assert_eq!(q.items[0].display_name(), "holiday.mkv");
+    }
+
+    /// With no explicit output, MEGA must be left to name the file: only it
+    /// can decrypt the real filename out of the attributes.
+    #[test]
+    fn mega_destination_defers_naming_when_it_can() {
+        let cfg = Config::default();
+
+        let q = queue_with(&[MEGA_LINK]);
+        let (output, dir) = q.items[0].mega_destination(&cfg);
+        assert_eq!(output, None);
+        assert_eq!(dir, cfg.download_dir);
+
+        // resolve_output would have invented this nonsense from the link.
+        assert!(q.items[0].resolve_output(&cfg).contains("AbCdEfGh"));
+
+        let mut q = Queue::default();
+        q.add(MEGA_LINK.into(), Some("movies/my%20film.mkv".into()), None);
+        let (output, _) = q.items[0].mega_destination(&cfg);
+        let output = output.expect("an explicit output must be honoured");
+        assert!(output.ends_with("movies/my film.mkv"), "{output}");
     }
 
     #[test]
