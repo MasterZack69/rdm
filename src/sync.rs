@@ -442,6 +442,13 @@ async fn run_mega(
     // says whether the user chose it.
     let base = PathBuf::from(&cfg.download_dir);
 
+    // rsync semantics: `sync <share> -o ~/Music` where the share's one folder
+    // is also called Music mirrors into ~/Music, not ~/Music/Music. This has
+    // to happen before anything is compared against the disk, because it
+    // changes every path that follows — including the ones printed below, so
+    // the plan shows where files actually go.
+    let collapsed = mega::folder::collapse_shared_root(&base, &mut entries);
+
     // Exact sizes come free with the listing, so no HEAD phase.
     let mut up_to_date = 0u64;
     let mut to_download: Vec<mega::folder::Entry> = Vec::new();
@@ -482,6 +489,11 @@ async fn run_mega(
 
     eprintln!();
     eprintln!("  Remote     : {} file(s)", entries.len());
+    eprintln!("  Into       : {}", base.display());
+    if let Some(folder) = collapsed.as_deref() {
+        eprintln!("               (already the share's '{folder}' folder, so its");
+        eprintln!("                contents mirror straight into it)");
+    }
     eprintln!("  Up to date : {}", up_to_date);
     eprintln!("  To download: {}", to_download.len());
     if delete {
