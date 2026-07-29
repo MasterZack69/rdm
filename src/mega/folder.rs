@@ -154,7 +154,7 @@ pub fn decode_folder_key(key_b64: &str) -> Result<[u8; 16]> {
     Ok(key)
 }
 
-// ── Node tree ───────────────────────────────────────────────────────
+// ── Node tree ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct RawNode {
@@ -462,7 +462,7 @@ pub async fn list_folder(client: &Client, link: &FolderLink) -> Result<Listing> 
     })
 }
 
-// ── Download ──────────────────────────────────────────────────────
+// ── Download ────────────────────────────────────────────────────
 
 /// What became of a folder download.
 #[derive(Debug, Clone, Default)]
@@ -586,8 +586,7 @@ pub async fn download_folder(
 mod tests {
     use super::*;
     use aes::Aes128;
-    use aes::cipher::generic_array::GenericArray;
-    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -596,7 +595,9 @@ mod tests {
         let cipher = Aes128::new(share.into());
         let mut out = plain.to_vec();
         for start in (0..plain.len() / 16 * 16).step_by(16) {
-            let mut block = GenericArray::clone_from_slice(&out[start..start + 16]);
+            let mut raw = [0u8; 16];
+            raw.copy_from_slice(&out[start..start + 16]);
+            let mut block = aes::Block::from(raw);
             cipher.encrypt_block(&mut block);
             out[start..start + 16].copy_from_slice(&block);
         }
@@ -604,7 +605,7 @@ mod tests {
     }
 
     /// Builds an `a` blob the way MEGA does: AES-128-CBC, zero IV, over
-    /// `MEGA{"n":"..."}` zero-padded to a block boundary.
+    /// `MEGA{\"n\":\"...\"}` zero-padded to a block boundary.
     fn seal_attributes(aes: &[u8; 16], name: &str) -> String {
         let mut plain = format!("MEGA{{\"n\":\"{name}\"}}").into_bytes();
         while plain.len() % 16 != 0 {
@@ -620,7 +621,7 @@ mod tests {
             for i in 0..16 {
                 block[i] = chunk[i] ^ previous[i];
             }
-            let mut ga = GenericArray::clone_from_slice(&block);
+            let mut ga = aes::Block::from(block);
             cipher.encrypt_block(&mut ga);
             previous.copy_from_slice(&ga);
             out.extend_from_slice(&ga);
