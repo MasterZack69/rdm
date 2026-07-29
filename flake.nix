@@ -5,7 +5,7 @@
   };
 
   outputs =
-    { nixpkgs, systems, ... }:
+    { self, nixpkgs, systems, ... }:
     let
       eachSystem = nixpkgs.lib.genAttrs (import systems);
     in
@@ -34,6 +34,28 @@
           };
         }
       );
+
+      checks = eachSystem (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        {
+          default = self.packages.${system}.default;
+        }
+      );
+
+      apps = eachSystem (
+        system:
+        {
+          default = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/rdm";
+          };
+        }
+      );
+
+      formatter = eachSystem (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);
 
       devShells = eachSystem (
         system:
