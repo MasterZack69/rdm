@@ -60,8 +60,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use aes::Aes128;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, KeyIvInit, StreamCipher};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit, KeyIvInit, StreamCipher};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -348,13 +347,13 @@ pub fn plan_tasks(chunks: &[(u64, u64)], target: u64) -> Vec<Task> {
 // ── CBC-MAC ──────────────────────────────────────────────────────
 
 fn encrypt_block(cipher: &Aes128, block: &mut [u8; 16]) {
-    let mut b = GenericArray::clone_from_slice(block);
+    let mut b = aes::Block::from(*block);
     cipher.encrypt_block(&mut b);
     block.copy_from_slice(&b);
 }
 
 fn decrypt_block(cipher: &Aes128, block: &mut [u8; 16]) {
-    let mut b = GenericArray::clone_from_slice(block);
+    let mut b = aes::Block::from(*block);
     cipher.decrypt_block(&mut b);
     block.copy_from_slice(&b);
 }
