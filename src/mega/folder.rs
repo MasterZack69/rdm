@@ -366,7 +366,7 @@ pub async fn list_folder(client: &Client, link: &FolderLink) -> Result<Listing> 
             // The share root's own key *is* the share key, and it is often
             // absent from `k` entirely. Folder keys are 16 bytes, and the same
             // attribute-blob oracle picks between candidates.
-            let mut chosen: Option<(([u8; 16]), String)> = None;
+            let mut chosen: Option<([u8; 16], String)> = None;
 
             for raw in &candidates {
                 if raw.len() < 16 {
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn a_node_without_attributes_falls_back_to_the_first_key() {
         let raw: Vec<u8> = (0..32u8).collect();
-        let (key, name) = choose_file_key(&[raw.clone()], None).unwrap();
+        let (key, name) = choose_file_key(std::slice::from_ref(&raw), None).unwrap();
         assert_eq!(key, file_key_from_bytes(&raw).unwrap());
         assert!(name.is_empty());
 
