@@ -200,7 +200,7 @@ pub fn parse_link(url: &str) -> Result<MegaLink> {
     Ok(MegaLink { handle, key })
 }
 
-// ── Key material ──────────────────────────────────────────────────
+// ── Key material ───────────────────────────────────────────────────
 
 /// The three things packed into a file link's 32-byte key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,7 +284,7 @@ fn ctr_iv(nonce: &[u8; 8], offset: u64) -> [u8; 16] {
     iv
 }
 
-// ── Chunk ladder ──────────────────────────────────────────────────
+// ── Chunk ladder ───────────────────────────────────────────────────
 
 /// MEGA's MAC chunk boundaries: `(offset, len)` pairs.
 ///
@@ -342,7 +342,7 @@ pub fn plan_tasks(chunks: &[(u64, u64)], target: u64) -> Vec<Task> {
     tasks
 }
 
-// ── Block cipher ──────────────────────────────────────────────────
+// ── Block cipher ───────────────────────────────────────────────────
 
 fn encrypt_block(cipher: &Aes128, block: &mut [u8; 16]) {
     let mut b = aes::Block::from(*block);
@@ -372,7 +372,7 @@ pub(crate) fn ecb_decrypt(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
     out
 }
 
-// ── CTR ─────────────────────────────────────────────────────────
+// ── CTR ──────────────────────────────────────────────────────────
 
 /// AES-128-CTR with a big-endian 128-bit counter.
 ///
@@ -444,7 +444,7 @@ impl Aes128Ctr {
     }
 }
 
-// ── CBC-MAC ────────────────────────────────────────────────────
+// ── CBC-MAC ──────────────────────────────────────────────────────
 
 /// Rolling CBC-MAC over one MAC chunk of plaintext.
 ///
@@ -563,7 +563,7 @@ pub async fn verify_file(
     Ok(combine_macs(key, &macs) == key.meta_mac)
 }
 
-// ── API ─────────────────────────────────────────────────────────
+// ── API ──────────────────────────────────────────────────────────
 
 /// Human wording for the MEGA API error codes worth distinguishing.
 pub fn api_error_message(code: i64) -> String {
@@ -796,7 +796,7 @@ fn rand_seq() -> u64 {
         .unwrap_or(1)
 }
 
-// ── Resume sidecar ─────────────────────────────────────────────────
+// ── Resume sidecar ────────────────────────────────────────────────
 
 /// Which range requests already landed, so a rerun does not redo them.
 ///
@@ -840,7 +840,7 @@ impl ResumeState {
     }
 }
 
-// ── Download ────────────────────────────────────────────────────
+// ── Download ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct MegaOptions {
