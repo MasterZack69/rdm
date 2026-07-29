@@ -38,6 +38,12 @@
 //! directory behave identically instead of one of them nesting an extra level
 //! named after the share.
 //!
+//! One adjustment on top of that, for rsync parity: if every file in the share
+//! lives under a single folder and the destination directory is *already* that
+//! folder by name, the level is dropped rather than repeated. `rsync
+//! host:/Music/ ~/Music` fills `~/Music`, not `~/Music/Music`. See
+//! [`collapse_shared_root`].
+//!
 //! ## Path safety
 //!
 //! Directory structure is reconstructed by walking `p` (parent) pointers, so
@@ -306,6 +312,47 @@ fn join_path(base: &Path, components: &[String]) -> PathBuf {
     path
 }
 
+/// Drops the share's single top-level folder when the destination already *is*
+/// that folder, and reports its name if it did.
+///
+/// This is what makes `-o` behave the way `rsync host:/Music/ ~/Music` does:
+/// the contents line up with the destination instead of gaining a second
+/// `Music` inside it. Without it, pointing `-o` at a directory that already
+/// holds the share reads as an empty destination and re-downloads everything
+/// one level deeper.
+///
+/// Deliberately narrow, because the alternative is guessing at structure the
+/// user can see and this function cannot. All of these must hold:
+///
+/// * every file sits under the same single top-level folder,
+/// * so no file sits at the share root, and
+/// * the destination's own final component matches that folder's name exactly.
+///
+/// Exact match, not case-insensitive: a rule that fires differently depending
+/// on the filesystem is worse than one that occasionally does not fire.
+pub fn collapse_shared_root(base: &Path, entries: &mut [Entry]) -> Option<String> {
+    let candidate = entries.first()?.path.first()?.clone();
+
+    // `path.len() >= 2` is what distinguishes "under a folder" from "is a file
+    // at the share root", where path[0] is the filename itself.
+    if entries
+        .iter()
+        .any(|e| e.path.len() < 2 || e.path[0] != candidate)
+    {
+        return None;
+    }
+
+    if base.file_name()?.to_str()? != candidate {
+        return None;
+    }
+
+    for entry in entries.iter_mut() {
+        entry.path.remove(0);
+    }
+
+    Some(candidate)
+}
+
 /// Fetches and decrypts the node tree.
 pub async fn list_folder(client: &Client, link: &FolderLink) -> Result<Listing> {
     let share = decode_folder_key(&link.key)?;
@@ -476,6 +523,9 @@ pub struct FolderSummary {
     /// `(relative path, reason)` for each file that did not make it.
     pub failed: Vec<(String, String)>,
     pub cancelled: bool,
+    /// Folder name dropped from every path because the destination already was
+    /// that folder. Worth surfacing: it changes where files land.
+    pub collapsed: Option<String>,
 }
 
 /// Downloads every file in a folder share, one after another.
@@ -507,7 +557,7 @@ pub async fn download_folder(
     let listing = list_folder(&client, &link).await?;
 
     // A link that points at one node downloads that node, not the share.
-    let entries: Vec<Entry> = match link.node.as_deref() {
+    let mut entries: Vec<Entry> = match link.node.as_deref() {
         Some(node) => listing
             .entries
             .iter()
@@ -526,9 +576,12 @@ pub async fn download_folder(
         None => PathBuf::from(download_dir),
     };
 
+    let collapsed = collapse_shared_root(&base, &mut entries);
+
     let mut summary = FolderSummary {
         root: base.clone(),
         total: entries.len() + listing.undecryptable.len(),
+        collapsed,
         ..FolderSummary::default()
     };
 
@@ -628,6 +681,21 @@ mod tests {
         }
 
         URL_SAFE_NO_PAD.encode(&out)
+    }
+
+    /// An Entry with only the fields the path tests care about.
+    fn entry_at(path: &[&str]) -> Entry {
+        Entry {
+            handle: path.join("-"),
+            path: path.iter().map(|p| p.to_string()).collect(),
+            size: 1,
+            key: FileKey {
+                aes: [0u8; 16],
+                nonce: [0u8; 8],
+                meta_mac: [0u8; 8],
+            },
+            ancestors: Vec::new(),
+        }
     }
 
     #[test]
@@ -793,5 +861,86 @@ mod tests {
             &["Season 1".to_string(), "ep01.mkv".to_string()],
         );
         assert_eq!(path, PathBuf::from("/tmp/dl/Season 1/ep01.mkv"));
+    }
+
+    /// rsync parity: pointing -o at the folder itself fills that folder rather
+    /// than nesting a second copy of it inside.
+    #[test]
+    fn destination_named_after_the_folder_absorbs_it() {
+        let mut entries = vec![
+            entry_at(&["bakchodi", "one.jpg"]),
+            entry_at(&["bakchodi", "two.jpg"]),
+        ];
+
+        let collapsed = collapse_shared_root(Path::new("/home/zack/Downloads/bakchodi"), &mut entries);
+
+        assert_eq!(collapsed.as_deref(), Some("bakchodi"));
+        assert_eq!(entries[0].display_path(), "one.jpg");
+        assert_eq!(
+            join_path(Path::new("/home/zack/Downloads/bakchodi"), &entries[0].path),
+            PathBuf::from("/home/zack/Downloads/bakchodi/one.jpg")
+        );
+    }
+
+    /// A trailing separator must not change the answer, since `-o dir` and
+    /// `-o dir/` mean the same thing everywhere else.
+    #[test]
+    fn a_trailing_separator_does_not_hide_the_match() {
+        let mut entries = vec![entry_at(&["Music", "song.flac"])];
+        assert_eq!(
+            collapse_shared_root(Path::new("/home/zack/Music/"), &mut entries).as_deref(),
+            Some("Music")
+        );
+    }
+
+    #[test]
+    fn a_differently_named_destination_keeps_the_folder() {
+        let mut entries = vec![entry_at(&["bakchodi", "one.jpg"])];
+
+        assert!(collapse_shared_root(Path::new("/home/zack/Downloads"), &mut entries).is_none());
+        assert_eq!(entries[0].display_path(), "bakchodi/one.jpg");
+    }
+
+    /// Only a *single* shared top level can be absorbed. Two roots, or a file
+    /// sitting beside the folder, mean the destination is genuinely the parent
+    /// of both.
+    #[test]
+    fn mixed_levels_are_left_alone() {
+        let mut two_roots = vec![
+            entry_at(&["bakchodi", "one.jpg"]),
+            entry_at(&["other", "two.jpg"]),
+        ];
+        assert!(collapse_shared_root(Path::new("/dl/bakchodi"), &mut two_roots).is_none());
+
+        let mut root_file = vec![
+            entry_at(&["bakchodi", "one.jpg"]),
+            entry_at(&["loose.jpg"]),
+        ];
+        assert!(collapse_shared_root(Path::new("/dl/bakchodi"), &mut root_file).is_none());
+        assert_eq!(root_file[0].display_path(), "bakchodi/one.jpg");
+    }
+
+    /// A file at the share root is not "under a folder called <its own name>",
+    /// which a naive path[0] check would happily conclude.
+    #[test]
+    fn a_file_at_the_share_root_is_never_absorbed() {
+        let mut entries = vec![entry_at(&["song.flac"])];
+        assert!(collapse_shared_root(Path::new("/dl/song.flac"), &mut entries).is_none());
+        assert_eq!(entries[0].display_path(), "song.flac");
+    }
+
+    /// Deeper structure below the absorbed level is preserved.
+    #[test]
+    fn structure_below_the_absorbed_level_survives() {
+        let mut entries = vec![
+            entry_at(&["Music", "Album", "01.flac"]),
+            entry_at(&["Music", "Album", "02.flac"]),
+        ];
+
+        assert_eq!(
+            collapse_shared_root(Path::new("/home/zack/Music"), &mut entries).as_deref(),
+            Some("Music")
+        );
+        assert_eq!(entries[0].display_path(), "Album/01.flac");
     }
 }
