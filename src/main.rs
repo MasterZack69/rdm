@@ -52,6 +52,19 @@ fn main() -> Result<()> {
         }
 
         Some(Command::Sync { url, opts, parallel, delete, ext }) => {
+            // Sync mirrors a listing it can re-read on demand. A GoFile
+            // content id is an API handle behind a throwaway account, with no
+            // listing to diff and no per-file URLs to keep. Without this the
+            // link falls through to the scraper, which finds an empty
+            // JavaScript page and reports "no files found" \u{2014} an accusation
+            // against a link that is perfectly fine.
+            if gofile::is_gofile_url(&url) {
+                anyhow::bail!(
+                    "GoFile links cannot be synced \u{2014} run `rdm <gofile link>` instead; \
+                     rerunning it skips whatever is already on disk"
+                );
+            }
+
             let parallel = parallel.unwrap_or(cfg.queue_parallel);
             let ext_filter = normalize_extensions(&ext);
             let allow_private = opts.allow_private;
@@ -259,9 +272,11 @@ fn mega_folder_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) ->
 /// `rdm <gofile link>` \u{2014} resolve the content id and download everything behind
 /// it.
 ///
-/// Always a multi-file path, even for a single file: one content id can hold a
-/// whole tree and the link does not say which, so `-o` names a destination
-/// directory here rather than a filename \u{2014} the same deal as a MEGA share.
+/// `-o` names a destination directory here rather than a filename, the same
+/// deal as a MEGA share: one content id can hold a whole tree and the link
+/// does not say which, so there is nothing a single filename could reliably
+/// mean. Where an unqualified download lands is decided after the listing
+/// comes back \u{2014} see `gofile::destination_root`.
 fn gofile_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
     let url = url.trim().to_string();
     let options = gofile_options(cfg, opts);
@@ -853,6 +868,19 @@ mod tests {
     fn ordinary_links_are_not_sent_to_gofile() {
         assert!(!gofile::is_gofile_url("https://example.com/gofile.io/d/abc"));
         assert!(!gofile::is_gofile_url("https://example.com/song.flac"));
+    }
+
+    /// Sync has to refuse GoFile links for the same reason the scraper cannot
+    /// handle them: there is no listing page behind the link, only an API the
+    /// scraper knows nothing about. The refusal lives in the Sync arm, and
+    /// this pins the condition it turns on.
+    #[test]
+    fn sync_can_tell_a_gofile_link_from_a_listing() {
+        assert!(gofile::is_gofile_url("https://gofile.io/d/jWwmJp"));
+
+        // An ordinary listing must still reach sync untouched.
+        assert!(!gofile::is_gofile_url("https://example.com/music/"));
+        assert!(!gofile::is_gofile_url("https://example.com/d/jWwmJp"));
     }
 
     #[test]
