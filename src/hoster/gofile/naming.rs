@@ -87,13 +87,17 @@ mod tests {
 
     #[test]
     fn remote_names_cannot_escape_the_root() {
-        assert_eq!(sanitize("../../.bashrc"), "_.._.bashrc");
+        // Each separator becomes an underscore and the dots around it stay,
+        // so the two leading dots survive as dots: `../../.bashrc` is
+        // `..` `/` `..` `/` `.bashrc`.
+        assert_eq!(sanitize("../../.bashrc"), ".._.._.bashrc");
         assert_eq!(sanitize("a/b"), "a_b");
         assert_eq!(sanitize(".."), "download.bin");
         assert_eq!(sanitize("."), "download.bin");
         assert_eq!(sanitize("   "), "download.bin");
 
-        // Every sanitised name is a single path component.
+        // Every sanitised name is a single path component. This is the
+        // property that actually matters; the exact spelling above does not.
         for name in ["../../.bashrc", "a/b", "..", "x\\y"] {
             assert_eq!(Path::new(&sanitize(name)).components().count(), 1);
         }
