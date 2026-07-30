@@ -96,6 +96,33 @@ A few things worth knowing:
 - **If you hit the quota** (HTTP 509), rdm backs off and waits rather than failing. Connect a VPN and it notices the new IP and resumes early instead of sitting out the rest of the timer. Turn that off with `mega_resume_on_ip_change = false`.
 - **Folder links are not supported yet** — only `/file/` links. A folder link gets a clear error rather than a confusing one.
 
+## GoFile
+
+gofile.io links work the same way:
+
+```
+rdm 'https://gofile.io/d/AbCdEf'
+rdm 'https://gofile.io/d/AbCdEf' -o ~/Videos/thatshow -c 3
+```
+
+A GoFile link is not an address, it is a content id. rdm creates a throwaway guest account (the same thing your browser does when you open the page), asks the API what is behind the id, mirrors the folder tree locally and downloads the files.
+
+A few things worth knowing:
+
+- **`-o` is a directory, not a filename.** One content id can hold a single file or a hundred in nested folders, and the link does not say which. Without `-o` everything lands in `download_dir/<content id>` — the id, because GoFile's own folder name is usually the useless default `root`.
+- **`-c` sets how many files download at once**, not chunks per file. GoFile throttles per connection, so several files side by side is what actually goes faster. Capped at 10; the API gets unfriendly beyond that.
+- **Interrupted downloads resume.** Each file is written to `<name>.part` and only renamed once its full length has arrived, so a half-finished file never looks finished. Rerun the same link and it continues.
+- **Files already on disk are skipped**, so rerunning a link is cheap.
+- **Password-protected links** need `RDM_GOFILE_PASSWORD`. It is hashed before it leaves the process, and it lives in the environment rather than in a flag so it stays out of your shell history and out of `ps` for everyone else on the machine.
+
+  ```
+  RDM_GOFILE_PASSWORD='hunter2' rdm 'https://gofile.io/d/AbCdEf'
+  ```
+
+- **Got a GoFile account?** Put its token in `gofile_token`, or pass `RDM_GOFILE_TOKEN`, and your quota is used instead of a guest one. The environment wins over the config file.
+- **GoFile links cannot be queued.** One link is N files with no individual URLs to store, so `rdm queue add` refuses it. Run `rdm <link>` directly.
+- **No integrity check.** GoFile publishes no checksum, so a finished file is only verified against its advertised length. That catches a truncated download, not a corrupt one.
+
 # Example Config File
 
 ```
@@ -120,6 +147,13 @@ mega_verify_mac = true
 
 # MEGA: when quota-blocked, resume early if your public IP changes
 mega_resume_on_ip_change = true
+
+# GoFile: how many files to download at once (max 10)
+gofile_workers = 5
+
+# GoFile: your account token, if you have one. Empty means a guest account
+# is created per run, same as opening the link in a browser.
+gofile_token = ""
 ```
 
 Every key is optional — anything you leave out falls back to the default, and a config file written before these keys existed still loads.
@@ -150,3 +184,5 @@ cargo test
 ## Prior art
 
 [MegaBasterd](https://github.com/tonikelope/megabasterd) by tonikelope (GPLv3) — the MEGA support here is a clean-room Rust implementation, but MegaBasterd is where the non-obvious parts came from: that the 509 quota is per-IP rather than per-connection, that backoff should end early when your IP changes, that chunk workers must not share a keep-alive socket, and that a 403 means an expired temp URL rather than a missing file. Years of bug reports, distilled. No MegaBasterd code was copied.
+
+[gofile-downloader](https://github.com/ltsdw/gofile-downloader) by ltsdw — the GoFile support is a Rust port of its behaviour, and the parts that are not guessable from the API are all from there: the `X-Website-Token` recipe and its four-hour slot, that a guest account has to be created before anything can be listed, that the token belongs in both a header and a cookie, and that a `200` in reply to a `Range` request means the resume was refused rather than accepted.

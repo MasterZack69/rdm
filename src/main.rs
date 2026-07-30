@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use rdm::args::{
     Cli, ClearTarget, Command, DownloadOpts, QueueCommand, RetryTarget, normalize_extensions,
 };
+use rdm::hoster::gofile;
 use rdm::ui::{self, ProgressSink};
 use rdm::{config, engine, mega, queue, scrape, signal, sync};
 
@@ -33,6 +34,12 @@ fn main() -> Result<()> {
             // load-bearing and must reach the parser untouched.
             if mega::is_mega_url(&url) {
                 return mega_route(&cfg, &url, &opts);
+            }
+
+            // Likewise for GoFile: `/d/<id>` is an API handle, not a path, and
+            // normalising it as one would corrupt the content id.
+            if gofile::is_gofile_url(&url) {
+                return gofile_download(&cfg, &url, &opts);
             }
 
             let url = engine::normalize_download_url(&url);
@@ -112,6 +119,16 @@ fn quick_download(
             eprintln!("  \u{26a0} -p applies to directory listings; MEGA uses mega_workers.");
         }
         return mega_route(cfg, url, opts);
+    }
+
+    // GoFile falls into exactly the same trap: `/d/AbCdEf` has no extension,
+    // so the listing heuristic below claims it and the scraper finds an empty
+    // JavaScript page.
+    if gofile::is_gofile_url(url) {
+        if parallel.is_some() && !opts.quiet {
+            eprintln!("  \u{26a0} -p applies to directory listings; GoFile uses gofile_workers.");
+        }
+        return gofile_download(cfg, url, opts);
     }
 
     let url = engine::normalize_download_url(url);
@@ -239,6 +256,42 @@ fn mega_folder_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) ->
     })
 }
 
+/// `rdm <gofile link>` \u{2014} resolve the content id and download everything behind
+/// it.
+///
+/// Always a multi-file path, even for a single file: one content id can hold a
+/// whole tree and the link does not say which, so `-o` names a destination
+/// directory here rather than a filename \u{2014} the same deal as a MEGA share.
+fn gofile_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    let url = url.trim().to_string();
+    let options = gofile_options(cfg, opts);
+    let quiet = opts.quiet;
+
+    let output = opts.output.as_deref().map(|o| {
+        let trimmed = o.trim_end_matches('/').trim_end_matches("\\\\");
+        resolve_relative_to_config(trimmed, cfg)
+    });
+    let download_dir = cfg.download_dir.clone();
+
+    run_async(|cancel| async move {
+        let client = reqwest::Client::new();
+
+        let summary = gofile::download(
+            client,
+            &url,
+            output,
+            &download_dir,
+            options,
+            cancel,
+            quiet,
+        )
+        .await?;
+
+        report_gofile(&summary, quiet);
+        Ok(())
+    })
+}
+
 fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
     match command {
         QueueCommand::Add { url, opts } => queue_add(cfg, &url, &opts),
@@ -327,6 +380,14 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
     if mega::folder::is_folder_link(url) {
         anyhow::bail!(
             "MEGA folder links cannot be queued \u{2014} run `rdm <folder link>` to download the whole share"
+        );
+    }
+
+    // Same reasoning for GoFile, which has no single-file link shape at all:
+    // every content id is a potential tree.
+    if gofile::is_gofile_url(url) {
+        anyhow::bail!(
+            "GoFile links cannot be queued \u{2014} run `rdm <gofile link>` to download the whole content"
         );
     }
 
@@ -458,6 +519,30 @@ fn mega_options(cfg: &config::Config, opts: &DownloadOpts) -> mega::MegaOptions 
     }
 }
 
+/// `-c` means files in flight here, not chunks per file \u{2014} GoFile rate-limits
+/// per connection, so splitting one file gains nothing.
+///
+/// The password and account token come from the environment rather than flags:
+/// a password on the command line ends up in shell history and in `ps` output
+/// for every other user on the machine.
+fn gofile_options(cfg: &config::Config, opts: &DownloadOpts) -> gofile::GofileOptions {
+    gofile::GofileOptions {
+        workers: opts.connections.unwrap_or(cfg.gofile_workers),
+        max_retries: cfg.max_retries,
+        password: std::env::var("RDM_GOFILE_PASSWORD")
+            .ok()
+            .filter(|p| !p.trim().is_empty()),
+        token: std::env::var("RDM_GOFILE_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| {
+                let configured = cfg.gofile_token.trim();
+                (!configured.is_empty()).then(|| configured.to_string())
+            }),
+        overwrite: false,
+    }
+}
+
 fn report_mega(outcome: &mega::MegaOutcome, quiet: bool) {
     if quiet {
         return;
@@ -500,6 +585,40 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
         eprintln!("      straight in rather than into a second '{folder}' inside it)");
     }
 
+    eprintln!(
+        "     {} of {} file(s), {}",
+        summary.completed,
+        summary.total,
+        ui::format_size(summary.bytes)
+    );
+
+    if summary.skipped > 0 {
+        eprintln!("     {} already on disk", summary.skipped);
+    }
+
+    if !summary.failed.is_empty() {
+        eprintln!();
+        eprintln!("  \u{26a0} {} file(s) failed:", summary.failed.len());
+        for (path, reason) in &summary.failed {
+            eprintln!("     - {path}: {reason}");
+        }
+    }
+
+    if summary.cancelled {
+        eprintln!();
+        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
+    }
+}
+
+/// Same shape as the MEGA folder report, for the same reason: one dead file in
+/// a content id does not make the other forty a failure.
+fn report_gofile(summary: &gofile::GofileSummary, quiet: bool) {
+    if quiet {
+        return;
+    }
+
+    eprintln!();
+    eprintln!("  \u{1f4c1} {}", summary.root.display());
     eprintln!(
         "     {} of {} file(s), {}",
         summary.completed,
@@ -713,5 +832,67 @@ mod tests {
             ..DownloadOpts::default()
         };
         assert_eq!(mega_options(&cfg, &opts).workers, 3);
+    }
+
+    // -- GoFile routing --
+
+    /// Exactly the MEGA trap again: `/d/AbCdEf` has no extension and is short
+    /// enough not to read as an opaque id, so the heuristic calls it a
+    /// listing. Hence the GoFile check sitting above it.
+    #[test]
+    fn gofile_links_would_be_mistaken_for_listings() {
+        let link = "https://gofile.io/d/AbCdEf";
+        assert!(gofile::is_gofile_url(link));
+        assert!(
+            looks_like_directory(link),
+            "if this ever stops being true the ordering comment above is stale, not wrong"
+        );
+    }
+
+    #[test]
+    fn ordinary_links_are_not_sent_to_gofile() {
+        assert!(!gofile::is_gofile_url("https://example.com/gofile.io/d/abc"));
+        assert!(!gofile::is_gofile_url("https://example.com/song.flac"));
+    }
+
+    #[test]
+    fn gofile_workers_come_from_connections_then_config() {
+        let cfg = config::Config::default();
+
+        let defaults = gofile_options(&cfg, &DownloadOpts::default());
+        assert_eq!(defaults.workers, cfg.gofile_workers);
+        assert_eq!(defaults.max_retries, cfg.max_retries);
+        assert!(!defaults.overwrite);
+
+        let opts = DownloadOpts {
+            connections: Some(2),
+            ..DownloadOpts::default()
+        };
+        assert_eq!(gofile_options(&cfg, &opts).workers, 2);
+    }
+
+    /// A configured token is used when the environment does not override it.
+    /// The environment variable itself is left alone here: tests share a
+    /// process, and setting it would leak into every other test.
+    #[test]
+    fn a_configured_account_token_is_picked_up() {
+        let cfg = config::Config {
+            gofile_token: "tok-from-config".to_string(),
+            ..config::Config::default()
+        };
+
+        if std::env::var("RDM_GOFILE_TOKEN").is_err() {
+            let options = gofile_options(&cfg, &DownloadOpts::default());
+            assert_eq!(options.token.as_deref(), Some("tok-from-config"));
+        }
+
+        // A blank token means "guest", not an empty bearer header.
+        let blank = config::Config {
+            gofile_token: "   ".to_string(),
+            ..config::Config::default()
+        };
+        if std::env::var("RDM_GOFILE_TOKEN").is_err() {
+            assert!(gofile_options(&blank, &DownloadOpts::default()).token.is_none());
+        }
     }
 }
