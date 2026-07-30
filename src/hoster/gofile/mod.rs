@@ -26,9 +26,9 @@
 //! ## Shape of a download
 //!
 //! One content id can be a single file or a whole tree of folders, and that is
-//! not knowable from the link, so a GoFile download always behaves like a
-//! folder download: walk the tree, mirror it under one root directory, then
-//! fetch the files concurrently.
+//! not knowable from the link, so a GoFile download always walks the tree
+//! first and only then decides where to put things. Where that is depends on
+//! what came back — see [`destination_root`].
 //!
 //! Per file: `.part` temp file, `Range` resume, a status-code check that
 //! refuses to treat a `200` as a resumed `206`, and a size comparison before
@@ -238,10 +238,9 @@ struct Session {
 
 /// Downloads everything behind a GoFile link.
 ///
-/// `output` names the destination directory. Without it, files land in
-/// `download_dir/<content id>` — the content id is the only name a link is
-/// guaranteed to have, and the folder name the API reports is often the
-/// useless default `root`.
+/// `output`, when given, is the directory everything is written into. Without
+/// it the destination depends on what the link turns out to hold — see
+/// [`destination_root`].
 ///
 /// `client` is used only to open the session; the transfers run on a second
 /// client that carries the account token by default, so the token cannot leak
@@ -260,11 +259,6 @@ pub async fn download(
 
     let session = open_session(client, &options).await?;
 
-    let root = match output {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(download_dir).join(&link.content_id),
-    };
-
     let files = list_content(&session, &link, &options).await?;
 
     if files.is_empty() {
@@ -273,6 +267,10 @@ pub async fn download(
             link.content_id
         );
     }
+
+    // Deliberately after the listing: whether a wrapper directory is wanted at
+    // all depends on how many files came back.
+    let root = destination_root(output, download_dir, &link.content_id, &files);
 
     fs::create_dir_all(&root)
         .await
@@ -372,6 +370,41 @@ pub async fn download(
         failed: failed.into_inner().unwrap_or_else(|e| e.into_inner()),
         cancelled: cancelled.load(Ordering::Relaxed),
     })
+}
+
+/// Where a content id's files should be written.
+///
+/// A single loose file gets no folder of its own: `~/Downloads/thing.zip`, not
+/// `~/Downloads/AbCdEf/thing.zip`. The wrapper exists to stop a forty-file
+/// content id scattering itself across the download directory, and with one
+/// file there is nothing to keep together — only a directory named after an id
+/// that means nothing to anyone.
+///
+/// Everything else keeps the wrapper, including a single file that the
+/// uploader already put inside a folder: that structure is information, and
+/// flattening it would throw the information away.
+///
+/// An explicit `-o` always wins and is always a directory. The shape of the
+/// content is not known until the listing has been fetched, so a flag that
+/// sometimes meant a filename would be decided by the contents of somebody
+/// else's upload.
+fn destination_root(
+    output: Option<String>,
+    download_dir: &str,
+    content_id: &str,
+    files: &[RemoteFile],
+) -> PathBuf {
+    if let Some(dir) = output {
+        return PathBuf::from(dir);
+    }
+
+    let lone_file = files.len() == 1 && files[0].relative.components().count() == 1;
+
+    if lone_file {
+        PathBuf::from(download_dir)
+    } else {
+        PathBuf::from(download_dir).join(content_id)
+    }
 }
 
 // ── Session ──────────────────────────────────────────────
@@ -940,6 +973,65 @@ mod tests {
         assert!(parse_link("https://gofile.io/d/").is_err());
         assert!(parse_link("https://gofile.io/uploadFiles").is_err());
         assert!(parse_link("https://example.com/d/AbCdEf").is_err());
+    }
+
+    // ── Where files land ──
+
+    fn file_at(relative: &str) -> RemoteFile {
+        RemoteFile {
+            relative: PathBuf::from(relative),
+            name: relative.rsplit('/').next().unwrap_or(relative).to_string(),
+            link: "https://store1.gofile.io/download/x".to_string(),
+            size: 0,
+        }
+    }
+
+    /// The whole point of the rule: `~/Downloads/thing.zip`, not
+    /// `~/Downloads/zp3Wzv/thing.zip`.
+    #[test]
+    fn a_lone_file_gets_no_folder_of_its_own() {
+        let files = vec![file_at("thing.zip")];
+        assert_eq!(
+            destination_root(None, "/dl", "AbCdEf", &files),
+            PathBuf::from("/dl")
+        );
+    }
+
+    /// Several loose files still need somewhere to go, or they end up strewn
+    /// across the download directory with nothing tying them together.
+    #[test]
+    fn several_files_keep_the_content_id_folder() {
+        let files = vec![file_at("a.zip"), file_at("b.zip")];
+        assert_eq!(
+            destination_root(None, "/dl", "AbCdEf", &files),
+            PathBuf::from("/dl/AbCdEf")
+        );
+    }
+
+    /// One file, but the uploader put it in a folder. That structure is
+    /// information, so it is kept rather than flattened away.
+    #[test]
+    fn a_single_nested_file_keeps_the_wrapper() {
+        let files = vec![file_at("season 1/ep1.mkv")];
+        assert_eq!(
+            destination_root(None, "/dl", "AbCdEf", &files),
+            PathBuf::from("/dl/AbCdEf")
+        );
+    }
+
+    #[test]
+    fn an_explicit_output_wins_whatever_the_shape() {
+        let one = vec![file_at("thing.zip")];
+        let many = vec![file_at("a.zip"), file_at("b.zip")];
+
+        assert_eq!(
+            destination_root(Some("/here".to_string()), "/dl", "AbCdEf", &one),
+            PathBuf::from("/here")
+        );
+        assert_eq!(
+            destination_root(Some("/here".to_string()), "/dl", "AbCdEf", &many),
+            PathBuf::from("/here")
+        );
     }
 
     // ── Website token ──
