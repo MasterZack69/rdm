@@ -109,7 +109,9 @@ A GoFile link is not an address, it is a content id. rdm creates a throwaway gue
 
 A few things worth knowing:
 
-- **`-o` is a directory, not a filename.** One content id can hold a single file or a hundred in nested folders, and the link does not say which. Without `-o` everything lands in `download_dir/<content id>` — the id, because GoFile's own folder name is usually the useless default `root`.
+- **A single file lands straight in `download_dir`.** No wrapper folder: a one-file link gives you `~/Downloads/thatfile.zip`, not `~/Downloads/AbCdEf/thatfile.zip`.
+- **Anything else goes in `download_dir/<content id>`** — several files, or one file the uploader already put in a folder. The alternative is forty loose files strewn across your download directory with nothing tying them together. The content id is used as the name because GoFile's own top-level folder is usually the useless default `root`.
+- **`-o` is always a directory, never a filename**, whichever of those two cases you land in. One content id can hold a single file or a hundred in nested folders and the link does not say which, so a flag that sometimes meant a filename would be decided by somebody else's upload.
 - **`-c` sets how many files download at once**, not chunks per file. GoFile throttles per connection, so several files side by side is what actually goes faster. Capped at 10; the API gets unfriendly beyond that.
 - **Interrupted downloads resume.** Each file is written to `<name>.part` and only renamed once its full length has arrived, so a half-finished file never looks finished. Rerun the same link and it continues.
 - **Files already on disk are skipped**, so rerunning a link is cheap.
