@@ -1030,6 +1030,6 @@ mod tests {
         assert!(options.password.is_none());
         assert!(options.token.is_none());
         assert!(!options.overwrite);
-        assert!(WORKERS_DEFAULT <= WORKERS_MAX);
+        const { assert!(WORKERS_DEFAULT <= WORKERS_MAX); }
     }
 }
