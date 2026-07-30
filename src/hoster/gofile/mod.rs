@@ -42,6 +42,7 @@
 //! throughput by running several files at once instead. `-c` therefore means
 //! "files in flight" here, in the same way it means "workers" for MEGA.
 
+mod naming;
 mod sha256;
 
 use std::collections::HashMap;
@@ -63,6 +64,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::ui::{self, Board, ProgressSink, SlotState};
+use naming::unique_path;
 
 /// GoFile's public API root.
 const API_BASE: &str = "https://api.gofile.io";
@@ -86,7 +88,7 @@ pub const WORKERS_DEFAULT: usize = 5;
 /// ten for the same reason: the API starts refusing a starved account.
 const WORKERS_MAX: usize = 10;
 
-// ── Link handling ──────────────────────────────────────────────────
+// ── Link handling ─────────────────────────────────────────
 
 /// A parsed GoFile link.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,7 +153,7 @@ pub fn parse_link(url: &str) -> Result<GofileLink> {
     })
 }
 
-// ── Options and results ────────────────────────────────────────────
+// ── Options and results ───────────────────────────────────
 
 /// Knobs for a GoFile download.
 #[derive(Debug, Clone)]
@@ -232,7 +234,7 @@ struct Session {
     user_agent: String,
 }
 
-// ── Entry point ────────────────────────────────────────────────────
+// ── Entry point ─────────────────────────────────────────
 
 /// Downloads everything behind a GoFile link.
 ///
@@ -372,7 +374,7 @@ pub async fn download(
     })
 }
 
-// ── Session ────────────────────────────────────────────────────────
+// ── Session ──────────────────────────────────────────────
 
 /// The rotating `X-Website-Token`.
 ///
@@ -497,7 +499,7 @@ async fn backoff(attempt: u32) {
     tokio::time::sleep(Duration::from_millis(millis)).await;
 }
 
-// ── Content tree ───────────────────────────────────────────────────
+// ── Content tree ──────────────────────────────────────────
 
 /// Walks the content tree and returns every file in it, with the local path it
 /// should be written to.
@@ -640,71 +642,7 @@ fn push_file(
     });
 }
 
-/// Strips anything that would let a remote name escape the download root.
-///
-/// Names come from whoever made the upload, so `../../.bashrc` is a name we
-/// have to assume we will eventually be handed.
-fn sanitize(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| match c {
-            '/' | '\\\\' => '_',
-            c if (c as u32) < 0x20 => '_',
-            c => c,
-        })
-        .collect();
-    let cleaned = cleaned.trim().trim_matches('.').trim().to_string();
-
-    if cleaned.is_empty() {
-        "download.bin".to_string()
-    } else {
-        cleaned
-    }
-}
-
-/// Gives every discovered name a path of its own.
-///
-/// GoFile happily holds two files called `video.mp4` in one folder; a
-/// filesystem does not, and the second one silently overwriting the first is
-/// the worst possible outcome. Repeats become `video(1).mp4`, mirroring the
-/// reference downloader.
-fn unique_path(
-    taken: &mut HashMap<PathBuf, usize>,
-    parent: &Path,
-    name: &str,
-    is_dir: bool,
-) -> PathBuf {
-    let candidate = parent.join(sanitize(name));
-
-    let seen = taken.entry(candidate.clone()).or_insert(0);
-    let index = *seen;
-    *seen += 1;
-
-    if index == 0 {
-        return candidate;
-    }
-
-    let renamed = if is_dir {
-        format!(
-            "{}({index})",
-            candidate.file_name().unwrap_or_default().to_string_lossy()
-        )
-    } else {
-        let stem = candidate
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        match candidate.extension() {
-            Some(extension) => format!("{stem}({index}).{}", extension.to_string_lossy()),
-            None => format!("{stem}({index})"),
-        }
-    };
-
-    parent.join(renamed)
-}
-
-// ── File transfer ──────────────────────────────────────────────────
+// ── File transfer ─────────────────────────────────────────
 
 async fn download_file(
     session: &Session,
@@ -978,66 +916,6 @@ mod tests {
             format!("Mozilla/5.0::en-US::abc::{slot}::{WEBSITE_TOKEN_SALT}").as_bytes(),
         );
         assert_eq!(actual, expected);
-    }
-
-    // ── Naming ──
-
-    #[test]
-    fn remote_names_cannot_escape_the_root() {
-        assert_eq!(sanitize("../../.bashrc"), "_.._bashrc");
-        assert_eq!(sanitize(".."), "download.bin");
-        assert_eq!(sanitize("   "), "download.bin");
-        assert_eq!(sanitize("a/b"), "a_b");
-        assert_eq!(sanitize("normal name.mkv"), "normal name.mkv");
-    }
-
-    #[test]
-    fn duplicate_names_get_a_suffix_instead_of_overwriting() {
-        let mut taken = HashMap::new();
-        let root = Path::new("");
-
-        assert_eq!(
-            unique_path(&mut taken, root, "video.mp4", false),
-            PathBuf::from("video.mp4")
-        );
-        assert_eq!(
-            unique_path(&mut taken, root, "video.mp4", false),
-            PathBuf::from("video(1).mp4")
-        );
-        assert_eq!(
-            unique_path(&mut taken, root, "video.mp4", false),
-            PathBuf::from("video(2).mp4")
-        );
-
-        // Directories keep the whole name; only files split off an extension.
-        assert_eq!(
-            unique_path(&mut taken, root, "season.1", true),
-            PathBuf::from("season.1")
-        );
-        assert_eq!(
-            unique_path(&mut taken, root, "season.1", true),
-            PathBuf::from("season.1(1)")
-        );
-
-        // Same name in different folders is not a collision.
-        assert_eq!(
-            unique_path(&mut taken, Path::new("sub"), "video.mp4", false),
-            PathBuf::from("sub/video.mp4")
-        );
-    }
-
-    #[test]
-    fn extensionless_files_still_get_a_suffix() {
-        let mut taken = HashMap::new();
-        let root = Path::new("");
-        assert_eq!(
-            unique_path(&mut taken, root, "README", false),
-            PathBuf::from("README")
-        );
-        assert_eq!(
-            unique_path(&mut taken, root, "README", false),
-            PathBuf::from("README(1)")
-        );
     }
 
     // ── Response validation ──
