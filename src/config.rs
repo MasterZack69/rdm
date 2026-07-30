@@ -28,10 +28,28 @@ pub struct Config {
     /// VPN. Turn this off on NAT-behind-NAT setups where detection misfires.
     #[serde(default = "default_true")]
     pub mega_resume_on_ip_change: bool,
+
+    /// How many GoFile files to download at once.
+    ///
+    /// Files, not chunks: GoFile rate-limits per connection, so throughput
+    /// comes from running several files side by side rather than splitting
+    /// one.
+    #[serde(default = "default_gofile_workers")]
+    pub gofile_workers: usize,
+
+    /// A GoFile account token, for people who have an account and want their
+    /// quota rather than a throwaway guest one. Empty means "create a guest
+    /// account per run", which is what the website does for visitors.
+    #[serde(default)]
+    pub gofile_token: String,
 }
 
 fn default_mega_workers() -> usize {
     crate::mega::WORKERS_DEFAULT
+}
+
+fn default_gofile_workers() -> usize {
+    crate::hoster::gofile::WORKERS_DEFAULT
 }
 
 fn default_true() -> bool {
@@ -54,6 +72,8 @@ impl Default for Config {
             mega_workers: default_mega_workers(),
             mega_verify_mac: true,
             mega_resume_on_ip_change: true,
+            gofile_workers: default_gofile_workers(),
+            gofile_token: String::new(),
         }
     }
 }
@@ -112,6 +132,17 @@ impl Config {
         eprintln!("  MEGA slots : {}", self.mega_workers);
         eprintln!("  MEGA verify: {}", self.mega_verify_mac);
         eprintln!("  MEGA VPN   : {}", self.mega_resume_on_ip_change);
+        eprintln!("  GoFile     : {} file(s) at a time", self.gofile_workers);
+        // Never print the token itself: config output gets pasted into bug
+        // reports.
+        eprintln!(
+            "  GoFile acct: {}",
+            if self.gofile_token.trim().is_empty() {
+                "guest"
+            } else {
+                "account token set"
+            }
+        );
     }
 }
 
@@ -119,8 +150,8 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// A 0.2.1 config file has none of the mega_* keys. It must still load,
-    /// keeping the values the user did set.
+    /// A 0.2.1 config file has none of the mega_* or gofile_* keys. It must
+    /// still load, keeping the values the user did set.
     #[test]
     fn older_config_files_still_parse() {
         let old = r#"
@@ -137,6 +168,11 @@ queue_parallel = 5
         assert_eq!(cfg.mega_workers, crate::mega::WORKERS_DEFAULT);
         assert!(cfg.mega_verify_mac);
         assert!(cfg.mega_resume_on_ip_change);
+        assert_eq!(
+            cfg.gofile_workers,
+            crate::hoster::gofile::WORKERS_DEFAULT
+        );
+        assert!(cfg.gofile_token.is_empty());
     }
 
     #[test]
@@ -150,5 +186,18 @@ queue_parallel = 5
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.mega_workers, 12);
         assert!(!back.mega_verify_mac);
+    }
+
+    #[test]
+    fn gofile_settings_round_trip() {
+        let cfg = Config {
+            gofile_workers: 3,
+            gofile_token: "abc123".to_string(),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.gofile_workers, 3);
+        assert_eq!(back.gofile_token, "abc123");
     }
 }
