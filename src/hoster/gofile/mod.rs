@@ -54,8 +54,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{StreamExt, stream};
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_RANGE, COOKIE, HeaderMap, HeaderValue, ORIGIN,
-    RANGE, REFERER, USER_AGENT,
+    ACCEPT, AUTHORIZATION, CONTENT_RANGE, COOKIE, HeaderMap, HeaderValue, ORIGIN, RANGE, REFERER,
+    USER_AGENT,
 };
 use reqwest::{Client, Response, StatusCode};
 use serde_json::Value;
@@ -403,7 +403,13 @@ async fn open_session(client: Client, options: &GofileOptions) -> Result<Session
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_str(&user_agent)?);
     headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
-    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+    // Deliberately no `Accept-Encoding: gzip`, even though the reference
+    // downloader sends one. Python's requests decompresses transparently;
+    // reqwest only does so for encodings it negotiated itself, and only with
+    // the matching cargo feature enabled. Asking by hand means the compressed
+    // bytes arrive as an opaque blob and every JSON parse dies at byte one.
+    // Letting reqwest decide costs a little bandwidth on API replies and
+    // nothing at all on file transfers, which are already compressed.
     headers.insert(ORIGIN, HeaderValue::from_static("https://gofile.io"));
     headers.insert(REFERER, HeaderValue::from_static("https://gofile.io/"));
     headers.insert(
@@ -468,6 +474,35 @@ async fn create_guest_account(
         .context("GoFile refused to hand out an account token"))
 }
 
+/// A gzip stream starts with these two bytes.
+///
+/// Worth naming: if a compressed body ever reaches the parser again, the
+/// error should say so outright instead of blaming the JSON.
+fn looks_gzipped(body: &[u8]) -> bool {
+    body.starts_with(&[0x1f, 0x8b])
+}
+
+/// The first couple of hundred bytes of a body, flattened onto one line.
+///
+/// A bare `expected value at line 1 column 1` says only that the body was not
+/// JSON — not whether it was HTML, a Cloudflare interstitial, or an empty
+/// response. Showing the start of it turns a guessing game into a glance.
+fn snippet(body: &[u8]) -> String {
+    const MAX: usize = 200;
+
+    let head = &body[..body.len().min(MAX)];
+    let flattened = String::from_utf8_lossy(head)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if body.len() > MAX {
+        format!("{flattened}…")
+    } else {
+        flattened
+    }
+}
+
 /// Unwraps the `{ "status": "ok", "data": … }` envelope every endpoint uses.
 ///
 /// A GoFile error is an HTTP 200 with `status: "error-notFound"` in the body,
@@ -475,16 +510,31 @@ async fn create_guest_account(
 async fn unwrap_envelope(response: Response) -> Result<Value> {
     let status = response.status();
     let body = response
-        .text()
+        .bytes()
         .await
         .context("the GoFile API response could not be read")?;
 
     if !status.is_success() {
-        bail!("the GoFile API answered HTTP {status}");
+        bail!("the GoFile API answered HTTP {status}: {}", snippet(&body));
     }
 
-    let parsed: Value =
-        serde_json::from_str(&body).context("the GoFile API answered with something that is not JSON")?;
+    if looks_gzipped(&body) {
+        bail!(
+            "the GoFile API answered with a compressed body this build cannot decode — \
+             an Accept-Encoding header is being sent without the matching reqwest feature"
+        );
+    }
+
+    if body.is_empty() {
+        bail!("the GoFile API answered with an empty body");
+    }
+
+    let parsed: Value = serde_json::from_slice(&body).with_context(|| {
+        format!(
+            "the GoFile API answered with something that is not JSON: {}",
+            snippet(&body)
+        )
+    })?;
 
     match parsed.get("status").and_then(Value::as_str) {
         Some("ok") => Ok(parsed.get("data").cloned().unwrap_or(Value::Null)),
@@ -916,6 +966,37 @@ mod tests {
             format!("Mozilla/5.0::en-US::abc::{slot}::{WEBSITE_TOKEN_SALT}").as_bytes(),
         );
         assert_eq!(actual, expected);
+    }
+
+    // ── Response bodies ──
+
+    /// The failure this replaced said only "expected value at line 1 column
+    /// 1", which is true of every non-JSON body ever sent.
+    #[test]
+    fn a_compressed_body_is_named_rather_than_blamed_on_json() {
+        assert!(looks_gzipped(&[0x1f, 0x8b, 0x08, 0x00]));
+        assert!(!looks_gzipped(b"{\"status\":\"ok\"}"));
+        assert!(!looks_gzipped(b""));
+        assert!(!looks_gzipped(&[0x1f]));
+    }
+
+    #[test]
+    fn body_snippets_are_short_and_single_line() {
+        assert_eq!(
+            snippet(b"<html>\n  <body>nope</body>\n</html>"),
+            "<html> <body>nope</body> </html>"
+        );
+        assert_eq!(snippet(b""), "");
+
+        let long = vec![b'x'; 500];
+        let shortened = snippet(&long);
+        assert!(shortened.ends_with('…'));
+        assert_eq!(shortened.chars().count(), 201);
+
+        // Cutting mid-character must not panic.
+        let mut multibyte = "é".repeat(300).into_bytes();
+        multibyte.truncate(401);
+        let _ = snippet(&multibyte);
     }
 
     // ── Response validation ──
