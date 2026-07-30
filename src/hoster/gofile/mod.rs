@@ -64,7 +64,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::ui::{self, Board, ProgressSink, SlotState};
-use naming::unique_path;
+use naming::{sanitize, unique_path};
 
 /// GoFile's public API root.
 const API_BASE: &str = "https://api.gofile.io";
@@ -215,6 +215,14 @@ struct RemoteFile {
     size: u64,
 }
 
+/// The result of walking a content id.
+struct Listing {
+    files: Vec<RemoteFile>,
+    /// What GoFile calls the top-level folder, unsanitised and quite possibly
+    /// useless. [`folder_label`] decides whether it is worth using.
+    root_name: Option<String>,
+}
+
 enum FileOutcome {
     Completed(u64),
     Skipped,
@@ -259,7 +267,8 @@ pub async fn download(
 
     let session = open_session(client, &options).await?;
 
-    let files = list_content(&session, &link, &options).await?;
+    let listing = list_content(&session, &link, &options).await?;
+    let files = listing.files;
 
     if files.is_empty() {
         bail!(
@@ -268,9 +277,15 @@ pub async fn download(
         );
     }
 
-    // Deliberately after the listing: whether a wrapper directory is wanted at
-    // all depends on how many files came back.
-    let root = destination_root(output, download_dir, &link.content_id, &files);
+    // Deliberately after the listing: both whether a wrapper directory is
+    // wanted and what it should be called depend on what came back.
+    let root = destination_root(
+        output,
+        download_dir,
+        &link.content_id,
+        listing.root_name.as_deref(),
+        &files,
+    );
 
     fs::create_dir_all(&root)
         .await
@@ -392,6 +407,7 @@ fn destination_root(
     output: Option<String>,
     download_dir: &str,
     content_id: &str,
+    root_name: Option<&str>,
     files: &[RemoteFile],
 ) -> PathBuf {
     if let Some(dir) = output {
@@ -403,7 +419,38 @@ fn destination_root(
     if lone_file {
         PathBuf::from(download_dir)
     } else {
-        PathBuf::from(download_dir).join(content_id)
+        PathBuf::from(download_dir).join(folder_label(root_name, content_id))
+    }
+}
+
+/// What to call the directory a content id is downloaded into.
+///
+/// The uploader's own folder name, when there is one worth using:
+/// `~/Downloads/bakchodi` rather than `~/Downloads/jWwmJp`. GoFile fills the
+/// field in by itself when nobody named the folder, and the values it picks
+/// — the default `root`, or the content id repeated back — say nothing the
+/// path does not already say, so the id is used instead.
+///
+/// The name is sanitised like any other remote name. A folder called
+/// `../../etc` is somebody else's idea of a joke, and it comes out as a single
+/// harmless path component.
+fn folder_label(root_name: Option<&str>, content_id: &str) -> String {
+    let Some(name) = root_name else {
+        return content_id.to_string();
+    };
+
+    let cleaned = sanitize(name);
+
+    // `download.bin` is what sanitize returns for a name with nothing usable
+    // left in it, and it would be a bizarre thing to call a directory.
+    let useless = cleaned.eq_ignore_ascii_case("root")
+        || cleaned.eq_ignore_ascii_case(content_id)
+        || cleaned == "download.bin";
+
+    if useless {
+        content_id.to_string()
+    } else {
+        cleaned
     }
 }
 
@@ -593,13 +640,14 @@ async fn list_content(
     session: &Session,
     link: &GofileLink,
     options: &GofileOptions,
-) -> Result<Vec<RemoteFile>> {
+) -> Result<Listing> {
     let password = options
         .password
         .as_deref()
         .map(|password| sha256::hex(password.as_bytes()));
 
     let mut files: Vec<RemoteFile> = Vec::new();
+    let mut root_name: Option<String> = None;
     let mut taken: HashMap<PathBuf, usize> = HashMap::new();
     let mut stack: Vec<(String, PathBuf)> = vec![(link.content_id.clone(), PathBuf::new())];
 
@@ -619,6 +667,17 @@ async fn list_content(
         if data.get("type").and_then(Value::as_str) != Some("folder") {
             push_file(&data, &parent, &mut files, &mut taken);
             continue;
+        }
+
+        // The name of the folder the link points at, which is the one name in
+        // the tree that has nowhere else to be recorded: every nested folder
+        // becomes a directory as it is walked, but the root only exists as
+        // whatever we decide to call the download directory.
+        if content_id == link.content_id {
+            root_name = data
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string);
         }
 
         let Some(children) = data.get("children").and_then(Value::as_object) else {
@@ -646,7 +705,7 @@ async fn list_content(
         }
     }
 
-    Ok(files)
+    Ok(Listing { files, root_name })
 }
 
 async fn fetch_content(
@@ -986,13 +1045,19 @@ mod tests {
         }
     }
 
-    /// The whole point of the rule: `~/Downloads/thing.zip`, not
-    /// `~/Downloads/zp3Wzv/thing.zip`.
+    /// `~/Downloads/thing.zip`, not `~/Downloads/zp3Wzv/thing.zip`.
     #[test]
     fn a_lone_file_gets_no_folder_of_its_own() {
         let files = vec![file_at("thing.zip")];
         assert_eq!(
-            destination_root(None, "/dl", "AbCdEf", &files),
+            destination_root(None, "/dl", "AbCdEf", None, &files),
+            PathBuf::from("/dl")
+        );
+
+        // Not even when the folder it sits in has a name: there is one file,
+        // and its own name is the only one that matters.
+        assert_eq!(
+            destination_root(None, "/dl", "AbCdEf", Some("bakchodi"), &files),
             PathBuf::from("/dl")
         );
     }
@@ -1000,10 +1065,10 @@ mod tests {
     /// Several loose files still need somewhere to go, or they end up strewn
     /// across the download directory with nothing tying them together.
     #[test]
-    fn several_files_keep_the_content_id_folder() {
+    fn several_files_keep_a_folder() {
         let files = vec![file_at("a.zip"), file_at("b.zip")];
         assert_eq!(
-            destination_root(None, "/dl", "AbCdEf", &files),
+            destination_root(None, "/dl", "AbCdEf", None, &files),
             PathBuf::from("/dl/AbCdEf")
         );
     }
@@ -1014,7 +1079,7 @@ mod tests {
     fn a_single_nested_file_keeps_the_wrapper() {
         let files = vec![file_at("season 1/ep1.mkv")];
         assert_eq!(
-            destination_root(None, "/dl", "AbCdEf", &files),
+            destination_root(None, "/dl", "AbCdEf", None, &files),
             PathBuf::from("/dl/AbCdEf")
         );
     }
@@ -1025,13 +1090,58 @@ mod tests {
         let many = vec![file_at("a.zip"), file_at("b.zip")];
 
         assert_eq!(
-            destination_root(Some("/here".to_string()), "/dl", "AbCdEf", &one),
+            destination_root(Some("/here".to_string()), "/dl", "AbCdEf", None, &one),
             PathBuf::from("/here")
         );
         assert_eq!(
-            destination_root(Some("/here".to_string()), "/dl", "AbCdEf", &many),
+            destination_root(
+                Some("/here".to_string()),
+                "/dl",
+                "AbCdEf",
+                Some("bakchodi"),
+                &many
+            ),
             PathBuf::from("/here")
         );
+    }
+
+    // ── Folder naming ──
+
+    /// The bug: a folder called `bakchodi` downloaded into `jWwmJp` and the
+    /// name appeared nowhere on disk.
+    #[test]
+    fn the_uploaders_folder_name_is_used() {
+        let files = vec![file_at("a.zip"), file_at("b.zip")];
+        assert_eq!(
+            destination_root(None, "/dl", "jWwmJp", Some("bakchodi"), &files),
+            PathBuf::from("/dl/bakchodi")
+        );
+    }
+
+    /// GoFile names the folder itself when the uploader did not, and none of
+    /// the names it picks are worth having.
+    #[test]
+    fn names_that_say_nothing_fall_back_to_the_content_id() {
+        assert_eq!(folder_label(None, "jWwmJp"), "jWwmJp");
+        assert_eq!(folder_label(Some("root"), "jWwmJp"), "jWwmJp");
+        assert_eq!(folder_label(Some("Root"), "jWwmJp"), "jWwmJp");
+        assert_eq!(folder_label(Some("jWwmJp"), "jWwmJp"), "jWwmJp");
+        assert_eq!(folder_label(Some("   "), "jWwmJp"), "jWwmJp");
+        assert_eq!(folder_label(Some(""), "jWwmJp"), "jWwmJp");
+    }
+
+    /// A folder name is a remote name like any other, and remote names are
+    /// written by strangers.
+    #[test]
+    fn folder_names_cannot_escape_the_download_directory() {
+        for name in ["../../etc", "..", "/absolute", "a/b"] {
+            let label = folder_label(Some(name), "jWwmJp");
+            assert_eq!(
+                Path::new(&label).components().count(),
+                1,
+                "{name} produced {label}"
+            );
+        }
     }
 
     // ── Website token ──
