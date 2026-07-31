@@ -74,13 +74,10 @@ rdm queue clear [pending|done]           Clear queue (all by default)   [c]
 
 Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything it finds and starts downloading, and `rdm queue add <URL>` enqueues without starting.
 
-## MEGA
+## Hoster section
 
-mega.nz file links work anywhere a normal URL does. Details, gotchas and the under-the-hood explainer live in [extraInfo/mega.md](extraInfo/mega.md).
-
-## GoFile
-
-gofile.io links work the same way. Details, gotchas and the under-the-hood explainer live in [extraInfo/gofile.md](extraInfo/gofile.md).
+- [mega - click to view](extraInfo/mega.md)
+- [gofile - click to view](extraInfo/gofile.md)
 
 # Example Config File
 
@@ -137,7 +134,7 @@ cargo test
 - Claude Opus 4.6 - Wrote the code, fixed the bugs
 - GPT 5.2 - Asked “what if it races?” one too many times
 - Claude Opus 4.7 - Here to do everything better
-- Claude Opus 5 - Clap Migration & Queue System
+- Claude Opus 5 - Clap Migration, Queue System and Hosters
 - DeepSeek V4 Flash - Clippy error fixer
 
 ## Prior art
