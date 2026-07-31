@@ -76,55 +76,11 @@ Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything
 
 ## MEGA
 
-mega.nz file links work anywhere a normal URL does:
-
-```
-rdm 'https://mega.nz/file/AbCdEfGh#your-key-here'
-rdm queue add 'https://mega.nz/file/AbCdEfGh#your-key-here'
-```
-
-**Quote the link.** The `#` starts a comment in every shell you are likely to be using, and everything after it is the decryption key — an unquoted link silently becomes an unusable one.
-
-What happens under the hood: the key is unpacked from the fragment and never leaves your machine, MEGA hands out a short-lived temporary URL, the file is fetched in parallel chunks and decrypted as it streams to disk, and the result is checked against the MAC embedded in the link before the `.mctemp` file is renamed into place. A failed check is a failed download — you get an error, not a corrupt file.
-
-A few things worth knowing:
-
-- **You do not name the file.** The real filename is encrypted inside the link, so `-o` is optional and only needed to override it. Without `-o` the file lands in `download_dir` under its actual name.
-- **`-c` sets the number of chunk workers**, same as it sets connections everywhere else.
-- **Interrupted downloads resume.** Progress lives in `<file>.mctemp` plus a small sidecar; rerun the same command and it picks up where it stopped.
-- **Queued MEGA links run one at a time**, regardless of `-p`. MEGA's bandwidth quota is per-IP, so downloading three at once is not faster — it just hits the limit three times as often.
-- **If you hit the quota** (HTTP 509), rdm backs off and waits rather than failing. Connect a VPN and it notices the new IP and resumes early instead of sitting out the rest of the timer. Turn that off with `mega_resume_on_ip_change = false`.
-- **Folder links are not supported yet** — only `/file/` links. A folder link gets a clear error rather than a confusing one.
+mega.nz file links work anywhere a normal URL does. Details, gotchas and the under-the-hood explainer live in [extraInfo/mega.md](extraInfo/mega.md).
 
 ## GoFile
 
-gofile.io links work the same way:
-
-```
-rdm 'https://gofile.io/d/AbCdEf'
-rdm 'https://gofile.io/d/AbCdEf' -o ~/Videos/thatshow -c 3
-```
-
-A GoFile link is not an address, it is a content id. rdm creates a throwaway guest account (the same thing your browser does when you open the page), asks the API what is behind the id, mirrors the folder tree locally and downloads the files.
-
-A few things worth knowing:
-
-- **A single file lands straight in `download_dir`.** No wrapper folder: a one-file link gives you `~/Downloads/thatfile.zip`, not `~/Downloads/AbCdEf/thatfile.zip`.
-- **Anything else goes in a folder of its own** — several files, or one file the uploader already put in a folder. The alternative is forty loose files strewn across your download directory with nothing tying them together.
-- **That folder keeps the uploader's name for it**, so a link to a folder called `bakchodi` gives you `~/Downloads/bakchodi`. When nobody named it, GoFile fills the field in with the useless default `root` or with the content id, and in that case the content id is used: `~/Downloads/AbCdEf`.
-- **`-o` is always a directory, never a filename**, whichever of those cases you land in. One content id can hold a single file or a hundred in nested folders and the link does not say which, so a flag that sometimes meant a filename would be decided by somebody else's upload.
-- **`-c` sets how many files download at once**, not chunks per file. GoFile throttles per connection, so several files side by side is what actually goes faster. Capped at 10; the API gets unfriendly beyond that.
-- **Interrupted downloads resume.** Each file is written to `<name>.part` and only renamed once its full length has arrived, so a half-finished file never looks finished. Rerun the same link and it continues.
-- **Files already on disk are skipped**, so rerunning a link is cheap. This is also the closest thing to `sync` for GoFile — see below.
-- **Password-protected links** need `RDM_GOFILE_PASSWORD`. It is hashed before it leaves the process, and it lives in the environment rather than in a flag so it stays out of your shell history and out of `ps` for everyone else on the machine.
-
-  ```
-  RDM_GOFILE_PASSWORD='hunter2' rdm 'https://gofile.io/d/AbCdEf'
-  ```
-
-- **Got a GoFile account?** Put its token in `gofile_token`, or pass `RDM_GOFILE_TOKEN`, and your quota is used instead of a guest one. The environment wins over the config file.
-- **GoFile links cannot be queued or synced.** One link is N files with no individual URLs to store, so `rdm queue add` refuses it. `rdm sync` refuses it too: there is no listing page to re-read and diff, only an API. Run `rdm <link>` directly — rerunning it skips whatever is already on disk, which is most of what you wanted `sync` for.
-- **No integrity check.** GoFile publishes no checksum, so a finished file is only verified against its advertised length. That catches a truncated download, not a corrupt one.
+gofile.io links work the same way. Details, gotchas and the under-the-hood explainer live in [extraInfo/gofile.md](extraInfo/gofile.md).
 
 # Example Config File
 
