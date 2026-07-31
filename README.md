@@ -74,27 +74,10 @@ rdm queue clear [pending|done]           Clear queue (all by default)   [c]
 
 Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything it finds and starts downloading, and `rdm queue add <URL>` enqueues without starting.
 
-## MEGA
+## Hoster section
 
-mega.nz file links work anywhere a normal URL does:
-
-```
-rdm 'https://mega.nz/file/AbCdEfGh#your-key-here'
-rdm queue add 'https://mega.nz/file/AbCdEfGh#your-key-here'
-```
-
-**Quote the link.** The `#` starts a comment in every shell you are likely to be using, and everything after it is the decryption key — an unquoted link silently becomes an unusable one.
-
-What happens under the hood: the key is unpacked from the fragment and never leaves your machine, MEGA hands out a short-lived temporary URL, the file is fetched in parallel chunks and decrypted as it streams to disk, and the result is checked against the MAC embedded in the link before the `.mctemp` file is renamed into place. A failed check is a failed download — you get an error, not a corrupt file.
-
-A few things worth knowing:
-
-- **You do not name the file.** The real filename is encrypted inside the link, so `-o` is optional and only needed to override it. Without `-o` the file lands in `download_dir` under its actual name.
-- **`-c` sets the number of chunk workers**, same as it sets connections everywhere else.
-- **Interrupted downloads resume.** Progress lives in `<file>.mctemp` plus a small sidecar; rerun the same command and it picks up where it stopped.
-- **Queued MEGA links run one at a time**, regardless of `-p`. MEGA's bandwidth quota is per-IP, so downloading three at once is not faster — it just hits the limit three times as often.
-- **If you hit the quota** (HTTP 509), rdm backs off and waits rather than failing. Connect a VPN and it notices the new IP and resumes early instead of sitting out the rest of the timer. Turn that off with `mega_resume_on_ip_change = false`.
-- **Folder links are not supported yet** — only `/file/` links. A folder link gets a clear error rather than a confusing one.
+- [mega - click to view](extraInfo/mega.md)
+- [gofile - click to view](extraInfo/gofile.md)
 
 # Example Config File
 
@@ -120,6 +103,13 @@ mega_verify_mac = true
 
 # MEGA: when quota-blocked, resume early if your public IP changes
 mega_resume_on_ip_change = true
+
+# GoFile: how many files to download at once (max 10)
+gofile_workers = 5
+
+# GoFile: your account token, if you have one. Empty means a guest account
+# is created per run, same as opening the link in a browser.
+gofile_token = ""
 ```
 
 Every key is optional — anything you leave out falls back to the default, and a config file written before these keys existed still loads.
@@ -144,9 +134,11 @@ cargo test
 - Claude Opus 4.6 - Wrote the code, fixed the bugs
 - GPT 5.2 - Asked “what if it races?” one too many times
 - Claude Opus 4.7 - Here to do everything better
-- Claude Opus 5 - Clap Migration & Queue System
+- Claude Opus 5 - Clap Migration, Queue System and Hosters
 - DeepSeek V4 Flash - Clippy error fixer
 
 ## Prior art
 
 [MegaBasterd](https://github.com/tonikelope/megabasterd) by tonikelope (GPLv3) — the MEGA support here is a clean-room Rust implementation, but MegaBasterd is where the non-obvious parts came from: that the 509 quota is per-IP rather than per-connection, that backoff should end early when your IP changes, that chunk workers must not share a keep-alive socket, and that a 403 means an expired temp URL rather than a missing file. Years of bug reports, distilled. No MegaBasterd code was copied.
+
+[gofile-downloader](https://github.com/ltsdw/gofile-downloader) by ltsdw (GPLv3) — the GoFile support here is a clean-room Rust implementation, but gofile-downloader is where the non-obvious parts came from: the `X-Website-Token` recipe and the four-hour slot it is built from, that a guest account has to exist before anything can be listed at all, that the token has to travel as both an `Authorization` header and an `accountToken` cookie, that a `200` answering a `Range` request means the resume was refused rather than granted, and that GoFile's own top-level folder is usually named the useless default `root`. All of that is invisible in the API and obvious only after someone else has been bitten by it. No gofile-downloader code was copied.
