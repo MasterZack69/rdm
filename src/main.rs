@@ -203,7 +203,7 @@ fn mega_route(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()
 /// API round trip, its own chunk ladder and its own quota handling, and none
 /// of that belongs in the generic engine.
 fn mega_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
-    let url = url.trim().to_string();
+    let url = url.trim().to_owned();
     let (output, download_dir) = mega_destination(opts.output.clone(), cfg);
     let options = mega_options(cfg, opts);
     let quiet = opts.quiet;
@@ -212,7 +212,7 @@ fn mega_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result
     // the bar starts out labelled with the link's handle.
     let label = mega::parse_link(&url)
         .map(|link| link.handle)
-        .unwrap_or_else(|_| "mega".to_string());
+        .unwrap_or_else(|_| "mega".to_owned());
 
     run_async(|cancel| async move {
         let sink = progress_sink(quiet, &label);
@@ -239,7 +239,7 @@ fn mega_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result
 /// files and its own directory structure, so there is nothing sensible for a
 /// single output filename to mean.
 fn mega_folder_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
-    let url = url.trim().to_string();
+    let url = url.trim().to_owned();
     let options = mega_options(cfg, opts);
     let quiet = opts.quiet;
 
@@ -278,7 +278,7 @@ fn mega_folder_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) ->
 /// mean. Where an unqualified download lands is decided after the listing
 /// comes back \u{2014} see `gofile::destination_root`.
 fn gofile_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
-    let url = url.trim().to_string();
+    let url = url.trim().to_owned();
     let options = gofile_options(cfg, opts);
     let quiet = opts.quiet;
 
@@ -411,7 +411,7 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
     // The queue runner recognises them and dispatches to the MEGA downloader.
     let is_mega = mega::is_mega_url(url);
     let url = if is_mega {
-        url.trim().to_string()
+        url.trim().to_owned()
     } else {
         engine::normalize_download_url(url)
     };
@@ -452,7 +452,7 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
                 // Never echo the link back: the fragment is the decryption key.
                 mega::parse_link(&url)
                     .map(|link| format!("MEGA {}", link.handle))
-                    .unwrap_or_else(|_| "MEGA link".to_string())
+                    .unwrap_or_else(|_| "MEGA link".to_owned())
             } else {
                 engine::percent_decode(&url)
             };
@@ -509,7 +509,7 @@ fn mega_destination(output: Option<String>, cfg: &config::Config) -> (Option<Str
         Some(o) => {
             let path = Path::new(&o);
             if o.ends_with('/') || o.ends_with("\\\\") || path.is_dir() {
-                let dir = o.trim_end_matches('/').trim_end_matches("\\\\").to_string();
+                let dir = o.trim_end_matches('/').trim_end_matches("\\\\").to_owned();
                 (None, dir)
             } else {
                 (
@@ -552,7 +552,7 @@ fn gofile_options(cfg: &config::Config, opts: &DownloadOpts) -> gofile::GofileOp
             .filter(|t| !t.trim().is_empty())
             .or_else(|| {
                 let configured = cfg.gofile_token.trim();
-                (!configured.is_empty()).then(|| configured.to_string())
+                (!configured.is_empty()).then(|| configured.to_owned())
             }),
         overwrite: false,
     }
@@ -682,7 +682,7 @@ fn print_discovered(files: &[scrape::DiscoveredFile]) {
 /// Relative paths land under the configured download directory.
 fn resolve_output(output: Option<String>, url: &str, cfg: &config::Config) -> String {
     let filename_from_url = || -> String {
-        engine::extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
+        engine::extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_owned())
     };
 
     match output {
@@ -703,7 +703,7 @@ fn resolve_output(output: Option<String>, url: &str, cfg: &config::Config) -> St
 
 fn resolve_relative_to_config(output: &str, cfg: &config::Config) -> String {
     if Path::new(output).is_absolute() {
-        output.to_string()
+        output.to_owned()
     } else {
         cfg.resolve_output_path(output)
     }
@@ -824,12 +824,12 @@ mod tests {
         assert_eq!(dir, cfg.download_dir);
 
         // Directory-ish -o: same, but somewhere else.
-        let (output, dir) = mega_destination(Some("/data/mega/".to_string()), &cfg);
+        let (output, dir) = mega_destination(Some("/data/mega/".to_owned()), &cfg);
         assert_eq!(output, None);
         assert_eq!(dir, "/data/mega");
 
         // Concrete -o: the user's name wins.
-        let (output, _) = mega_destination(Some("/data/movie.mkv".to_string()), &cfg);
+        let (output, _) = mega_destination(Some("/data/movie.mkv".to_owned()), &cfg);
         assert_eq!(output.as_deref(), Some("/data/movie.mkv"));
     }
 
@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn a_configured_account_token_is_picked_up() {
         let cfg = config::Config {
-            gofile_token: "tok-from-config".to_string(),
+            gofile_token: "tok-from-config".to_owned(),
             ..config::Config::default()
         };
 
@@ -916,7 +916,7 @@ mod tests {
 
         // A blank token means "guest", not an empty bearer header.
         let blank = config::Config {
-            gofile_token: "   ".to_string(),
+            gofile_token: "   ".to_owned(),
             ..config::Config::default()
         };
         if std::env::var("RDM_GOFILE_TOKEN").is_err() {

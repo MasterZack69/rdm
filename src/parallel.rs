@@ -119,7 +119,7 @@ where
     let done_flag = Arc::new(AtomicBool::new(false));
 
     let autosave_handle = spawn_autosave(
-        meta_path.to_string(),
+        meta_path.to_owned(),
         Arc::clone(&shared_meta),
         chunk_counters
             .iter()
@@ -144,8 +144,8 @@ where
             let chunk = queue.pop_front().unwrap();
 
             let client = ctx.client.clone();
-            let url = ctx.url.to_string();
-            let path = temp_path.to_string();
+            let url = ctx.url.to_owned();
+            let path = temp_path.to_owned();
             let cancel = ctx.cancel.clone();
             let config = ctx.retry_config.clone();
             let chunk_progress = chunk_counters
@@ -239,9 +239,9 @@ async fn load_or_create_metadata(
         let _ = fs::remove_file(temp_path).await;
     }
 
-    let mut meta = resume::create_new(url.to_string(), file_size, chunks);
-    meta.etag = etag.map(|s| s.to_string());
-    meta.last_modified = last_modified.map(|s| s.to_string());
+    let mut meta = resume::create_new(url.to_owned(), file_size, chunks);
+    meta.etag = etag.map(|s| s.to_owned());
+    meta.last_modified = last_modified.map(|s| s.to_owned());
 
     resume::save_atomic(meta_path, &meta).await?;
 

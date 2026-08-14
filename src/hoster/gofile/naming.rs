@@ -27,12 +27,12 @@ pub fn sanitize(name: &str) -> String {
         })
         .collect();
 
-    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
+    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_owned();
 
     // `.` and `..` survive the pass above unscathed and both mean "a directory
     // that is not this one".
     if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-        return "download.bin".to_string();
+        return "download.bin".to_owned();
     }
 
     cleaned

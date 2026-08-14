@@ -143,7 +143,7 @@ pub fn clip(s: &str, max: usize) -> String {
         return String::new();
     }
     if display_width(s) <= max {
-        return s.to_string();
+        return s.to_owned();
     }
     let budget = max - 1; // room for the ellipsis
     let mut out = String::new();
@@ -169,7 +169,7 @@ pub fn ellipsize(s: &str, max: usize) -> String {
 fn pad(s: &str, width: usize) -> String {
     let len = display_width(s);
     if len >= width {
-        s.to_string()
+        s.to_owned()
     } else {
         format!("{}{}", s, " ".repeat(width - len))
     }
@@ -281,7 +281,7 @@ impl SoloBar {
     pub fn new(name: &str) -> Arc<Self> {
         Arc::new(Self {
             tty: is_tty(),
-            name: name.to_string(),
+            name: name.to_owned(),
             started: Instant::now(),
             total: AtomicU64::new(0),
             done: AtomicU64::new(0),
@@ -614,7 +614,7 @@ pub struct Board(Arc<BoardInner>);
 impl Board {
     pub fn new(title: &str, total_files: usize, lanes: usize) -> Self {
         Board(Arc::new(BoardInner {
-            title: title.to_string(),
+            title: title.to_owned(),
             tty: is_tty(),
             started: Instant::now(),
             lanes: Mutex::new((0..lanes.max(1)).map(|_| None).collect()),
@@ -662,7 +662,7 @@ impl Board {
     pub fn claim(&self, id: u64, name: &str) -> Option<Lane> {
         let slot = Arc::new(Slot {
             id,
-            name: name.to_string(),
+            name: name.to_owned(),
             board: Arc::downgrade(&self.0),
             started: Instant::now(),
             total: AtomicU64::new(0),
@@ -770,7 +770,7 @@ pub struct CountProgress {
 impl CountProgress {
     pub fn new(label: &str, total: usize) -> Self {
         Self {
-            label: label.to_string(),
+            label: label.to_owned(),
             total,
             done: AtomicUsize::new(0),
             started: Instant::now(),
@@ -957,7 +957,7 @@ fn compose(
     width: usize,
 ) -> String {
     let right = if done == 0 && state != SlotState::Downloading {
-        state.label().to_string()
+        state.label().to_owned()
     } else if total > 0 {
         let fraction = (done as f64 / total as f64).clamp(0.0, 1.0);
         let eta = match speed {
@@ -1034,7 +1034,7 @@ pub fn short_size(bytes: u64) -> String {
 pub fn short_speed(bps: Option<u64>) -> String {
     match bps {
         Some(b) if b > 0 => format!("{}/s", short_size(b)),
-        _ => "--".to_string(),
+        _ => "--".to_owned(),
     }
 }
 
@@ -1067,7 +1067,7 @@ pub fn format_size(bytes: u64) -> String {
 pub fn format_speed(bps: Option<u64>) -> String {
     match bps {
         Some(b) if b > 0 => format!("{}/s", format_size(b)),
-        _ => "--".to_string(),
+        _ => "--".to_owned(),
     }
 }
 
@@ -1086,7 +1086,7 @@ pub fn format_duration(secs: u64) -> String {
 pub fn format_eta(secs: Option<u64>) -> String {
     match secs {
         Some(s) => format!("ETA {}", short_duration(s)),
-        None => "ETA --".to_string(),
+        None => "ETA --".to_owned(),
     }
 }
 

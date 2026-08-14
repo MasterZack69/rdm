@@ -149,7 +149,7 @@ pub fn parse_link(url: &str) -> Result<GofileLink> {
     }
 
     Ok(GofileLink {
-        content_id: id.to_string(),
+        content_id: id.to_owned(),
     })
 }
 
@@ -436,7 +436,7 @@ fn destination_root(
 /// harmless path component.
 fn folder_label(root_name: Option<&str>, content_id: &str) -> String {
     let Some(name) = root_name else {
-        return content_id.to_string();
+        return content_id.to_owned();
     };
 
     let cleaned = sanitize(name);
@@ -448,7 +448,7 @@ fn folder_label(root_name: Option<&str>, content_id: &str) -> String {
         || cleaned == "download.bin";
 
     if useless {
-        content_id.to_string()
+        content_id.to_owned()
     } else {
         cleaned
     }
@@ -473,10 +473,10 @@ fn website_token(user_agent: &str, account_token: &str) -> String {
 }
 
 async fn open_session(client: Client, options: &GofileOptions) -> Result<Session> {
-    let user_agent = DEFAULT_USER_AGENT.to_string();
+    let user_agent = DEFAULT_USER_AGENT.to_owned();
 
     let token = match options.token.as_deref().map(str::trim) {
-        Some(token) if !token.is_empty() => token.to_string(),
+        Some(token) if !token.is_empty() => token.to_owned(),
         _ => create_guest_account(&client, &user_agent, options).await?,
     };
 
@@ -538,7 +538,7 @@ async fn create_guest_account(
         match response {
             Ok(response) => match unwrap_envelope(response).await {
                 Ok(data) => match data.get("token").and_then(Value::as_str) {
-                    Some(token) if !token.is_empty() => return Ok(token.to_string()),
+                    Some(token) if !token.is_empty() => return Ok(token.to_owned()),
                     _ => last = Some(anyhow!("the accounts endpoint returned no token")),
                 },
                 Err(error) => last = Some(error),
@@ -677,7 +677,7 @@ async fn list_content(
             root_name = data
                 .get("name")
                 .and_then(Value::as_str)
-                .map(str::to_string);
+                .map(str::to_owned);
         }
 
         let Some(children) = data.get("children").and_then(Value::as_object) else {
@@ -698,7 +698,7 @@ async fn list_content(
                 };
                 let name = child.get("name").and_then(Value::as_str).unwrap_or(id);
                 let dir = unique_path(&mut taken, &parent, name, true);
-                stack.push((id.to_string(), dir));
+                stack.push((id.to_owned(), dir));
             } else {
                 push_file(child, &parent, &mut files, &mut taken);
             }
@@ -774,12 +774,12 @@ fn push_file(
     let leaf = relative
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| name.to_string());
+        .unwrap_or_else(|| name.to_owned());
 
     files.push(RemoteFile {
         relative,
         name: leaf,
-        link: link.to_string(),
+        link: link.to_owned(),
         size,
     });
 }
@@ -1039,8 +1039,8 @@ mod tests {
     fn file_at(relative: &str) -> RemoteFile {
         RemoteFile {
             relative: PathBuf::from(relative),
-            name: relative.rsplit('/').next().unwrap_or(relative).to_string(),
-            link: "https://store1.gofile.io/download/x".to_string(),
+            name: relative.rsplit('/').next().unwrap_or(relative).to_owned(),
+            link: "https://store1.gofile.io/download/x".to_owned(),
             size: 0,
         }
     }
@@ -1090,12 +1090,12 @@ mod tests {
         let many = vec![file_at("a.zip"), file_at("b.zip")];
 
         assert_eq!(
-            destination_root(Some("/here".to_string()), "/dl", "AbCdEf", None, &one),
+            destination_root(Some("/here".to_owned()), "/dl", "AbCdEf", None, &one),
             PathBuf::from("/here")
         );
         assert_eq!(
             destination_root(
-                Some("/here".to_string()),
+                Some("/here".to_owned()),
                 "/dl",
                 "AbCdEf",
                 Some("bakchodi"),

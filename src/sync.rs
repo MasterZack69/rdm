@@ -803,7 +803,7 @@ fn local_path(cfg: &Config, relative: &str) -> PathBuf {
 }
 
 fn extract_filename(path: &str) -> String {
-    path.rsplit('/').next().unwrap_or(path).to_string()
+    path.rsplit('/').next().unwrap_or(path).to_owned()
 }
 
 fn file_has_ext(filename: &str, exts: &HashSet<String>) -> bool {
@@ -1016,7 +1016,7 @@ mod tests {
     #[test]
     fn relative_components_join_in_order() {
         assert_eq!(
-            join_relative(Path::new("/tmp/dl"), &["a".to_string(), "b.jpg".to_string()]),
+            join_relative(Path::new("/tmp/dl"), &["a".to_owned(), "b.jpg".to_owned()]),
             PathBuf::from("/tmp/dl/a/b.jpg")
         );
     }

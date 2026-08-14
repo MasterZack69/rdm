@@ -183,15 +183,14 @@ pub fn parse_link(url: &str) -> Result<MegaLink> {
         bail!("Unrecognised MEGA link shape: {url}");
     };
 
-    let handle = handle.trim().to_string();
+    let handle = handle.trim().to_owned();
     // A trailing query or fragment on the key is common when links are pasted
     // out of a browser address bar.
     let key = key
         .split(['?', '&', '/'])
         .next()
         .unwrap_or("")
-        .trim()
-        .to_string();
+        .trim().to_owned();
 
     if handle.is_empty() || key.is_empty() {
         bail!("MEGA link is missing its handle or key");
@@ -748,7 +747,7 @@ pub(crate) fn decrypt_attributes(at: &str, aes: &[u8; 16]) -> Option<String> {
     let text = text.trim_end_matches('\0');
     let json_part = text.strip_prefix("MEGA")?;
     let value: serde_json::Value = serde_json::from_str(json_part.trim()).ok()?;
-    let name = value.get("n")?.as_str()?.to_string();
+    let name = value.get("n")?.as_str()?.to_owned();
     Some(sanitize_filename(&name))
 }
 
@@ -782,7 +781,7 @@ pub fn sanitize_filename(name: &str) -> String {
         .collect();
 
     if cleaned.is_empty() {
-        "mega-download".to_string()
+        "mega-download".to_owned()
     } else {
         cleaned
     }
@@ -813,7 +812,7 @@ pub struct ResumeState {
 impl ResumeState {
     fn fresh(handle: &str, size: u64, target: u64) -> Self {
         Self {
-            handle: handle.to_string(),
+            handle: handle.to_owned(),
             size,
             target,
             done: BTreeSet::new(),
@@ -975,7 +974,7 @@ async fn public_ip(client: &Client) -> Option<String> {
         .await
         .ok()?;
     let text = response.text().await.ok()?;
-    let text = text.trim().to_string();
+    let text = text.trim().to_owned();
     (!text.is_empty()).then_some(text)
 }
 
@@ -1303,7 +1302,7 @@ pub(crate) async fn run_download(
     let shared = Arc::new(Shared {
         api,
         client,
-        handle: handle.to_string(),
+        handle: handle.to_owned(),
         folder,
         key: key.clone(),
         size: info.size,
