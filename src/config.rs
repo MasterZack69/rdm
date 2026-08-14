@@ -114,7 +114,7 @@ impl Config {
     pub fn resolve_output_path(&self, filename: &str) -> String {
         let path = std::path::Path::new(filename);
         if path.is_absolute() {
-            filename.to_string()
+            filename.to_owned()
         } else {
             PathBuf::from(&self.download_dir)
                 .join(filename)
@@ -192,7 +192,7 @@ queue_parallel = 5
     fn gofile_settings_round_trip() {
         let cfg = Config {
             gofile_workers: 3,
-            gofile_token: "abc123".to_string(),
+            gofile_token: "abc123".to_owned(),
             ..Default::default()
         };
         let text = toml::to_string_pretty(&cfg).unwrap();

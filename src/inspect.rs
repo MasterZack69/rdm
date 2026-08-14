@@ -35,7 +35,7 @@ fn filename_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Op
         let name = name.split(';').next().unwrap_or(name).trim();
         let name = name.trim_matches('"');
         if !name.is_empty() {
-            return Some(name.to_string());
+            return Some(name.to_owned());
         }
     }
 
@@ -45,13 +45,13 @@ fn filename_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Op
 fn extract_etag(headers: &header::HeaderMap) -> Option<String> {
     headers.get(header::ETAG)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+        .map(|s| s.to_owned())
 }
 
 fn extract_last_modified(headers: &header::HeaderMap) -> Option<String> {
     headers.get(header::LAST_MODIFIED)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+        .map(|s| s.to_owned())
 }
 
 pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
