@@ -73,7 +73,7 @@ impl Item {
         if self.is_mega() {
             return mega::parse_link(&self.url)
                 .map(|link| format!("MEGA {}", link.handle))
-                .unwrap_or_else(|_| "MEGA link".to_string());
+                .unwrap_or_else(|_| "MEGA link".to_owned());
         }
 
         let raw = self
@@ -526,7 +526,7 @@ impl Queue {
 
             let size = match item.size {
                 Some(b) if b > 0 => ui::format_size(b),
-                _ => "\u{2014}".to_string(),
+                _ => "\u{2014}".to_owned(),
             };
 
             eprintln!(
@@ -573,7 +573,7 @@ impl Queue {
 fn pad_display(s: &str, width: usize) -> String {
     let len = s.chars().count();
     if len >= width {
-        s.to_string()
+        s.to_owned()
     } else {
         format!("{}{}", s, " ".repeat(width - len))
     }
@@ -589,7 +589,7 @@ pub fn send_signal(sig: &str) -> Result<()> {
 fn read_signal() -> Option<String> {
     fs::read_to_string(signal_file())
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
 }
 
@@ -1036,7 +1036,7 @@ mod tests {
     fn queue_with(urls: &[&str]) -> Queue {
         let mut q = Queue::default();
         for url in urls {
-            q.add((*url).to_string(), None, None);
+            q.add((*url).to_owned(), None, None);
         }
         q
     }

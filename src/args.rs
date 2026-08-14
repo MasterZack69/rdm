@@ -227,11 +227,11 @@ pub fn parse_url(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
 
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return Ok(trimmed.to_string());
+        return Ok(trimmed.to_owned());
     }
 
     if trimmed.is_empty() {
-        return Err("URL must not be empty".to_string());
+        return Err("URL must not be empty".to_owned());
     }
 
     // Concatenated rather than formatted: the suggestion must come out as a
@@ -548,7 +548,7 @@ mod tests {
                 assert_eq!(opts.connections, Some(8));
                 assert_eq!(parallel, Some(4));
                 assert!(delete);
-                assert_eq!(ext, vec!["flac".to_string(), "mkv".to_string()]);
+                assert_eq!(ext, vec!["flac".to_owned(), "mkv".to_owned()]);
             }
             other => panic!("expected sync, got {other:?}"),
         }
@@ -561,7 +561,7 @@ mod tests {
             Some(Command::Sync { parallel, delete, ext, .. }) => {
                 assert_eq!(parallel, Some(2));
                 assert!(delete);
-                assert_eq!(ext, vec!["mkv".to_string()]);
+                assert_eq!(ext, vec!["mkv".to_owned()]);
             }
             other => panic!("expected sync, got {other:?}"),
         }
@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn extensions_are_normalised() {
-        let raw = vec![".FLAC".to_string(), " mkv ".to_string()];
+        let raw = vec![".FLAC".to_owned(), " mkv ".to_owned()];
         let set = normalize_extensions(&raw).expect("expected a filter");
         assert_eq!(set.len(), 2);
         assert!(set.contains("flac"));
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn extensions_split_on_commas_and_dedupe() {
-        let raw = vec!["flac,mkv".to_string(), "FLAC".to_string()];
+        let raw = vec!["flac,mkv".to_owned(), "FLAC".to_owned()];
         let set = normalize_extensions(&raw).expect("expected a filter");
         assert_eq!(set.len(), 2);
     }
@@ -757,8 +757,8 @@ mod tests {
     #[test]
     fn empty_extensions_mean_no_filter() {
         assert_eq!(normalize_extensions(&[]), None);
-        assert_eq!(normalize_extensions(&[" ".to_string()]), None);
-        assert_eq!(normalize_extensions(&[",".to_string(), ".".to_string()]), None);
+        assert_eq!(normalize_extensions(&[" ".to_owned()]), None);
+        assert_eq!(normalize_extensions(&[",".to_owned(), ".".to_owned()]), None);
     }
 
     #[test]

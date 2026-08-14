@@ -324,9 +324,9 @@ pub async fn run_download(
 ) -> Result<()> {
     let name = output
         .clone()
-        .map(|o| o.rsplit('/').next().unwrap_or(&o).to_string())
+        .map(|o| o.rsplit('/').next().unwrap_or(&o).to_owned())
         .or_else(|| extract_filename_from_url(&url))
-        .unwrap_or_else(|| "download".to_string());
+        .unwrap_or_else(|| "download".to_owned());
 
     let bar = if quiet {
         None
@@ -529,12 +529,12 @@ pub async fn resolve_existing_output(
     use std::io::{BufRead, IsTerminal, Write};
 
     if !std::path::Path::new(path).exists() {
-        return Ok(OutputDecision::Use(path.to_string()));
+        return Ok(OutputDecision::Use(path.to_owned()));
     }
 
     let part_path = format!("{}.part", path);
     if std::path::Path::new(&part_path).exists() {
-        return Ok(OutputDecision::Use(path.to_string()));
+        return Ok(OutputDecision::Use(path.to_owned()));
     }
 
     let meta_path = crate::resume::ResumeMetadata::meta_path(path);
@@ -549,7 +549,7 @@ pub async fn resolve_existing_output(
             })
             .collect();
         if crate::resume::validate_against(&meta, url, meta.file_size, &chunks) {
-            return Ok(OutputDecision::Use(path.to_string()));
+            return Ok(OutputDecision::Use(path.to_owned()));
         }
     }
 
@@ -560,7 +560,7 @@ pub async fn resolve_existing_output(
             let _ = std::fs::remove_file(path);
             let _ = std::fs::remove_file(&part_path);
             let _ = std::fs::remove_file(&meta_path);
-            return Ok(OutputDecision::Use(path.to_string()));
+            return Ok(OutputDecision::Use(path.to_owned()));
         }
         ExistingPolicy::Ask => {}
     }
@@ -594,7 +594,7 @@ pub async fn resolve_existing_output(
                 let _ = std::fs::remove_file(path);
                 let _ = std::fs::remove_file(&part_path);
                 let _ = std::fs::remove_file(&meta_path);
-                return Ok(OutputDecision::Use(path.to_string()));
+                return Ok(OutputDecision::Use(path.to_owned()));
             }
             "2" => loop {
                 eprint!("  New filename: ");
@@ -607,7 +607,7 @@ pub async fn resolve_existing_output(
                     continue;
                 }
                 let new_path = if parent.as_os_str().is_empty() {
-                    trimmed.to_string()
+                    trimmed.to_owned()
                 } else {
                     parent.join(trimmed).to_string_lossy().to_string()
                 };
@@ -621,9 +621,9 @@ pub async fn resolve_existing_output(
 
 fn resolve_output_path(url: &str, output: Option<&str>) -> String {
     if let Some(provided) = output {
-        return provided.to_string();
+        return provided.to_owned();
     }
-    extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
+    extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_owned())
 }
 
 pub fn extract_filename_from_url(url: &str) -> Option<String> {
@@ -636,40 +636,40 @@ pub fn extract_filename_from_url(url: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed == "/" {
         return None;
     }
-    Some(trimmed.to_string())
+    Some(trimmed.to_owned())
 }
 
 pub fn normalize_download_url(url: &str) -> String {
     let Ok(mut parsed) = reqwest::Url::parse(url) else {
-        return url.to_string();
+        return url.to_owned();
     };
 
     let Some(fragment) = parsed.fragment() else {
-        return url.to_string();
+        return url.to_owned();
     };
 
     let route = fragment.split('?').next().unwrap_or(fragment);
-    let route = route.trim_start_matches('/').to_string();
+    let route = route.trim_start_matches('/').to_owned();
     let mut route_segments = route.split('/');
     if route_segments.next() != Some("download") {
-        return url.to_string();
+        return url.to_owned();
     }
 
     let rest: Vec<String> = route_segments
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(str::to_owned)
         .collect();
     let Some(last) = rest.last() else {
-        return url.to_string();
+        return url.to_owned();
     };
     if !last.contains('.') {
-        return url.to_string();
+        return url.to_owned();
     }
 
     parsed.set_fragment(None);
     parsed.set_query(None);
 
-    let mut base_dir = parsed.path().to_string();
+    let mut base_dir = parsed.path().to_owned();
     if !base_dir.ends_with('/') {
         if let Some(pos) = base_dir.rfind('/') {
             base_dir.truncate(pos + 1);
@@ -713,7 +713,7 @@ pub fn percent_decode(input: &str) -> String {
             bytes.push(b);
         }
     }
-    String::from_utf8(bytes).unwrap_or_else(|_| input.to_string())
+    String::from_utf8(bytes).unwrap_or_else(|_| input.to_owned())
 }
 
 fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {

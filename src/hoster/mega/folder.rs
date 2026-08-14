@@ -125,19 +125,19 @@ pub fn parse_folder_link(url: &str) -> Result<FolderLink> {
     let key = parts.next().unwrap_or("").trim();
     let node = match (parts.next(), parts.next()) {
         (Some("file"), Some(node)) | (Some("folder"), Some(node)) => {
-            Some(node.trim().to_string())
+            Some(node.trim().to_owned())
         }
         _ => None,
     };
 
-    let handle = handle.trim().to_string();
+    let handle = handle.trim().to_owned();
     if handle.is_empty() || key.is_empty() {
         bail!("MEGA folder link is missing its handle or key");
     }
 
     Ok(FolderLink {
         handle,
-        key: key.to_string(),
+        key: key.to_owned(),
         node: node.filter(|n| !n.is_empty()),
     })
 }
@@ -590,7 +590,7 @@ pub async fn download_folder(
     for handle in &listing.undecryptable {
         summary.failed.push((
             handle.clone(),
-            "no key in this share link opens this node".to_string(),
+            "no key in this share link opens this node".to_owned(),
         ));
     }
 
@@ -822,10 +822,10 @@ mod tests {
         let path = join_path(
             base,
             &[
-                "..".to_string(),
-                "safe".to_string(),
-                "../../etc".to_string(),
-                "passwd".to_string(),
+                "..".to_owned(),
+                "safe".to_owned(),
+                "../../etc".to_owned(),
+                "passwd".to_owned(),
             ],
         );
 
@@ -845,11 +845,11 @@ mod tests {
         let base = Path::new("/home/zack/test");
 
         assert_eq!(
-            join_path(base, &["bakchodi".to_string(), "one.jpg".to_string()]),
+            join_path(base, &["bakchodi".to_owned(), "one.jpg".to_owned()]),
             PathBuf::from("/home/zack/test/bakchodi/one.jpg")
         );
         assert_eq!(
-            join_path(base, &["two.jpg".to_string()]),
+            join_path(base, &["two.jpg".to_owned()]),
             PathBuf::from("/home/zack/test/two.jpg")
         );
     }
@@ -858,7 +858,7 @@ mod tests {
     fn nested_paths_are_joined_in_order() {
         let path = join_path(
             Path::new("/tmp/dl"),
-            &["Season 1".to_string(), "ep01.mkv".to_string()],
+            &["Season 1".to_owned(), "ep01.mkv".to_owned()],
         );
         assert_eq!(path, PathBuf::from("/tmp/dl/Season 1/ep01.mkv"));
     }

@@ -72,7 +72,7 @@ pub async fn discover_files(
 
     let folder_name = derive_folder_name(&base_url);
 
-    let base_str = base_url.as_str().to_string();
+    let base_str = base_url.as_str().to_owned();
 
     let mut files: Vec<DiscoveredFile> = Vec::new();
     let mut seen_files: HashSet<String> = HashSet::new();
@@ -92,7 +92,7 @@ pub async fn discover_files(
             if depth > MAX_DEPTH {
                 continue;
             }
-            let key = dir_url.as_str().to_string();
+            let key = dir_url.as_str().to_owned();
             if !visited.insert(key) {
                 continue;
             }
@@ -155,7 +155,7 @@ pub async fn discover_files(
                 }
 
                 let raw_relative = match file_url.strip_prefix(&base_str) {
-                    Some(s) => s.to_string(),
+                    Some(s) => s.to_owned(),
                     None => continue,
                 };
 
@@ -192,7 +192,7 @@ pub async fn discover_files(
             }
 
             for sub in found_dirs {
-                let k = sub.as_str().to_string();
+                let k = sub.as_str().to_owned();
                 if !visited.contains(&k) && next_seen.insert(k) {
                     next_level.push((sub, depth + 1));
                 }
@@ -287,11 +287,11 @@ fn derive_folder_name(base: &Url) -> String {
     let path = base.path().trim_end_matches('/');
     let last = path.rsplit('/').next().unwrap_or("");
     let candidate = if last.is_empty() {
-        base.host_str().unwrap_or("download").to_string()
+        base.host_str().unwrap_or("download").to_owned()
     } else {
         engine::percent_decode(last)
     };
-    sanitize_path_component(&candidate).unwrap_or_else(|| "download".to_string())
+    sanitize_path_component(&candidate).unwrap_or_else(|| "download".to_owned())
 }
 
 fn directory_label(base: &Url, dir: &Url) -> String {
@@ -303,9 +303,9 @@ fn directory_label(base: &Url, dir: &Url) -> String {
     let trimmed = decoded.trim_end_matches('/');
     let last = trimmed.rsplit('/').next().unwrap_or("");
     if last.is_empty() {
-        dir.as_str().to_string()
+        dir.as_str().to_owned()
     } else {
-        last.to_string()
+        last.to_owned()
     }
 }
 
@@ -351,7 +351,7 @@ fn sanitize_relative_path(raw: &str) -> Option<String> {
         if stripped.is_empty() {
             return None;
         }
-        clean.push(comp.to_string());
+        clean.push(comp.to_owned());
     }
     if clean.is_empty() {
         None
@@ -498,12 +498,12 @@ fn parse_links(html: &str, page_url: &Url, base: &Url) -> (Vec<String>, Vec<Url>
         }
 
         if resolved.path().ends_with('/') {
-            let key = resolved.as_str().to_string();
+            let key = resolved.as_str().to_owned();
             if seen_dirs.insert(key) {
                 dirs.push(resolved);
             }
         } else {
-            let s = resolved.as_str().to_string();
+            let s = resolved.as_str().to_owned();
             if seen_files.insert(s.clone()) {
                 files.push(s);
             }
@@ -651,7 +651,7 @@ fn extract_hrefs(html: &str) -> Vec<String> {
                     (&bytes[start..j], j)
                 };
                 let s = match std::str::from_utf8(val_bytes) {
-                    Ok(s) => s.to_string(),
+                    Ok(s) => s.to_owned(),
                     Err(_) => String::from_utf8_lossy(val_bytes).into_owned(),
                 };
                 hrefs.push(s);
@@ -756,8 +756,8 @@ mod tests {
         let page = u("http://x.com/root/");
         let (files, dirs) = parse_links(html, &page, &page);
         assert_eq!(files, vec![
-            "http://x.com/root/movie.mkv".to_string(),
-            "http://x.com/root/photo.png".to_string(),
+            "http://x.com/root/movie.mkv".to_owned(),
+            "http://x.com/root/photo.png".to_owned(),
         ]);
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0].as_str(), "http://x.com/root/subdir/");
@@ -772,7 +772,7 @@ mod tests {
         "#;
         let page = u("http://x.com/a/b/");
         let (files, dirs) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/a/b/file.mp4".to_string()]);
+        assert_eq!(files, vec!["http://x.com/a/b/file.mp4".to_owned()]);
         assert_eq!(dirs[0].as_str(), "http://x.com/a/b/deep/");
     }
 
@@ -784,7 +784,7 @@ mod tests {
         "#;
         let page = u("http://safe.com/d/");
         let (files, _) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://safe.com/d/good.zip".to_string()]);
+        assert_eq!(files, vec!["http://safe.com/d/good.zip".to_owned()]);
     }
 
     #[test]
@@ -792,7 +792,7 @@ mod tests {
         let html = r#"<a href="/files/sub/">sub</a><a href="/files/a.mkv">a</a>"#;
         let page = u("http://x.com/files/");
         let (files, dirs) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/files/a.mkv".to_string()]);
+        assert_eq!(files, vec!["http://x.com/files/a.mkv".to_owned()]);
         assert_eq!(dirs[0].as_str(), "http://x.com/files/sub/");
     }
 
@@ -801,7 +801,7 @@ mod tests {
         let html = r#"<a href="/other/secret.zip">bad</a><a href="good.zip">good</a>"#;
         let page = u("http://x.com/files/");
         let (files, _) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/files/good.zip".to_string()]);
+        assert_eq!(files, vec!["http://x.com/files/good.zip".to_owned()]);
     }
 
     #[test]
@@ -809,7 +809,7 @@ mod tests {
         let html = r#"<a href="file%201.mp4">f</a><a href="sub%20dir/">s</a>"#;
         let page = u("http://x.com/d/");
         let (files, dirs) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/d/file%201.mp4".to_string()]);
+        assert_eq!(files, vec!["http://x.com/d/file%201.mp4".to_owned()]);
         assert_eq!(dirs[0].as_str(), "http://x.com/d/sub%20dir/");
     }
 
@@ -818,7 +818,7 @@ mod tests {
         let html = "<a href='video.mp4'>video</a>";
         let page = u("http://x.com/d/");
         let (files, _) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/d/video.mp4".to_string()]);
+        assert_eq!(files, vec!["http://x.com/d/video.mp4".to_owned()]);
     }
 
     #[test]
@@ -827,7 +827,7 @@ mod tests {
         let html = "<a href=video.mp4>video</a>";
         let page = u("http://x.com/d/");
         let (files, _) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/d/video.mp4".to_string()]);
+        assert_eq!(files, vec!["http://x.com/d/video.mp4".to_owned()]);
     }
 
     #[test]
@@ -878,7 +878,7 @@ mod tests {
         "#;
         let page = u("http://x.com/files/sub/");
         let (files, _) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/files/sub/legit.mp4".to_string()]);
+        assert_eq!(files, vec!["http://x.com/files/sub/legit.mp4".to_owned()]);
     }
 
     #[test]
@@ -895,7 +895,7 @@ mod tests {
         let html = r#"<a data-href="evil.exe" href="good.txt">x</a>"#;
         let page = u("http://x.com/d/");
         let (files, _) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/d/good.txt".to_string()]);
+        assert_eq!(files, vec!["http://x.com/d/good.txt".to_owned()]);
     }
 
     #[test]
@@ -904,7 +904,7 @@ mod tests {
                       <a href="good.txt">good</a>"#;
         let page = u("http://x.com/d/");
         let (files, _) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/d/good.txt".to_string()]);
+        assert_eq!(files, vec!["http://x.com/d/good.txt".to_owned()]);
     }
 
     #[test]
@@ -913,7 +913,7 @@ mod tests {
                       <a href="good.txt">good</a>"#;
         let page = u("http://x.com/d/");
         let (files, _) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/d/good.txt".to_string()]);
+        assert_eq!(files, vec!["http://x.com/d/good.txt".to_owned()]);
     }
 
     #[test]
@@ -922,7 +922,7 @@ mod tests {
         let html = r#"<a href="//x.com/files/a.mp4">a</a>"#;
         let page = u("http://x.com/files/");
         let (files, _) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/files/a.mp4".to_string()]);
+        assert_eq!(files, vec!["http://x.com/files/a.mp4".to_owned()]);
     }
 
     #[test]
@@ -940,7 +940,7 @@ mod tests {
         let html = "<a HREF =\n\"video.mp4\">v</a>";
         let page = u("http://x.com/d/");
         let (files, _) = parse_links(html, &page, &page);
-        assert_eq!(files, vec!["http://x.com/d/video.mp4".to_string()]);
+        assert_eq!(files, vec!["http://x.com/d/video.mp4".to_owned()]);
     }
 
     #[test]
