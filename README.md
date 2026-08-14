@@ -78,6 +78,7 @@ Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything
 
 - [mega - click to view](extraInfo/mega.md)
 - [gofile - click to view](extraInfo/gofile.md)
+- [dropbox - click to view](extraInfo/dropbox.md)
 
 # Example Config File
 
@@ -112,7 +113,7 @@ gofile_workers = 5
 gofile_token = ""
 ```
 
-Every key is optional — anything you leave out falls back to the default, and a config file written before these keys existed still loads.
+Every key is optional — anything you leave out falls back to the default, and a config file written before these keys existed still loads. Dropbox has no keys of its own: it needs no token, and `connections` already covers it.
 
 # Release
 Zack encourages you to build from source. As some random internet person once said, "Always build from source"
