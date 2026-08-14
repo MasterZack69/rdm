@@ -190,7 +190,8 @@ pub fn parse_link(url: &str) -> Result<MegaLink> {
         .split(['?', '&', '/'])
         .next()
         .unwrap_or("")
-        .trim().to_owned();
+        .trim()
+        .to_owned();
 
     if handle.is_empty() || key.is_empty() {
         bail!("MEGA link is missing its handle or key");
