@@ -343,15 +343,30 @@ mod tests {
     }
 
     /// The name comes off the network, so it must not be able to point outside
-    /// the download directory. `%2E%2E` rather than `..` on purpose: `..` is
-    /// resolved away by URL parsing, `%2E%2E` reaches us intact.
+    /// the download directory.
+    ///
+    /// Encoded separators are the case worth testing, because they are the
+    /// case that reaches us: URL parsing folds away a double-dot segment
+    /// before we ever see it, `%2E%2E` included — that spelling turns
+    /// `/scl/fi/<id>/%2E%2E` into `/scl/`, which is not a share link at all
+    /// and is refused as one. `%2F` survives parsing and only becomes a
+    /// separator when the name is decoded, which is where `sanitize` earns its
+    /// keep.
     #[test]
     fn a_hostile_name_cannot_escape_the_download_directory() {
+        // A path in a name is reduced to its last component.
         let traversal =
             resolve("https://www.dropbox.com/scl/fi/abc123/..%2F..%2Fetc%2Fpasswd?dl=0").unwrap();
         assert_eq!(traversal.fallback_name, "passwd");
 
-        let dots = resolve("https://www.dropbox.com/scl/fi/abc123/%2E%2E?dl=0").unwrap();
+        // Nothing after the last separator: the name is unusable, so the share
+        // id stands in for it.
+        let trailing = resolve("https://www.dropbox.com/scl/fi/abc123/..%2F..%2F?dl=0").unwrap();
+        assert_eq!(trailing.fallback_name, "dropbox-abc123");
+
+        // A last component of `..` is refused rather than joined onto the
+        // download directory.
+        let dots = resolve("https://www.dropbox.com/scl/fi/abc123/photos%2F..?dl=0").unwrap();
         assert_eq!(dots.fallback_name, "dropbox-abc123");
     }
 
