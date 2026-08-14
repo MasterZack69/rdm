@@ -143,7 +143,7 @@ impl Kind {
             // No folders: a Dropbox folder share does not expand into a
             // listing, it is zipped and served as one response, so there is
             // nothing for a folder-aware caller to walk. No integrity check
-            // either \u{2014} the response carries a length and no digest. Resume and
+            // either — the response carries a length and no digest. Resume and
             // parallel chunks are inherited from the CDN, which honours
             // `Range` once the share link has been rewritten.
             Self::Dropbox => Capabilities {

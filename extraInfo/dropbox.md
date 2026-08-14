@@ -48,7 +48,7 @@ A file share keeps the name in its own path, so `album.zip` stays `album.zip`.
 ## Notes
 
 - `dl=0`, `dl=1` or no `dl` at all: all three work, the flag is never
-  duplicated, and every other parameter (`rlkey`, `st`) is preserved \u{2014} the
+  duplicated, and every other parameter (`rlkey`, `st`) is preserved — the
   server 404s without them.
 - `-p` does nothing here. It parallelises files within a listing, and a share
   link is a single download.
