@@ -63,6 +63,18 @@ pub struct DownloadRequest {
     pub output: Option<String>,
     pub connections: usize,
     pub policy: ExistingPolicy,
+    /// The client to download with, when it has to be a particular one.
+    ///
+    /// Normally `None`, and the shared client is used along with its connection
+    /// pool. A hoster that had to authenticate passes its own client instead,
+    /// because some authorisation cannot be expressed in a URL: a
+    /// password-protected Dropbox share is authorised by the cookies in a jar,
+    /// so the download has to go out over the client holding that jar.
+    ///
+    /// Keeping it on the request is what lets such a hoster stay a URL rewrite
+    /// instead of growing a downloader: ranges, chunking, resume and retries
+    /// all still come from this module.
+    pub client: Option<reqwest::Client>,
 }
 
 impl DownloadRequest {
@@ -72,11 +84,19 @@ impl DownloadRequest {
             output,
             connections,
             policy: ExistingPolicy::Ask,
+            client: None,
         }
     }
 
     pub fn with_policy(mut self, policy: ExistingPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Downloads over `client` rather than the shared one, carrying whatever
+    /// session it holds.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = Some(client);
         self
     }
 }
@@ -188,7 +208,14 @@ pub async fn download(
 
     let user_explicitly_renamed = output_path != original_path;
     let connections = req.connections.max(1);
-    let client = shared_client()?;
+
+    // An authenticated client, if the caller had to obtain one: the session it
+    // holds is the authorisation, so every request below has to go out over it
+    // rather than over the shared client.
+    let client = match req.client.as_ref() {
+        Some(authenticated) => authenticated,
+        None => shared_client()?,
+    };
 
     sink.state(SlotState::Inspecting);
     sink.detail(&format!("Inspecting: {}", url));
@@ -322,6 +349,32 @@ pub async fn run_download(
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<()> {
+    run(url, output, connections, None, cancel, quiet).await
+}
+
+/// The same, over a client the caller has already authenticated.
+///
+/// For a source whose authorisation is a session rather than part of the URL —
+/// a password-protected Dropbox share, whose cookies live in that client's jar.
+pub async fn run_download_with_client(
+    url: String,
+    output: Option<String>,
+    connections: usize,
+    client: reqwest::Client,
+    cancel: CancellationToken,
+    quiet: bool,
+) -> Result<()> {
+    run(url, output, connections, Some(client), cancel, quiet).await
+}
+
+async fn run(
+    url: String,
+    output: Option<String>,
+    connections: usize,
+    client: Option<reqwest::Client>,
+    cancel: CancellationToken,
+    quiet: bool,
+) -> Result<()> {
     let name = output
         .clone()
         .map(|o| o.rsplit('/').next().unwrap_or(&o).to_owned())
@@ -339,6 +392,11 @@ pub async fn run_download(
     };
 
     let request = DownloadRequest::new(url, output, connections);
+    let request = match client {
+        Some(authenticated) => request.with_client(authenticated),
+        None => request,
+    };
+
     let result = download(request, cancel, sink).await;
     let elapsed = bar.as_ref().map(|b| b.elapsed()).unwrap_or_default();
 
@@ -777,6 +835,18 @@ mod tests {
         let req = DownloadRequest::new("https://example.com/f.zip".into(), None, 8);
         assert_eq!(req.policy, ExistingPolicy::Ask);
         assert_eq!(req.with_policy(ExistingPolicy::Reuse).policy, ExistingPolicy::Reuse);
+    }
+
+    /// A session cannot be expressed in a URL, so it travels on the request.
+    /// Default is the shared client, which is what keeps the pool useful.
+    #[test]
+    fn a_request_uses_the_shared_client_unless_given_one() {
+        let req = DownloadRequest::new("https://example.com/f.zip".into(), None, 8);
+        assert!(req.client.is_none());
+
+        let authenticated = DownloadRequest::new("https://example.com/f.zip".into(), None, 8)
+            .with_client(reqwest::Client::new());
+        assert!(authenticated.client.is_some());
     }
 
     // ── Existing-output policy ──
