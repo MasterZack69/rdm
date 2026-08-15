@@ -350,10 +350,10 @@ fn gofile_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Resu
 /// Unlike MEGA and GoFile, `-o` here means a filename, because a share link is
 /// always one response \u{2014} a folder share included, since Dropbox zips it.
 ///
-/// A password-protected share is the one thing a rewrite cannot express, since
-/// it is authorised by a session. `dropbox::open` performs that handshake and
-/// hands back the client holding it, which the engine then downloads with \u{2014}
-/// so even that case adds no second downloader.
+/// A password-protected share is the one thing a rewritten URL cannot express,
+/// being authorised by a session instead. `dropbox::open` performs that
+/// handshake and hands back the client holding it, which the engine then
+/// downloads with \u{2014} so even that case adds no second downloader.
 fn dropbox_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
     let link = dropbox::resolve(url)?;
     let connections = opts.connections.unwrap_or(cfg.connections);
@@ -491,9 +491,9 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
     // rather than at the front of the queue an hour later.
     //
     // The exception is a password-protected share, which is authorised by a
-    // session the runner has no way to hold. Nothing here detects that \u{2014} it
-    // takes a request \u{2014} so such a link queues and then fetches the password
-    // page. See extraInfo/dropbox.md.
+    // session the runner has no way to hold. Nothing here can detect that \u{2014}
+    // it takes a request \u{2014} so such a link queues and then fetches the
+    // password page. See extraInfo/dropbox.md.
     let dropbox_link = if dropbox::is_dropbox_url(url) {
         Some(dropbox::resolve(url)?)
     } else {
@@ -1068,4 +1068,62 @@ mod tests {
 
     /// Sync refuses Dropbox for a different reason than GoFile: the link is
     /// fetchable, there is just nothing behind it to diff, because a folder
-    /
+    /// share is zipped into a single response.
+    #[test]
+    fn sync_can_tell_a_dropbox_link_from_a_listing() {
+        assert!(dropbox::is_dropbox_url(
+            "https://www.dropbox.com/scl/fo/abc123/h?rlkey=k&dl=0"
+        ));
+        assert!(!dropbox::is_dropbox_url("https://example.com/music/"));
+    }
+
+    /// The Dropbox path is "rewrite, then hand to the engine", so the name has
+    /// to survive that hand-off and land in the download directory.
+    #[test]
+    fn a_dropbox_file_share_keeps_its_name() {
+        let cfg = config::Config::default();
+        let link =
+            dropbox::resolve("https://www.dropbox.com/scl/fi/abc123/holiday%20photos.zip?dl=0")
+                .expect("a file share resolves without a request");
+
+        assert_eq!(link.fallback_name, "holiday photos.zip");
+        assert_eq!(
+            resolve_output_named(None, &link.fallback_name, &cfg),
+            cfg.resolve_output_path("holiday photos.zip")
+        );
+    }
+
+    /// Why `resolve_output_named` exists: a folder share's own last path
+    /// segment is `h`, so a directory-ish `-o` has to keep the share's name
+    /// rather than the URL's.
+    #[test]
+    fn dropbox_output_directory_keeps_the_remote_name() {
+        let cfg = config::Config::default();
+
+        assert_eq!(
+            resolve_output_named(Some("/data/dl/".to_owned()), "dropbox-abc123.zip", &cfg),
+            "/data/dl/dropbox-abc123.zip"
+        );
+
+        // A concrete -o still wins outright.
+        assert_eq!(
+            resolve_output_named(Some("/data/mine.zip".to_owned()), "dropbox-abc123.zip", &cfg),
+            "/data/mine.zip"
+        );
+    }
+
+    /// The password never comes from a flag, so nothing in `DownloadOpts` can
+    /// carry it. This pins the variable's name and the blank-is-absent rule
+    /// the Dropbox path relies on, without setting the variable: tests share a
+    /// process and it would leak into every other one.
+    #[test]
+    fn a_dropbox_password_comes_only_from_the_environment() {
+        match std::env::var("RDM_DROPBOX_PASSWORD") {
+            Err(_) => assert!(dropbox::password_from_env().is_none()),
+            Ok(set) if set.trim().is_empty() => {
+                assert!(dropbox::password_from_env().is_none())
+            }
+            Ok(set) => assert_eq!(dropbox::password_from_env().as_deref(), Some(set.as_str())),
+        }
+    }
+}
