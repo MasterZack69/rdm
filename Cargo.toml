@@ -5,12 +5,19 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-# "cookies" is for Dropbox's password-protected shares, which authenticate by
-# session rather than by URL: the CSRF token has to be read back out of a jar
-# (Dropbox may set it on a redirect hop), and a jar keeps the session scoped to
-# dropbox.com. Sending it as a default header would leak it to
-# dropboxusercontent.com when the download redirects to the CDN.
-reqwest = { version = "0.13", features = ["json", "stream", "rustls", "cookies"] }
+# Two non-default reqwest features, both there for Dropbox's password-protected
+# shares, which authenticate by session rather than by URL:
+#
+# "cookies": the CSRF token has to be read back out of a jar (Dropbox may set
+#   it on a redirect hop), and a jar keeps the session scoped to dropbox.com.
+#   Sending it as a default header would leak it to dropboxusercontent.com when
+#   the download redirects to the CDN.
+#
+# "form": /sm/auth takes an application/x-www-form-urlencoded body. reqwest
+#   0.13 gates RequestBuilder::form behind this feature, which is what pulls in
+#   serde_urlencoded; without it the method does not exist. Better that than
+#   percent-encoding a password by hand.
+reqwest = { version = "0.13", features = ["json", "stream", "rustls", "cookies", "form"] }
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3"
