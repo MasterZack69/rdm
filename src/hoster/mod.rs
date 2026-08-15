@@ -72,6 +72,10 @@ pub enum LinkKind {
 }
 
 /// What a hoster is able to do, so callers can refuse early and clearly.
+///
+/// These are per-hoster best cases, not per-link promises: the engine still
+/// probes each response and adapts, so a host that usually supports ranged
+/// requests can still answer one particular URL without them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     /// Folder or album links expand into a listing of files.
@@ -143,9 +147,15 @@ impl Kind {
             // No folders: a Dropbox folder share does not expand into a
             // listing, it is zipped and served as one response, so there is
             // nothing for a folder-aware caller to walk. No integrity check
-            // either — the response carries a length and no digest. Resume and
-            // parallel chunks are inherited from the CDN, which honours
-            // `Range` once the share link has been rewritten.
+            // either — the response carries a length and no digest.
+            //
+            // Resume and parallel chunks belong to the CDN rather than to us,
+            // and in practice only a file share gets them: a folder share's
+            // zip is built while it is being sent, so Dropbox cannot advertise
+            // a byte range into a file that does not exist yet and the
+            // response arrives without `Accept-Ranges`. The engine notices and
+            // drops to a single connection, which is why these stay `true` as
+            // the best case rather than being pessimised for every link.
             Self::Dropbox => Capabilities {
                 folders: false,
                 resume: true,
