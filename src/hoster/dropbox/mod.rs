@@ -34,9 +34,28 @@
 //! host — `/home`, a Paper doc — and every `dl.dropboxusercontent.com` link,
 //! which is already direct, falls through to the generic engine that handles
 //! it perfectly well.
+//!
+//! ## Password-protected shares
+//!
+//! These are the one case that cannot be handled by rewriting a URL, because
+//! the authorisation lives in a session rather than in the link. Left alone, a
+//! protected share answers `dl=1` with its password page, and rdm would write
+//! that HTML to disk under the name of the file the user wanted.
+//!
+//! [`open`] performs the handshake and hands back a client holding the
+//! authenticated cookies, which [`crate::engine`] then downloads with — so
+//! resume, ranges and parallel chunks still come from the engine rather than
+//! being reimplemented here. See [`content_id`] for the part Dropbox makes
+//! awkward.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
+use reqwest::Client;
 use reqwest::Url;
+use reqwest::cookie::{CookieStore, Jar};
 
 /// Hosts this module answers for, compared whole and case-insensitively:
 /// `notdropbox.com` is not Dropbox, and neither is `dropbox.com.evil.com`.
@@ -45,6 +64,25 @@ const HOSTS: [&str; 2] = ["dropbox.com", "www.dropbox.com"];
 /// The query flag that picks between the preview page (`0`) and the file
 /// itself (`1`).
 const DOWNLOAD_FLAG: &str = "dl";
+
+/// Where a share password is posted.
+const AUTH_ENDPOINT: &str = "https://www.dropbox.com/sm/auth";
+
+/// What `/sm/auth` answers when the password was right.
+const AUTHED: &str = "authed";
+
+/// The JavaScript call the share page hides its prefetched state inside.
+const PREFETCH_CALL: &str = "registerStreamedPrefetch";
+
+/// What marks the prefetched blob that describes the password form.
+const PASSWORD_MARKER: &str = "/sm/password";
+
+/// The environment variable a share password is read from.
+///
+/// An environment variable rather than a flag, matching `RDM_GOFILE_PASSWORD`:
+/// a password on the command line ends up in shell history and in `ps` output
+/// for every other user on the machine.
+pub const PASSWORD_ENV: &str = "RDM_DROPBOX_PASSWORD";
 
 /// What a recognised share link points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,27 +253,232 @@ fn share_id(parsed: &Url) -> Option<&str> {
     }
 }
 
-/// Returns `parsed` with exactly one `dl=1`, every other parameter kept.
-fn with_download_flag(parsed: &Url) -> String {
+/// Returns `parsed` with exactly one `dl=<value>`, every other parameter kept.
+fn with_flag(parsed: &Url, value: &str) -> String {
     let preserved: Vec<(String, String)> = parsed
         .query_pairs()
-        .filter_map(|(key, value)| {
+        .filter_map(|(key, existing)| {
             let key = key.into_owned();
-            (key != DOWNLOAD_FLAG).then(|| (key, value.into_owned()))
+            (key != DOWNLOAD_FLAG).then(|| (key, existing.into_owned()))
         })
         .collect();
 
-    let mut direct = parsed.clone();
+    let mut rewritten = parsed.clone();
     {
-        let mut query = direct.query_pairs_mut();
+        let mut query = rewritten.query_pairs_mut();
         query.clear();
-        for (key, value) in &preserved {
-            query.append_pair(key, value);
+        for (key, existing) in &preserved {
+            query.append_pair(key, existing);
         }
-        query.append_pair(DOWNLOAD_FLAG, "1");
+        query.append_pair(DOWNLOAD_FLAG, value);
     }
 
-    String::from(direct)
+    String::from(rewritten)
+}
+
+/// The link that serves the file.
+fn with_download_flag(parsed: &Url) -> String {
+    with_flag(parsed, "1")
+}
+
+/// The link that serves the preview page.
+///
+/// Worth being explicit about rather than reusing whatever the user pasted: if
+/// they hand us a link that already says `dl=1`, fetching it as-is to look for
+/// a password form would download the entire file into a `String`.
+fn with_preview_flag(parsed: &Url) -> String {
+    with_flag(parsed, "0")
+}
+
+// ── Password-protected shares ───────────────────────────────────────────
+
+/// Reads the share password from the environment, if it is set to anything.
+pub fn password_from_env() -> Option<String> {
+    std::env::var(PASSWORD_ENV)
+        .ok()
+        .filter(|password| !password.trim().is_empty())
+}
+
+/// A client that keeps cookies, plus the jar so the CSRF token can be read
+/// back out of it.
+///
+/// Matches the engine's own client settings, since whatever this returns may
+/// end up doing the download.
+fn session() -> Result<(Client, Arc<Jar>)> {
+    let jar = Arc::new(Jar::default());
+    let client = Client::builder()
+        .user_agent("rdm")
+        .connect_timeout(Duration::from_secs(10))
+        .cookie_provider(Arc::clone(&jar))
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    Ok((client, jar))
+}
+
+/// Opens a share, authenticating first if it turns out to be password-
+/// protected.
+///
+/// `Ok(None)` means the share is public and the caller should download it with
+/// the engine's own client, so nothing is spent on a session it does not need.
+/// `Ok(Some(client))` carries the authenticated cookies and must be used for
+/// the download itself.
+///
+/// This costs one small HTML GET on every Dropbox download, public ones
+/// included. That buys the difference between a clear "this share needs a
+/// password" and silently saving a password page under the name of the file
+/// the user asked for, which is worth far more than one request against a
+/// download measured in megabytes.
+pub async fn open(url: &str, password: Option<&str>) -> Result<Option<Client>> {
+    let parsed = dropbox_url(url).context("Not a Dropbox link")?;
+    let (client, jar) = session()?;
+
+    let page = client
+        .get(with_preview_flag(&parsed))
+        .send()
+        .await
+        .context("Failed to open the Dropbox share page")?
+        .text()
+        .await
+        .context("Failed to read the Dropbox share page")?;
+
+    let Some(content_id) = content_id(&page) else {
+        return Ok(None);
+    };
+
+    let password = password.with_context(|| {
+        format!("This Dropbox share is password-protected — set {PASSWORD_ENV} to its password")
+    })?;
+
+    let token = csrf_token(&jar, &parsed)
+        .context("Dropbox did not set the CSRF cookie that its password form needs")?;
+
+    // Dropbox wants the link without its scheme or host.
+    let relative = relative_link(&parsed);
+
+    let answer = client
+        .post(AUTH_ENDPOINT)
+        .form(&[
+            ("is_xhr", "true"),
+            ("t", token.as_str()),
+            ("content_id", content_id.as_str()),
+            ("password", password),
+            ("url", relative.as_str()),
+        ])
+        .send()
+        .await
+        .context("Failed to send the share password to Dropbox")?;
+
+    let status = answer.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "Dropbox refused the password request with status {} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("Unknown"),
+        );
+    }
+
+    // A wrong password is a 200 with a different status field, so it is the
+    // body that decides, not the code.
+    let answer: serde_json::Value = answer
+        .json()
+        .await
+        .context("Dropbox's answer to the password was not JSON")?;
+    let outcome = answer
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("no status");
+
+    if outcome != AUTHED {
+        anyhow::bail!("Dropbox rejected the password for this share (answered \"{outcome}\")");
+    }
+
+    Ok(Some(client))
+}
+
+/// The `content_id` of the password form, if this page is asking for one.
+///
+/// Doubles as the "is this share protected?" test, because a page that is not
+/// asking for a password has no password form to identify.
+///
+/// Dropbox does not put it in the markup. The page carries base64 blobs of
+/// prefetched state, so they are decoded and the one describing the password
+/// form — the one mentioning `/sm/password` — is the one that holds the id.
+/// Later blobs supersede earlier ones, hence the reverse iteration.
+fn content_id(page: &str) -> Option<String> {
+    prefetched(page)
+        .iter()
+        .rev()
+        .filter(|blob| blob.contains(PASSWORD_MARKER))
+        .find_map(|blob| content_id_in(blob))
+}
+
+/// Every prefetched blob on the page, decoded, in document order.
+///
+/// A blob that will not decode is skipped rather than fatal: the page is full
+/// of them, we are looking for one, and Dropbox is free to change the rest.
+fn prefetched(page: &str) -> Vec<String> {
+    page.split(PREFETCH_CALL)
+        .skip(1)
+        .filter_map(|call| {
+            // registerStreamedPrefetch("<key>", "<payload>") — stop at the
+            // closing paren so a call without a payload cannot reach forward
+            // into unrelated markup for its second string.
+            let head = call.split(')').next()?;
+            let payload = nth_quoted(head, 1)?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
+
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .collect()
+}
+
+/// The `n`th double-quoted string in `text`, counting from zero.
+///
+/// Sound for the JavaScript this reads, whose arguments are base64 and cannot
+/// contain a quote or an escape.
+fn nth_quoted(text: &str, n: usize) -> Option<&str> {
+    text.split('"').nth(n * 2 + 1)
+}
+
+/// Pulls `content_id=<value>` out of a decoded blob.
+fn content_id_in(blob: &str) -> Option<String> {
+    let value: String = blob
+        .split_once("content_id=")?
+        .1
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '=' | '/' | '-' | '_'))
+        .collect();
+
+    (!value.is_empty()).then_some(value)
+}
+
+/// The CSRF token Dropbox expects echoed back in the form body.
+///
+/// Read out of the jar rather than off the response, because Dropbox is free
+/// to set it on any hop of a redirect chain and only the last response's
+/// headers are visible afterwards.
+fn csrf_token(jar: &Jar, url: &Url) -> Option<String> {
+    let header = jar.cookies(url)?;
+
+    cookie_value(header.to_str().ok()?, "t")
+}
+
+/// Picks one cookie out of a `Cookie:` header value.
+fn cookie_value(header: &str, name: &str) -> Option<String> {
+    header
+        .split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| key.trim() == name)
+        .map(|(_, value)| value.trim().to_owned())
+}
+
+/// The share link as `/path?query`, which is the shape `/sm/auth` expects.
+fn relative_link(parsed: &Url) -> String {
+    match parsed.query() {
+        Some(query) => format!("{}?{}", parsed.path(), query),
+        None => parsed.path().to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +566,19 @@ mod tests {
         }
     }
 
+    /// The page has to be fetched as a page. A link that already says `dl=1`
+    /// would otherwise be read into a `String` in full.
+    #[test]
+    fn the_share_page_is_always_asked_for_as_a_preview() {
+        let parsed =
+            dropbox_url("https://www.dropbox.com/scl/fi/abc123/report.pdf?rlkey=k&dl=1").unwrap();
+        let preview = with_preview_flag(&parsed);
+
+        assert!(preview.ends_with("dl=0"));
+        assert_eq!(preview.matches("dl=").count(), 1);
+        assert!(preview.contains("rlkey=k"));
+    }
+
     #[test]
     fn a_file_share_is_named_by_its_own_path() {
         let link =
@@ -374,5 +630,141 @@ mod tests {
     fn a_link_we_do_not_recognise_is_refused_with_a_reason() {
         let err = resolve("https://www.dropbox.com/home").expect_err("expected a refusal");
         assert!(err.to_string().contains("share link"), "got: {err}");
+    }
+
+    // ── Password-protected shares ──
+
+    /// Builds a page carrying `payload` the way Dropbox does: base64, inside a
+    /// `registerStreamedPrefetch` call.
+    fn page_with(payloads: &[&str]) -> String {
+        let mut page = String::from("<!doctype html><html><body>");
+        for payload in payloads {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+            page.push_str(&format!(
+                "<script>registerStreamedPrefetch(\"key\", \"{encoded}\");</script>"
+            ));
+        }
+        page.push_str("</body></html>");
+
+        page
+    }
+
+    /// The id is the whole point of decoding the blobs, and its character set
+    /// is wider than it looks: it has to stop at the `&`, not at the `+`, `/`
+    /// or `=`.
+    #[test]
+    fn the_password_form_is_found_inside_a_prefetched_blob() {
+        let page = page_with(&[
+            "{\"route\":\"/sharing/view\"}",
+            "{\"form\":\"/sm/password?content_id=AbC-1.2+3/4_5=&next=/home\"}",
+        ]);
+
+        assert_eq!(content_id(&page).as_deref(), Some("AbC-1.2+3/4_5="));
+    }
+
+    /// A public share has no password form, which is exactly how it is
+    /// recognised as public.
+    #[test]
+    fn a_page_without_a_password_form_needs_no_password() {
+        let page = page_with(&[
+            "{\"route\":\"/sharing/view\"}",
+            "{\"preview\":\"/scl/fi/abc123/report.pdf\"}",
+        ]);
+
+        assert_eq!(content_id(&page), None);
+        assert_eq!(content_id("<html>nothing prefetched here</html>"), None);
+    }
+
+    /// The page is full of blobs meant for the browser, and Dropbox owes us no
+    /// stability in any of them. One that will not decode, or a call with no
+    /// payload, must not stop us finding the one we came for.
+    #[test]
+    fn unreadable_blobs_are_skipped_rather_than_fatal() {
+        let good = base64::engine::general_purpose::STANDARD
+            .encode("{\"form\":\"/sm/password?content_id=OK123\"}");
+        let page = format!(
+            "<script>registerStreamedPrefetch(\"key\", \"not!valid!base64!\");</script>\
+             <script>registerStreamedPrefetch(\"key\");</script>\
+             <script>registerStreamedPrefetch(\"key\", \"{good}\");</script>\
+             <p>content_id=NOT_FROM_A_BLOB</p>"
+        );
+
+        assert_eq!(content_id(&page).as_deref(), Some("OK123"));
+    }
+
+    /// Markup outside a prefetched blob is not a source of ids, even when it
+    /// contains the words we are looking for.
+    #[test]
+    fn the_id_is_only_taken_from_a_decoded_blob() {
+        let page = "<p>/sm/password?content_id=FROM_THE_MARKUP</p>";
+
+        assert_eq!(content_id(page), None);
+    }
+
+    #[test]
+    fn the_csrf_token_is_read_out_of_the_jar() {
+        let url = Url::parse("https://www.dropbox.com/scl/fi/abc123/report.pdf").unwrap();
+        let jar = Jar::default();
+        jar.add_cookie_str("gvc=99; Path=/", &url);
+        jar.add_cookie_str("t=tok123; Path=/", &url);
+
+        assert_eq!(csrf_token(&jar, &url).as_deref(), Some("tok123"));
+    }
+
+    #[test]
+    fn a_jar_without_the_token_yields_nothing() {
+        let url = Url::parse("https://www.dropbox.com/scl/fi/abc123/report.pdf").unwrap();
+        let jar = Jar::default();
+        jar.add_cookie_str("gvc=99; Path=/", &url);
+
+        assert_eq!(csrf_token(&jar, &url), None);
+    }
+
+    #[test]
+    fn one_cookie_is_picked_out_of_many() {
+        assert_eq!(
+            cookie_value("gvc=99; t=tok123; locale=en", "t").as_deref(),
+            Some("tok123")
+        );
+        assert_eq!(cookie_value("t=tok123", "t").as_deref(), Some("tok123"));
+        // A name that merely ends in the one we want is a different cookie.
+        assert_eq!(cookie_value("st=nope", "t"), None);
+        assert_eq!(cookie_value("", "t"), None);
+    }
+
+    #[test]
+    fn the_endpoint_is_given_the_link_without_its_host() {
+        let parsed =
+            dropbox_url("https://www.dropbox.com/scl/fi/abc123/report.pdf?rlkey=k&dl=0").unwrap();
+        assert_eq!(
+            relative_link(&parsed),
+            "/scl/fi/abc123/report.pdf?rlkey=k&dl=0"
+        );
+
+        let bare = dropbox_url("https://www.dropbox.com/s/abc123/report.pdf").unwrap();
+        assert_eq!(relative_link(&bare), "/s/abc123/report.pdf");
+    }
+
+    /// An unset or blank variable means "no password", not an empty one.
+    #[test]
+    fn a_blank_password_variable_counts_as_unset() {
+        assert_eq!(PASSWORD_ENV, "RDM_DROPBOX_PASSWORD");
+
+        // SAFETY: single-threaded test, and the variable is read back here
+        // rather than by anything else.
+        unsafe {
+            std::env::set_var(PASSWORD_ENV, "   ");
+        }
+        assert_eq!(password_from_env(), None);
+
+        unsafe {
+            std::env::set_var(PASSWORD_ENV, "hunter2");
+        }
+        assert_eq!(password_from_env().as_deref(), Some("hunter2"));
+
+        unsafe {
+            std::env::remove_var(PASSWORD_ENV);
+        }
+        assert_eq!(password_from_env(), None);
     }
 }
