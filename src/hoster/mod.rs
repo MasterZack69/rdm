@@ -27,6 +27,10 @@
 //!      answer for the new host — detection, naming, capabilities. Nothing
 //!      silently defaults.
 //!
+//! Step 4 is also where a host can turn out to need less than a full
+//! downloader: Dropbox only needs its links rewritten, after which the generic
+//! engine does the work.
+//!
 //! ## Why an enum and not a trait
 //!
 //! A `Box<dyn Hoster>` looks tidier right up until the first `async fn`:
@@ -37,6 +41,10 @@
 //! hoster's own function signatures honest (MEGA needs a `FileKey`;
 //! pixeldrain will not), and turns "I forgot to wire up the new host"
 //! from a silent fallthrough into a compile error.
+
+/// Dropbox (dropbox.com): share links rewritten to `dl=1`, then downloaded by
+/// the generic engine.
+pub mod dropbox;
 
 /// GoFile (gofile.io): API-resolved content trees, guest or account tokens.
 pub mod gofile;
@@ -49,6 +57,7 @@ pub mod mega;
 pub enum Kind {
     Mega,
     Gofile,
+    Dropbox,
 }
 
 /// What a link points at.
@@ -63,6 +72,10 @@ pub enum LinkKind {
 }
 
 /// What a hoster is able to do, so callers can refuse early and clearly.
+///
+/// These are per-hoster best cases, not per-link promises: the engine still
+/// probes each response and adapts, so a host that usually supports ranged
+/// requests can still answer one particular URL without them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     /// Folder or album links expand into a listing of files.
@@ -88,6 +101,9 @@ impl Kind {
         if gofile::is_gofile_url(url) {
             return Some(Self::Gofile);
         }
+        if dropbox::is_dropbox_url(url) {
+            return Some(Self::Dropbox);
+        }
         None
     }
 
@@ -96,6 +112,7 @@ impl Kind {
         match self {
             Self::Mega => "mega",
             Self::Gofile => "gofile",
+            Self::Dropbox => "dropbox",
         }
     }
 
@@ -104,6 +121,7 @@ impl Kind {
         match self {
             Self::Mega => "MEGA",
             Self::Gofile => "GoFile",
+            Self::Dropbox => "Dropbox",
         }
     }
 
@@ -125,6 +143,24 @@ impl Kind {
                 resume: true,
                 integrity_check: false,
                 parallel_chunks: false,
+            },
+            // No folders: a Dropbox folder share does not expand into a
+            // listing, it is zipped and served as one response, so there is
+            // nothing for a folder-aware caller to walk. No integrity check
+            // either — the response carries a length and no digest.
+            //
+            // Resume and parallel chunks belong to the CDN rather than to us,
+            // and in practice only a file share gets them: a folder share's
+            // zip is built while it is being sent, so Dropbox cannot advertise
+            // a byte range into a file that does not exist yet and the
+            // response arrives without `Accept-Ranges`. The engine notices and
+            // drops to a single connection, which is why these stay `true` as
+            // the best case rather than being pessimised for every link.
+            Self::Dropbox => Capabilities {
+                folders: false,
+                resume: true,
+                integrity_check: false,
+                parallel_chunks: true,
             },
         }
     }
@@ -149,6 +185,11 @@ impl Kind {
             // in a directory of its own, which is the harmless direction to
             // be wrong in.
             Self::Gofile => LinkKind::Folder,
+            // Always a file, folder shares included: Dropbox zips a folder
+            // and serves it as one response, so there is exactly one
+            // destination path either way. `dropbox::is_folder_link` is still
+            // available for callers that want to say which it was.
+            Self::Dropbox => LinkKind::File,
         }
     }
 
@@ -165,9 +206,10 @@ pub fn detect(url: &str) -> Option<Kind> {
 
 /// Does any hoster module claim this link?
 ///
-/// A `true` here means the generic HTTP engine must not be handed the URL:
-/// hoster links are API handles plus decryption keys, not fetchable
-/// addresses.
+/// A `true` here means the generic HTTP engine must not be handed the URL as
+/// it stands: MEGA and GoFile links are API handles plus decryption keys
+/// rather than fetchable addresses, and a Dropbox share link serves an HTML
+/// preview page until [`dropbox::resolve`] rewrites it into a direct one.
 pub fn is_hoster_url(url: &str) -> bool {
     detect(url).is_some()
 }
@@ -201,6 +243,21 @@ mod tests {
         assert!(is_hoster_url("https://gofile.io/d/AbCdEf"));
     }
 
+    #[test]
+    fn dropbox_share_links_are_routed_to_dropbox() {
+        assert_eq!(
+            Kind::detect("https://www.dropbox.com/scl/fi/abc123/report.pdf?rlkey=k&dl=0"),
+            Some(Kind::Dropbox)
+        );
+        assert_eq!(
+            Kind::detect("https://dropbox.com/sh/abc123/AABBCC?dl=0"),
+            Some(Kind::Dropbox)
+        );
+        assert!(is_hoster_url(
+            "https://www.dropbox.com/scl/fo/abc123/h?rlkey=k&dl=0"
+        ));
+    }
+
     /// Ordinary links must fall through to the generic engine, and lookalike
     /// hosts must not be claimed by anyone.
     #[test]
@@ -210,6 +267,17 @@ mod tests {
         assert_eq!(Kind::detect("https://mega.nz.evil.com/file/abc#key"), None);
         assert_eq!(Kind::detect("https://notgofile.io/d/abc"), None);
         assert_eq!(Kind::detect("https://gofile.io.evil.com/d/abc"), None);
+        assert_eq!(Kind::detect("https://notdropbox.com/scl/fi/abc/f.zip"), None);
+        assert_eq!(
+            Kind::detect("https://dropbox.com.evil.com/scl/fi/abc/f.zip"),
+            None
+        );
+        // A Dropbox CDN link is already direct, so no hoster claims it: there
+        // is nothing to rewrite.
+        assert_eq!(
+            Kind::detect("https://dl.dropboxusercontent.com/cd/0/get/abc/f.zip"),
+            None
+        );
         assert!(!is_hoster_url("https://example.com/f.zip"));
     }
 
@@ -239,6 +307,19 @@ mod tests {
         );
     }
 
+    /// Dropbox is the other way round from GoFile: the link does say which it
+    /// is, and it does not matter, because a folder share arrives as one zip.
+    /// Both halves of that are easy to get wrong in the other direction.
+    #[test]
+    fn a_dropbox_folder_share_is_still_a_single_download() {
+        let link = "https://www.dropbox.com/scl/fo/abc123/h?rlkey=k&dl=0";
+
+        assert!(dropbox::is_folder_link(link));
+        assert_eq!(Kind::Dropbox.link_kind(link), LinkKind::File);
+        assert!(!Kind::Dropbox.is_folder_link(link));
+        assert!(!Kind::Dropbox.capabilities().folders);
+    }
+
     #[test]
     fn mega_advertises_what_it_implements() {
         let caps = Kind::Mega.capabilities();
@@ -261,5 +342,16 @@ mod tests {
         assert!(!caps.parallel_chunks);
         assert_eq!(Kind::Gofile.name(), "gofile");
         assert_eq!(Kind::Gofile.display_name(), "GoFile");
+    }
+
+    #[test]
+    fn dropbox_advertises_what_it_implements() {
+        let caps = Kind::Dropbox.capabilities();
+        assert!(!caps.folders);
+        assert!(caps.resume);
+        assert!(!caps.integrity_check);
+        assert!(caps.parallel_chunks);
+        assert_eq!(Kind::Dropbox.name(), "dropbox");
+        assert_eq!(Kind::Dropbox.display_name(), "Dropbox");
     }
 }

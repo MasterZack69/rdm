@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use rdm::args::{
     Cli, ClearTarget, Command, DownloadOpts, QueueCommand, RetryTarget, normalize_extensions,
 };
-use rdm::hoster::gofile;
+use rdm::hoster::{dropbox, gofile};
 use rdm::ui::{self, ProgressSink};
 use rdm::{config, engine, mega, queue, scrape, signal, sync};
 
@@ -42,6 +42,14 @@ fn main() -> Result<()> {
                 return gofile_download(&cfg, &url, &opts);
             }
 
+            // And for Dropbox, for a different reason: the link is fetchable,
+            // it just serves an HTML preview page until `dl=1` asks for the
+            // file. The share key lives in the query string, so it needs
+            // rewriting rather than normalising as a path.
+            if dropbox::is_dropbox_url(&url) {
+                return dropbox_download(&cfg, &url, &opts);
+            }
+
             let url = engine::normalize_download_url(&url);
             let connections = opts.connections.unwrap_or(cfg.connections);
             let output_path = resolve_output(opts.output.clone(), &url, &cfg);
@@ -62,6 +70,17 @@ fn main() -> Result<()> {
                 anyhow::bail!(
                     "GoFile links cannot be synced \u{2014} run `rdm <gofile link>` instead; \
                      rerunning it skips whatever is already on disk"
+                );
+            }
+
+            // Dropbox has the same problem from the other end: a share link is
+            // one file, or one folder that Dropbox zips before serving. Either
+            // way there is a single response and no listing to diff against
+            // the local directory.
+            if dropbox::is_dropbox_url(&url) {
+                anyhow::bail!(
+                    "Dropbox links cannot be synced \u{2014} run `rdm <dropbox link>` instead; \
+                     a share link is a single download, and a folder share arrives as one zip"
                 );
             }
 
@@ -142,6 +161,18 @@ fn quick_download(
             eprintln!("  \u{26a0} -p applies to directory listings; GoFile uses gofile_workers.");
         }
         return gofile_download(cfg, url, opts);
+    }
+
+    // And Dropbox, for the third time: a folder share's `/scl/fo/<id>/h` has
+    // no extension either, so the heuristic would call it a listing and send
+    // it to the scraper, which finds a preview page.
+    if dropbox::is_dropbox_url(url) {
+        if parallel.is_some() && !opts.quiet {
+            eprintln!(
+                "  \u{26a0} -p applies to directory listings; a Dropbox link is one download."
+            );
+        }
+        return dropbox_download(cfg, url, opts);
     }
 
     let url = engine::normalize_download_url(url);
@@ -307,6 +338,53 @@ fn gofile_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Resu
     })
 }
 
+/// `rdm <dropbox link>` \u{2014} rewrite the share link, then let the engine do the
+/// work.
+///
+/// There is deliberately no Dropbox downloader. `dl=1` redirects to a CDN that
+/// honours `Range`, so resume, parallel connections, retries and the progress
+/// bar all come free from the generic path; a second copy of that machinery
+/// which happened to know the word "dropbox" would be strictly worse. All this
+/// function decides is which URL to fetch and what to call the result.
+///
+/// Unlike MEGA and GoFile, `-o` here means a filename, because a share link is
+/// always one response \u{2014} a folder share included, since Dropbox zips it.
+///
+/// A password-protected share is the one thing a rewritten URL cannot express,
+/// being authorised by a session instead. `dropbox::open` performs that
+/// handshake and hands back the client holding it, which the engine then
+/// downloads with \u{2014} so even that case adds no second downloader.
+fn dropbox_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    let link = dropbox::resolve(url)?;
+    let connections = opts.connections.unwrap_or(cfg.connections);
+
+    // The name cannot come from the URL: a folder share's last path segment is
+    // `h`, which would make for a memorable download.
+    let output = resolve_output_named(opts.output.clone(), &link.fallback_name, cfg);
+    let quiet = opts.quiet;
+
+    let share = url.trim().to_owned();
+    let password = dropbox::password_from_env();
+
+    run_async(|cancel| async move {
+        // A public share needs no session, and says so by handing back nothing.
+        match dropbox::open(&share, password.as_deref()).await? {
+            Some(client) => {
+                engine::run_download_with_client(
+                    link.url,
+                    Some(output),
+                    connections,
+                    client,
+                    cancel,
+                    quiet,
+                )
+                .await
+            }
+            None => engine::run_download(link.url, Some(output), connections, cancel, quiet).await,
+        }
+    })
+}
+
 fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
     match command {
         QueueCommand::Add { url, opts } => queue_add(cfg, &url, &opts),
@@ -406,17 +484,35 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
         );
     }
 
+    // Dropbox is the one hoster that queues cleanly, folder shares included:
+    // rewriting the link yields an ordinary HTTPS URL for a single response,
+    // so the runner can fetch it without knowing Dropbox exists. Resolving now
+    // also means a bad link is rejected here, while the user is watching,
+    // rather than at the front of the queue an hour later.
+    //
+    // The exception is a password-protected share, which is authorised by a
+    // session the runner has no way to hold. Nothing here can detect that \u{2014}
+    // it takes a request \u{2014} so such a link queues and then fetches the
+    // password page. See extraInfo/dropbox.md.
+    let dropbox_link = if dropbox::is_dropbox_url(url) {
+        Some(dropbox::resolve(url)?)
+    } else {
+        None
+    };
+
     // MEGA links go in verbatim: `normalize_download_url` would touch the
     // `#key` fragment, and there is no listing behind a file link to scrape.
     // The queue runner recognises them and dispatches to the MEGA downloader.
     let is_mega = mega::is_mega_url(url);
     let url = if is_mega {
         url.trim().to_owned()
+    } else if let Some(link) = &dropbox_link {
+        link.url.clone()
     } else {
         engine::normalize_download_url(url)
     };
 
-    let discovered = if !is_mega && looks_like_directory(&url) {
+    let discovered = if !is_mega && dropbox_link.is_none() && looks_like_directory(&url) {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
@@ -443,16 +539,31 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
         }
 
         _ => {
+            // A Dropbox item needs its name pinned now: by the time the runner
+            // sees the rewritten URL, the only thing left to name it after is
+            // the CDN path.
             let output = opts
                 .output
                 .as_deref()
-                .map(|o| resolve_relative_to_config(o, cfg));
+                .map(|o| resolve_relative_to_config(o, cfg))
+                .or_else(|| {
+                    dropbox_link
+                        .as_ref()
+                        .map(|link| cfg.resolve_output_path(&link.fallback_name))
+                });
             let id = queue::Queue::locked(|q| Ok(q.add(url.clone(), output, opts.connections)))?;
             let label = if is_mega {
                 // Never echo the link back: the fragment is the decryption key.
                 mega::parse_link(&url)
                     .map(|link| format!("MEGA {}", link.handle))
                     .unwrap_or_else(|_| "MEGA link".to_owned())
+            } else if let Some(link) = &dropbox_link {
+                // Same care as MEGA: `rlkey` is the share secret, so the link
+                // does not go on screen.
+                match link.share {
+                    dropbox::Share::File => format!("Dropbox {}", link.fallback_name),
+                    dropbox::Share::Folder => "Dropbox folder (zip)".to_owned(),
+                }
             } else {
                 engine::percent_decode(&url)
             };
@@ -681,23 +792,31 @@ fn print_discovered(files: &[scrape::DiscoveredFile]) {
 /// under its remote name"; anything else is taken as the filename itself.
 /// Relative paths land under the configured download directory.
 fn resolve_output(output: Option<String>, url: &str, cfg: &config::Config) -> String {
-    let filename_from_url = || -> String {
-        engine::extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_owned())
-    };
+    let filename =
+        engine::extract_filename_from_url(url).unwrap_or_else(|| "download.bin".to_owned());
 
+    resolve_output_named(output, &filename, cfg)
+}
+
+/// The same rules, for a download whose name did not come from its URL.
+///
+/// Dropbox is why this is a separate function: a folder share's URL ends in
+/// `/h`, so the name has to come from the share itself, while a directory-ish
+/// `-o` must still keep that name rather than write a file called `h`.
+fn resolve_output_named(output: Option<String>, filename: &str, cfg: &config::Config) -> String {
     match output {
         Some(o) => {
             let path = Path::new(&o);
             if o.ends_with('/') || o.ends_with("\\\\") || path.is_dir() {
                 let dir = o.trim_end_matches('/').trim_end_matches("\\\\");
-                format!("{}/{}", dir, filename_from_url())
+                format!("{}/{}", dir, filename)
             } else if path.is_absolute() {
                 o
             } else {
                 cfg.resolve_output_path(&o)
             }
         }
-        None => cfg.resolve_output_path(&filename_from_url()),
+        None => cfg.resolve_output_path(filename),
     }
 }
 
@@ -921,6 +1040,90 @@ mod tests {
         };
         if std::env::var("RDM_GOFILE_TOKEN").is_err() {
             assert!(gofile_options(&blank, &DownloadOpts::default()).token.is_none());
+        }
+    }
+
+    // -- Dropbox routing --
+
+    /// The same trap a third time, and the worst of the three: a folder share
+    /// ends in `/h`, so the heuristic calls it a listing and the scraper finds
+    /// a preview page. Hence the Dropbox check sitting above it.
+    #[test]
+    fn dropbox_folder_links_would_be_mistaken_for_listings() {
+        let link = "https://www.dropbox.com/scl/fo/abc123/h?rlkey=k&dl=0";
+        assert!(dropbox::is_dropbox_url(link));
+        assert!(
+            looks_like_directory(link),
+            "if this ever stops being true the ordering comment above is stale, not wrong"
+        );
+    }
+
+    #[test]
+    fn ordinary_links_are_not_sent_to_dropbox() {
+        assert!(!dropbox::is_dropbox_url(
+            "https://example.com/dropbox.com/scl/fi/abc/f.zip"
+        ));
+        assert!(!dropbox::is_dropbox_url("https://example.com/song.flac"));
+    }
+
+    /// Sync refuses Dropbox for a different reason than GoFile: the link is
+    /// fetchable, there is just nothing behind it to diff, because a folder
+    /// share is zipped into a single response.
+    #[test]
+    fn sync_can_tell_a_dropbox_link_from_a_listing() {
+        assert!(dropbox::is_dropbox_url(
+            "https://www.dropbox.com/scl/fo/abc123/h?rlkey=k&dl=0"
+        ));
+        assert!(!dropbox::is_dropbox_url("https://example.com/music/"));
+    }
+
+    /// The Dropbox path is "rewrite, then hand to the engine", so the name has
+    /// to survive that hand-off and land in the download directory.
+    #[test]
+    fn a_dropbox_file_share_keeps_its_name() {
+        let cfg = config::Config::default();
+        let link =
+            dropbox::resolve("https://www.dropbox.com/scl/fi/abc123/holiday%20photos.zip?dl=0")
+                .expect("a file share resolves without a request");
+
+        assert_eq!(link.fallback_name, "holiday photos.zip");
+        assert_eq!(
+            resolve_output_named(None, &link.fallback_name, &cfg),
+            cfg.resolve_output_path("holiday photos.zip")
+        );
+    }
+
+    /// Why `resolve_output_named` exists: a folder share's own last path
+    /// segment is `h`, so a directory-ish `-o` has to keep the share's name
+    /// rather than the URL's.
+    #[test]
+    fn dropbox_output_directory_keeps_the_remote_name() {
+        let cfg = config::Config::default();
+
+        assert_eq!(
+            resolve_output_named(Some("/data/dl/".to_owned()), "dropbox-abc123.zip", &cfg),
+            "/data/dl/dropbox-abc123.zip"
+        );
+
+        // A concrete -o still wins outright.
+        assert_eq!(
+            resolve_output_named(Some("/data/mine.zip".to_owned()), "dropbox-abc123.zip", &cfg),
+            "/data/mine.zip"
+        );
+    }
+
+    /// The password never comes from a flag, so nothing in `DownloadOpts` can
+    /// carry it. This pins the variable's name and the blank-is-absent rule
+    /// the Dropbox path relies on, without setting the variable: tests share a
+    /// process and it would leak into every other one.
+    #[test]
+    fn a_dropbox_password_comes_only_from_the_environment() {
+        match std::env::var("RDM_DROPBOX_PASSWORD") {
+            Err(_) => assert!(dropbox::password_from_env().is_none()),
+            Ok(set) if set.trim().is_empty() => {
+                assert!(dropbox::password_from_env().is_none())
+            }
+            Ok(set) => assert_eq!(dropbox::password_from_env().as_deref(), Some(set.as_str())),
         }
     }
 }
