@@ -18,6 +18,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "rdm";
+            version = "0.2.5";
             src = ./.;
 
             cargoLock.lockFile = ./Cargo.lock;
