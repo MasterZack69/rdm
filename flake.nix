@@ -1,13 +1,16 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    systems.url = "github:nix-systems/default";
+    systems.url = "github:nix-systems/default-linux";
   };
-
   outputs =
-    { self, nixpkgs, systems, ... }:
+    { self, nixpkgs, ... }:
     let
-      eachSystem = nixpkgs.lib.genAttrs (import systems);
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
+      eachSystem = nixpkgs.lib.genAttrs systems;
     in
     {
       packages = eachSystem (
@@ -20,21 +23,18 @@
             pname = "rdm";
             version = "0.2.5";
             src = ./.;
-
             cargoLock.lockFile = ./Cargo.lock;
-
             doCheck = false;
-
             meta = {
               description = "Rust Download Manager - CLI";
               homepage = "https://github.com/MasterZack69/rdm";
               license = pkgs.lib.licenses.agpl3Only;
+              platforms = pkgs.lib.platforms.linux;
               mainProgram = "rdm";
             };
           };
         }
       );
-
       checks = eachSystem (
         system:
         let
@@ -44,30 +44,20 @@
           default = self.packages.${system}.default;
         }
       );
-
-      apps = eachSystem (
-        system:
-        {
-          default = {
-            type = "app";
-            program = "${self.packages.${system}.default}/bin/rdm";
-          };
-        }
-      );
-
+      apps = eachSystem (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/rdm";
+        };
+      });
       formatter = eachSystem (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);
-
       devShells = eachSystem (
         system:
         let
           pkgs = import nixpkgs { inherit system; };
         in
         {
-          default = pkgs.mkShell {
-            buildInputs = with pkgs; [
-              rustup
-            ];
-          };
+          default = pkgs.mkShell { buildInputs = with pkgs; [ rustup ]; };
         }
       );
     };
