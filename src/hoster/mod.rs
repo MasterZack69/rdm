@@ -52,12 +52,17 @@ pub mod gofile;
 /// MEGA (mega.nz): AES-CTR chunked downloads, folder shares, MAC verification.
 pub mod mega;
 
+/// OneDrive (1drv.ms, onedrive.live.com): anonymous share resolution, then the
+/// generic engine for a file and a recursive walk for a folder.
+pub mod onedrive;
+
 /// A supported file host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Mega,
     Gofile,
     Dropbox,
+    OneDrive,
 }
 
 /// What a link points at.
@@ -104,6 +109,9 @@ impl Kind {
         if dropbox::is_dropbox_url(url) {
             return Some(Self::Dropbox);
         }
+        if onedrive::is_onedrive_url(url) {
+            return Some(Self::OneDrive);
+        }
         None
     }
 
@@ -113,6 +121,7 @@ impl Kind {
             Self::Mega => "mega",
             Self::Gofile => "gofile",
             Self::Dropbox => "dropbox",
+            Self::OneDrive => "onedrive",
         }
     }
 
@@ -122,6 +131,7 @@ impl Kind {
             Self::Mega => "MEGA",
             Self::Gofile => "GoFile",
             Self::Dropbox => "Dropbox",
+            Self::OneDrive => "OneDrive",
         }
     }
 
@@ -157,7 +167,25 @@ impl Kind {
             // drops to a single connection, which is why these stay `true` as
             // the best case rather than being pessimised for every link.
             Self::Dropbox => Capabilities {
-                folders: false,
+                folders: true,
+                resume: true,
+                integrity_check: false,
+                parallel_chunks: true,
+            },
+            // Folders, unlike Dropbox: a OneDrive folder share expands into a
+            // real listing of items that each carry their own download URL, so
+            // there is a tree to walk and files land under their own names.
+            //
+            // No integrity check. The API can hand over a `quickXorHash`, but
+            // nothing in this crate can compute one, and a digest that cannot
+            // be recomputed would only be decoration.
+            //
+            // Parallel chunks are the best case, as everywhere else: a file
+            // share is handed to the engine whole and gets them, while inside
+            // a folder walk each file takes one connection and the parallelism
+            // is files at once.
+            Self::OneDrive => Capabilities {
+                folders: true,
                 resume: true,
                 integrity_check: false,
                 parallel_chunks: true,
@@ -190,6 +218,17 @@ impl Kind {
             // destination path either way. `dropbox::is_folder_link` is still
             // available for callers that want to say which it was.
             Self::Dropbox => LinkKind::File,
+            // Unknowable from the link, and unlike GoFile there is no harmless
+            // direction to guess in: a OneDrive share id is opaque, and a file
+            // and a folder differ in where the download lands rather than only
+            // in how it is counted. So the syntactic answer is the shape a
+            // caller can always act on — one link, one destination — and the
+            // truth comes from `onedrive::resolve`, which has to ask the API
+            // before anything can be fetched anyway. Guessing from the `/u/`
+            // and `/f/` path hints in a `1drv.ms` link would be reading
+            // undocumented tea leaves, and `link_kind` is contractually not
+            // allowed to make a request.
+            Self::OneDrive => LinkKind::File,
         }
     }
 
@@ -208,8 +247,10 @@ pub fn detect(url: &str) -> Option<Kind> {
 ///
 /// A `true` here means the generic HTTP engine must not be handed the URL as
 /// it stands: MEGA and GoFile links are API handles plus decryption keys
-/// rather than fetchable addresses, and a Dropbox share link serves an HTML
-/// preview page until [`dropbox::resolve`] rewrites it into a direct one.
+/// rather than fetchable addresses, a Dropbox share link serves an HTML
+/// preview page until [`dropbox::resolve`] rewrites it into a direct one, and a
+/// OneDrive link is a preview page too until [`onedrive::resolve`] asks the API
+/// what is behind it.
 pub fn is_hoster_url(url: &str) -> bool {
     detect(url).is_some()
 }
@@ -258,6 +299,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn onedrive_share_links_are_routed_to_onedrive() {
+        assert_eq!(
+            Kind::detect("https://1drv.ms/u/s!AbCdEfGh"),
+            Some(Kind::OneDrive)
+        );
+        assert_eq!(
+            Kind::detect("https://onedrive.live.com/?cid=ABC&id=ABC%21123"),
+            Some(Kind::OneDrive)
+        );
+        assert!(is_hoster_url("https://1drv.ms/f/s!AbCdEfGh"));
+    }
+
     /// Ordinary links must fall through to the generic engine, and lookalike
     /// hosts must not be claimed by anyone.
     #[test]
@@ -272,10 +326,18 @@ mod tests {
             Kind::detect("https://dropbox.com.evil.com/scl/fi/abc/f.zip"),
             None
         );
+        assert_eq!(Kind::detect("https://not1drv.ms/u/s!abc"), None);
+        assert_eq!(Kind::detect("https://1drv.ms.evil.com/u/s!abc"), None);
         // A Dropbox CDN link is already direct, so no hoster claims it: there
         // is nothing to rewrite.
         assert_eq!(
             Kind::detect("https://dl.dropboxusercontent.com/cd/0/get/abc/f.zip"),
+            None
+        );
+        // OneDrive for Business lives on SharePoint and authenticates against
+        // a tenant, which an anonymous badger token cannot do.
+        assert_eq!(
+            Kind::detect("https://contoso-my.sharepoint.com/:u:/g/personal/x"),
             None
         );
         assert!(!is_hoster_url("https://example.com/f.zip"));
@@ -320,6 +382,19 @@ mod tests {
         assert!(!Kind::Dropbox.capabilities().folders);
     }
 
+    /// A OneDrive link keeps the same shape whatever is behind it, so the
+    /// syntactic answer is the one a caller can act on and the API settles the
+    /// rest. Which is not the same as saying folders are unsupported.
+    #[test]
+    fn a_onedrive_link_does_not_say_whether_it_is_a_folder() {
+        for link in ["https://1drv.ms/u/s!AbCdEfGh", "https://1drv.ms/f/s!AbCdEfGh"] {
+            assert_eq!(Kind::OneDrive.link_kind(link), LinkKind::File);
+            assert!(!Kind::OneDrive.is_folder_link(link));
+        }
+
+        assert!(Kind::OneDrive.capabilities().folders);
+    }
+
     #[test]
     fn mega_advertises_what_it_implements() {
         let caps = Kind::Mega.capabilities();
@@ -353,5 +428,16 @@ mod tests {
         assert!(caps.parallel_chunks);
         assert_eq!(Kind::Dropbox.name(), "dropbox");
         assert_eq!(Kind::Dropbox.display_name(), "Dropbox");
+    }
+
+    #[test]
+    fn onedrive_advertises_what_it_implements() {
+        let caps = Kind::OneDrive.capabilities();
+        assert!(caps.folders);
+        assert!(caps.resume);
+        assert!(!caps.integrity_check);
+        assert!(caps.parallel_chunks);
+        assert_eq!(Kind::OneDrive.name(), "onedrive");
+        assert_eq!(Kind::OneDrive.display_name(), "OneDrive");
     }
 }
