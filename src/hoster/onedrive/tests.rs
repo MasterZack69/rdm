@@ -130,7 +130,7 @@ fn children_are_read_as_files_folders_or_skipped() {
 
     let items: Vec<&DriveItem> = page.items().collect();
 
-    assert!(matches!(classify(items[0]), Some(Child::File { url }) if url == "https://cdn/a"));
+    assert!(matches!(classify(items[0]), Some(Child::File { id, url }) if id == "D!1" && url == "https://cdn/a"));
     assert!(matches!(classify(items[1]), Some(Child::Folder { id }) if id == "D!2"));
     assert!(classify(items[2]).is_none());
 }

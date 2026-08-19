@@ -167,7 +167,7 @@ impl Kind {
             // drops to a single connection, which is why these stay `true` as
             // the best case rather than being pessimised for every link.
             Self::Dropbox => Capabilities {
-                folders: true,
+                folders: false,
                 resume: true,
                 integrity_check: false,
                 parallel_chunks: true,

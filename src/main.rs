@@ -378,12 +378,13 @@ fn onedrive_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Re
             // HTTPS download, exactly like a resolved Dropbox link.
             onedrive::Resolved::File(file) => {
                 let output = resolve_output_named(opts.output.clone(), &file.name, cfg);
-                engine::run_download(
+                engine::run_download_with_identity(
                     file.url,
                     Some(output),
                     opts.connections.unwrap_or(cfg.connections),
+                    format!("onedrive:{}", file.id),
                     cancel,
-                    quiet,
+                    opts.quiet,
                 )
                 .await
             }

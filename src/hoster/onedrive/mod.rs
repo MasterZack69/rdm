@@ -191,7 +191,7 @@ impl ChildrenPage {
 
 /// What a child of a folder turned out to be.
 enum Child<'a> {
-    File { url: &'a str },
+    File { id: &'a str, url: &'a str },
     Folder { id: &'a str },
 }
 
@@ -203,7 +203,10 @@ enum Child<'a> {
 /// the reference downloader skips them too.
 fn classify(item: &DriveItem) -> Option<Child<'_>> {
     if let Some(url) = item.download_url.as_deref() {
-        return Some(Child::File { url });
+        return Some(Child::File {
+            id: item.id.as_deref()?,
+            url,
+        });
     }
     item.id.as_deref().map(|id| Child::Folder { id })
 }
@@ -266,6 +269,8 @@ pub struct DirectLink {
     pub url: String,
     /// The name the file has on OneDrive, already safe to use as a filename.
     pub name: String,
+    /// What the file is, durably, when the URL is not: a drive item id.
+    pub id: String,
 }
 
 /// A folder share, ready to be walked.
@@ -291,6 +296,8 @@ struct RemoteFile {
     name: String,
     /// Signed, ranged, and good for about an hour.
     url: String,
+    /// What the file is, durably, when the URL is not: a drive item id.
+    id: String,
 }
 
 // ── Entry points ──────────────────────────────────────────
@@ -312,6 +319,7 @@ pub async fn resolve(client: Client, url: &str, options: &OneDriveOptions) -> Re
         return Ok(Resolved::File(DirectLink {
             url: download,
             name,
+            id: root.id.unwrap_or_default(),
         }));
     }
 
@@ -427,7 +435,8 @@ pub async fn download_folder(
                         // Never `Ask`: a folder of four hundred files must not
                         // stop on a prompt hidden behind the progress board.
                         ExistingPolicy::Reuse
-                    });
+                    })
+                    .with_resume_identity(format!("onedrive:{}", file.id));
 
                     match engine::download(request, cancel, Arc::clone(&sink)).await {
                         Ok(Outcome::Completed { bytes: written, .. }) => {
@@ -600,7 +609,7 @@ async fn walk(
                 let name = safe_component(item.name.as_deref().unwrap_or_default());
 
                 match classify(item) {
-                    Some(Child::File { url }) => {
+                    Some(Child::File { id, url }) => {
                         let relative = unique(&mut taken, parent.join(&name));
                         // The leaf rather than the remote name, so a numbered
                         // collision shows up on the progress line as the file
@@ -612,6 +621,7 @@ async fn walk(
                         files.push(RemoteFile {
                             relative,
                             name,
+                            id: id.to_owned(),
                             url: url.to_owned(),
                         });
                     }

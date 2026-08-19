@@ -22,6 +22,7 @@ pub struct ParallelDownloadCtx<'a> {
     pub chunks: &'a [Chunk],
     pub retry_config: &'a RetryConfig,
     pub cancel: CancellationToken,
+    pub identity: Option<String>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
 }
@@ -82,6 +83,7 @@ where
         meta_path,
         temp_path,
         ctx.url,
+        ctx.identity.as_deref(),
         ctx.file_size,
         ctx.chunks,
         ctx.etag.as_deref(),
@@ -215,17 +217,19 @@ where
     Ok(total_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_or_create_metadata(
     meta_path: &str,
     temp_path: &str,
     url: &str,
+    identity: Option<&str>,
     file_size: u64,
     chunks: &[Chunk],
     etag: Option<&str>,
     last_modified: Option<&str>,
 ) -> Result<ResumeMetadata> {
     if let Ok(existing) = resume::load(meta_path).await {
-        if resume::validate_against(&existing, url, file_size, chunks)
+        if resume::validate_against(&existing, url, identity, file_size, chunks)
             && existing.matches_server_identity(etag, last_modified)
         {
             eprintln!("  [Resume] Using existing chunk layout ({} chunks)", existing.chunks.len());
@@ -234,12 +238,15 @@ async fn load_or_create_metadata(
 
         if !existing.matches_server_identity(etag, last_modified) {
             eprintln!("  [Resume] Server file changed (ETag/Last-Modified mismatch), restarting");
+        } else {
+            eprintln!("  [Resume] Saved state is for a different source, restarting");
         }
         let _ = resume::delete(meta_path).await;
         let _ = fs::remove_file(temp_path).await;
     }
 
     let mut meta = resume::create_new(url.to_owned(), file_size, chunks);
+    meta.identity = identity.map(|s| s.to_owned());
     meta.etag = etag.map(|s| s.to_owned());
     meta.last_modified = last_modified.map(|s| s.to_owned());
 
