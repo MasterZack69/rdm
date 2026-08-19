@@ -72,6 +72,9 @@ use tokio_util::sync::CancellationToken;
 use crate::engine::{self, DownloadRequest, ExistingPolicy, Outcome};
 use crate::ui::{self, Board};
 
+#[cfg(test)]
+mod tests;
+
 /// Where personal shares are served from.
 const API_BASE: &str = "https://my.microsoftpersonalcontent.com/_api/v2.0";
 
@@ -802,23 +805,3 @@ fn snippet(body: &[u8]) -> String {
 async fn backoff(attempt: u32) {
     tokio::time::sleep(Duration::from_millis(250u64 << attempt.min(5))).await;
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── Link recognition ──
-
-    #[test]
-    fn onedrive_links_are_recognised() {
-        assert!(is_onedrive_url("https://1drv.ms/u/s!AbCdEf"));
-        assert!(is_onedrive_url("https://1drv.ms/f/s!AbCdEf"));
-        assert!(is_onedrive_url("  https://1drv.ms/u/s!AbCdEf  "));
-        assert!(is_onedrive_url("http://1drv.ms/u/s!AbCdEf"));
-        assert!(is_onedrive_url("https://onedrive.live.com/?cid=ABC&id=ABC%21123"));
-        assert!(is_onedrive_url("https://WWW.OneDrive.Live.Com/redir?resid=ABC"));
-    }
-
-    /// Lookalikes fall through to the generic engine. Business shares are left
-    /// alone on purpose: an anonymous token cannot open a tenant's share, so
-    /// claiming one would only turn a maybe into a certain failure.
