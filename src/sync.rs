@@ -4,11 +4,11 @@
 //! the actual downloading is handed to [`crate::queue`], so a sync shows the
 //! same live per-file board as `rdm queue start`.
 //!
-//! MEGA folder shares take a separate path through [`run`]. Almost none of the
-//! machinery here applies to them: there is no HTML listing to scrape, no
-//! `HEAD` request to compare sizes with, and no per-file URL that could become
-//! a queue item. What they do give is a node tree with exact sizes in it,
-//! which makes the whole verification phase unnecessary.
+//! MEGA and OneDrive folder shares take separate paths through [`run`]. Almost
+//! none of the machinery here applies to them: there is no HTML listing to
+//! scrape, no `HEAD` request to compare sizes with, and no per-file URL that
+//! could become a queue item. What they do give is a node tree with exact sizes
+//! in it, which makes the whole verification phase unnecessary.
 
 use anyhow::{Context, Result};
 use reqwest::header::CONTENT_LENGTH;
@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::engine;
+use crate::hoster::onedrive;
 use crate::mega;
 use crate::queue;
 use crate::scrape;
@@ -59,6 +60,23 @@ pub async fn run(
         // default.
         let workers = requested_connections.unwrap_or(cfg.mega_workers);
         return run_mega(
+            cfg,
+            url,
+            workers,
+            delete,
+            output_dir.as_deref(),
+            ext_filter,
+            cancel,
+        )
+        .await;
+    }
+
+    // Also before the queue guard, and for the same reason: this path does not
+    // use the queue either. `-c` is files-at-once here, so it falls back to
+    // onedrive_workers rather than the generic default.
+    if onedrive::is_onedrive_url(url) {
+        let workers = requested_connections.unwrap_or(cfg.onedrive_workers);
+        return run_onedrive(
             cfg,
             url,
             workers,
@@ -481,7 +499,7 @@ async fn run_mega(
             Some(_) => {
                 let keep: HashSet<String> = entries.iter().map(|e| e.display_path()).collect();
                 if base.is_dir() {
-                    collect_mega_orphans(&base, &base, &keep, &ext_filter, &mut to_delete);
+                    collect_listing_orphans(&base, &base, &keep, &ext_filter, &mut to_delete);
                     to_delete.sort();
                 }
             }
@@ -666,6 +684,262 @@ async fn run_mega(
     Ok(())
 }
 
+// -- OneDrive --------------------------------------------------------
+
+/// Mirrors a OneDrive folder share.
+///
+/// Closer to the MEGA path than the HTTP one, for the same reason: no listing
+/// page to scrape, and no stable per-file URL to `HEAD` — the address the API
+/// hands back is signed and was minted seconds ago. What it does give is a size
+/// per child, so "is my copy current?" is a `stat` call and the verification
+/// phase disappears.
+///
+/// Unlike a MEGA share, a folder share has a name of its own, so the mirror
+/// gets its own directory and `--delete` does not need `-o` to be safe.
+async fn run_onedrive(
+    cfg: &Config,
+    url: &str,
+    workers: usize,
+    delete: bool,
+    explicit_dir: Option<&str>,
+    ext_filter: Option<HashSet<String>>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let options = onedrive::OneDriveOptions {
+        workers,
+        max_retries: cfg.max_retries,
+        // Nothing reaching the download phase has a good local copy, and the
+        // stale ones are removed below rather than resumed onto — which keeps
+        // any .part beside them alive.
+        overwrite: false,
+    };
+
+    let folder = match onedrive::resolve(reqwest::Client::new(), url, &options).await? {
+        onedrive::Resolved::Folder(folder) => folder,
+        onedrive::Resolved::File(_) => anyhow::bail!(
+            "`rdm sync` mirrors a folder \u{2014} for a single OneDrive file use `rdm <link>`"
+        ),
+    };
+
+    let listing = onedrive::list_folder(&folder, &options)
+        .await
+        .context("Failed to list the OneDrive folder")?;
+
+    let mut files = listing.files;
+    let total_before_filter = files.len();
+
+    if let Some(exts) = ext_filter.as_ref() {
+        files.retain(|file| file_has_ext(&file.name, exts));
+
+        let mut sorted: Vec<&str> = exts.iter().map(|s| s.as_str()).collect();
+        sorted.sort();
+        eprintln!(
+            "  \u{1f50e} Filter: {} → {} file(s) matching .{}",
+            total_before_filter,
+            files.len(),
+            sorted.join(", ."),
+        );
+    }
+
+    if files.is_empty() {
+        eprintln!("  \u{274c} No files found in that OneDrive folder");
+        return Ok(());
+    }
+
+    if cancel.is_cancelled() {
+        eprintln!("  \u{26a0} Cancelled during scan.");
+        return Ok(());
+    }
+
+    let base = onedrive::destination_root(
+        explicit_dir.map(|dir| dir.to_owned()),
+        &cfg.download_dir,
+        folder.name(),
+    );
+
+    let mut to_delete: Vec<String> = Vec::new();
+    if delete {
+        if listing.skipped > 0 {
+            // The same hazard as an undecryptable MEGA node: a child with
+            // nothing to fetch never reaches `keep`, and an upload still in
+            // progress then looks exactly like a file the share dropped. One
+            // of those readings deletes a local copy that is still wanted.
+            eprintln!(
+                "  \u{26a0} Skipping --delete: {} item(s) in this share are neither a",
+                listing.skipped
+            );
+            eprintln!("    file nor a folder, so their local copies cannot be told apart");
+            eprintln!("    from orphans. Nothing will be deleted this run.");
+        } else if base.is_dir() {
+            let keep: HashSet<String> = files.iter().map(|f| relative_key(&f.relative)).collect();
+            collect_listing_orphans(&base, &base, &keep, &ext_filter, &mut to_delete);
+            to_delete.sort();
+        }
+    }
+
+    let total_remote = files.len();
+    let mut up_to_date = 0u64;
+    let mut unverified = 0u64;
+    let mut to_download: Vec<onedrive::RemoteFile> = Vec::new();
+
+    for file in files {
+        let path = base.join(&file.relative);
+        match (file.size, std::fs::metadata(&path)) {
+            // Exact sizes come free with the listing, so this is the whole
+            // verification phase.
+            (Some(size), Ok(meta)) if meta.is_file() && meta.len() == size => up_to_date += 1,
+            // A wrong-sized copy is stale. Removing it here rather than asking
+            // the engine to overwrite keeps any .part and .rdm beside it, so an
+            // interrupted mirror still resumes instead of starting over.
+            (Some(_), Ok(meta)) if meta.is_file() => {
+                let _ = std::fs::remove_file(&path);
+                to_download.push(file);
+            }
+            // No size to compare against. The HTTP path makes the same call
+            // when a HEAD fails: leave the file alone and say how many.
+            (None, Ok(meta)) if meta.is_file() && meta.len() > 0 => {
+                unverified += 1;
+                up_to_date += 1;
+            }
+            _ => to_download.push(file),
+        }
+    }
+
+    eprintln!();
+    eprintln!("  Remote     : {} file(s)", total_remote);
+    eprintln!("  Into       : {}", base.display());
+    eprintln!("  Up to date : {}", up_to_date);
+    if unverified > 0 {
+        eprintln!("  Unverified : {} file(s) the listing gave no size for", unverified);
+    }
+    eprintln!("  To download: {}", to_download.len());
+    if delete {
+        eprintln!("  To delete  : {}", to_delete.len());
+    }
+    // Stated whether or not --delete was asked for: a "complete" mirror that is
+    // quietly missing files is worse than a noisy one.
+    if listing.skipped > 0 {
+        eprintln!("  Skipped    : {} item(s) with nothing to fetch", listing.skipped);
+    }
+
+    if to_download.is_empty() && to_delete.is_empty() {
+        eprintln!();
+        eprintln!("  \u{2705} Everything is up to date!");
+        return Ok(());
+    }
+
+    if !to_download.is_empty() {
+        eprintln!();
+        print_sample(
+            "+",
+            to_download.iter().map(|f| relative_key(&f.relative)),
+            to_download.len(),
+        );
+    }
+
+    if !to_delete.is_empty() {
+        eprintln!();
+        print_sample("-", to_delete.iter().cloned(), to_delete.len());
+    }
+
+    eprintln!();
+
+    let mut downloaded = 0u64;
+
+    if !to_download.is_empty() {
+        onedrive::create_tree(&base, &listing.dirs)
+            .await
+            .context("Failed to create the mirror's directories")?;
+
+        let done = onedrive::download_files(
+            &to_download,
+            &base,
+            &options,
+            cancel.clone(),
+            onedrive::Progress::Board,
+        )
+        .await?;
+
+        downloaded = done.completed as u64;
+        up_to_date += done.skipped as u64;
+
+        if downloaded > 0 {
+            eprintln!();
+            eprintln!(
+                "  {} file(s) downloaded, {}",
+                downloaded,
+                ui::format_size(done.bytes)
+            );
+        }
+
+        if done.cancelled {
+            eprintln!();
+            eprintln!(
+                "  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off."
+            );
+            return Ok(());
+        }
+
+        // Deleting after a partial mirror could remove files the failed
+        // downloads were meant to replace.
+        if !done.failed.is_empty() {
+            eprintln!();
+            eprintln!("  \u{26a0} {} file(s) failed:", done.failed.len());
+            for (path, reason) in &done.failed {
+                eprintln!("     - {path}: {reason}");
+            }
+            eprintln!();
+            eprintln!("  \u{26a0} Skipping delete phase after failures.");
+            return Ok(());
+        }
+    }
+
+    if !to_delete.is_empty() {
+        if cancel.is_cancelled() {
+            eprintln!("  \u{26a0} Cancelled before delete phase.");
+            return Ok(());
+        }
+
+        let total_local = up_to_date as usize + downloaded as usize + to_delete.len();
+        if !confirm_bulk_delete(to_delete.len(), total_local) {
+            return Ok(());
+        }
+
+        let progress = ui::CountProgress::new("Deleting orphans", to_delete.len());
+        let mut deleted = 0u64;
+        let mut delete_failed = 0u64;
+
+        for relative in &to_delete {
+            let full_path = base.join(relative);
+            match std::fs::remove_file(&full_path) {
+                Ok(_) => {
+                    deleted += 1;
+                    let _ = std::fs::remove_file(format!("{}.part", full_path.display()));
+                    let meta = crate::resume::ResumeMetadata::meta_path(&full_path.to_string_lossy());
+                    let _ = std::fs::remove_file(&meta);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    delete_failed += 1;
+                    progress.note(&format!("  \u{26a0} Failed to delete {}: {}", relative, e));
+                }
+            }
+            progress.tick();
+        }
+
+        progress.finish(&format!("{} file(s) deleted", deleted));
+        remove_empty_dirs(&base);
+
+        if delete_failed > 0 {
+            eprintln!("  \u{26a0} Failed to delete {} file(s)", delete_failed);
+        }
+    }
+
+    eprintln!();
+    eprintln!("  \u{2705} Sync complete!");
+    Ok(())
+}
+
 /// Joins share-relative components onto the destination.
 ///
 /// Components were sanitised when the node tree was decrypted, so this does
@@ -686,10 +960,11 @@ fn join_relative(base: &Path, components: &[String]) -> PathBuf {
 /// the downloader happens to use) belongs to a file we are keeping, so it is
 /// left alone without this function needing to know the naming scheme.
 ///
-/// Callers must not reach here when part of the share is undecryptable: `keep`
-/// would be missing those files' names and their local copies would be
-/// reported as orphans.
-fn collect_mega_orphans(
+/// Callers must not reach here with an incomplete listing: `keep` would be
+/// missing those files' names and their local copies would be reported as
+/// orphans. MEGA's undecryptable nodes and OneDrive's unwalkable children are
+/// both that case.
+fn collect_listing_orphans(
     dir: &Path,
     base: &Path,
     keep: &HashSet<String>,
@@ -705,7 +980,7 @@ fn collect_mega_orphans(
         let path = entry.path();
 
         if path.is_dir() {
-            collect_mega_orphans(&path, base, keep, ext_filter, out);
+            collect_listing_orphans(&path, base, keep, ext_filter, out);
             continue;
         }
         if !path.is_file() {
@@ -800,6 +1075,12 @@ enum SyncRoot {
 fn local_path(cfg: &Config, relative: &str) -> PathBuf {
     let decoded = engine::percent_decode(relative);
     PathBuf::from(cfg.resolve_output_path(&decoded))
+}
+
+/// A listing path in the form [`collect_listing_orphans`] derives from disk:
+/// slash-separated and relative to the mirror root.
+fn relative_key(relative: &Path) -> String {
+    relative.to_string_lossy().replace('\\', "/")
 }
 
 fn extract_filename(path: &str) -> String {
@@ -934,7 +1215,7 @@ mod tests {
 
         let keep = keep_set(&["keep.jpg", "sub/nested.jpg"]);
         let mut out = Vec::new();
-        collect_mega_orphans(base, base, &keep, &None, &mut out);
+        collect_listing_orphans(base, base, &keep, &None, &mut out);
         out.sort();
 
         assert_eq!(out, vec!["gone.jpg", "sub/also-gone.jpg"]);
@@ -957,7 +1238,7 @@ mod tests {
 
         let keep = keep_set(&["movie.mkv"]);
         let mut out = Vec::new();
-        collect_mega_orphans(base, base, &keep, &None, &mut out);
+        collect_listing_orphans(base, base, &keep, &None, &mut out);
 
         // Only the leftover with no kept file behind it is an orphan.
         assert_eq!(out, vec!["stray.mkv.part"]);
@@ -973,7 +1254,7 @@ mod tests {
 
         let exts: HashSet<String> = keep_set(&["jpg"]);
         let mut out = Vec::new();
-        collect_mega_orphans(base, base, &HashSet::new(), &Some(exts), &mut out);
+        collect_listing_orphans(base, base, &HashSet::new(), &Some(exts), &mut out);
 
         // notes.txt was never in scope for this sync, so it is not an orphan.
         assert_eq!(out, vec!["gone.jpg"]);
@@ -994,7 +1275,7 @@ mod tests {
         // Only the readable node made it into the listing.
         let keep = keep_set(&["readable.jpg"]);
         let mut out = Vec::new();
-        collect_mega_orphans(base, base, &keep, &None, &mut out);
+        collect_listing_orphans(base, base, &keep, &None, &mut out);
 
         assert_eq!(
             out,

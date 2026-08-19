@@ -70,7 +70,7 @@ use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{self, DownloadRequest, ExistingPolicy, Outcome};
-use crate::ui::{self, Board};
+use crate::ui::{self, Board, ProgressSink, SlotState};
 
 #[cfg(test)]
 mod tests;
@@ -134,7 +134,7 @@ fn share_id(url: &str) -> String {
 fn children_url(item_id: &str) -> String {
     let drive_id = item_id.split('!').next().unwrap_or(item_id);
     format!(
-        "{API_BASE}/drives/{drive_id}/items/{item_id}?select=children&expand=children(select=name,@content.downloadUrl,id)"
+        "{API_BASE}/drives/{drive_id}/items/{item_id}?select=children&expand=children(select=name,@content.downloadUrl,id,size)"
     )
 }
 
@@ -155,6 +155,9 @@ struct DriveItem {
     /// learning the same thing, and two answers can disagree.
     #[serde(rename = "@content.downloadUrl")]
     download_url: Option<String>,
+    /// Bytes. Selected on a folder listing but not on the root item: "is my
+    /// copy current?" is a question only the listing has to answer.
+    size: Option<u64>,
 }
 
 /// One page of a folder's children.
@@ -283,21 +286,106 @@ pub struct Folder {
     name: Option<String>,
 }
 
+impl Folder {
+    /// The folder's own name, when the share had one.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+}
+
+/// What a walk of a folder share found.
+pub struct Listing {
+    /// Every file under the folder, in walk order.
+    pub files: Vec<RemoteFile>,
+    /// Every directory seen, empty ones included.
+    pub dirs: Vec<PathBuf>,
+    /// Children that were neither: no download URL and no id. Counted rather
+    /// than dropped silently, because a caller that deletes local files needs
+    /// to know its picture of the share is incomplete.
+    pub skipped: usize,
+}
+
+/// Where a folder download reports to.
+pub enum Progress {
+    /// This module's own board: one live line per file in flight.
+    Board,
+    /// One caller-owned line for the whole folder, which is all a queue item
+    /// gets — it holds a single lane on a board it does not own.
+    Lane(Arc<dyn ProgressSink>),
+    /// Nothing.
+    Silent,
+}
+
+/// Adds many files' progress up into one line.
+///
+/// A lane draws one bar, and [`crate::engine`] reports the absolute byte count
+/// of the one file it was handed, so several engines sharing a lane would each
+/// overwrite the others' numbers. This keeps a running total instead: the lane
+/// is told the whole folder's size once, and every file folds in as a delta.
+struct FolderLane {
+    lane: Arc<dyn ProgressSink>,
+    done: AtomicU64,
+}
+
+impl FolderLane {
+    /// Folds one file's new absolute count into the folder's total.
+    ///
+    /// `previous` is per-file, so a file whose chunk restarts and reports fewer
+    /// bytes than last time subtracts instead of being counted twice.
+    fn shift(&self, previous: u64, current: u64) {
+        let done = if current >= previous {
+            let step = current - previous;
+            self.done.fetch_add(step, Ordering::Relaxed) + step
+        } else {
+            let step = previous - current;
+            self.done.fetch_sub(step, Ordering::Relaxed) - step
+        };
+        self.lane.progress(done);
+    }
+}
+
+/// One file's view of a shared lane.
+struct FileLane {
+    folder: Arc<FolderLane>,
+    reported: AtomicU64,
+}
+
+impl ProgressSink for FileLane {
+    fn progress(&self, downloaded: u64) {
+        let previous = self.reported.swap(downloaded, Ordering::Relaxed);
+        self.folder.shift(previous, downloaded);
+    }
+
+    /// The lane's total is the folder's, set before any file started.
+    fn total(&self, _bytes: Option<u64>) {}
+
+    /// Retries and server hiccups are worth seeing even mid-folder.
+    fn note(&self, msg: &str) {
+        self.folder.lane.note(msg);
+    }
+
+    /// The lane belongs to the caller and outlives this file.
+    fn finish(&self) {}
+}
+
 /// A client that already carries the badger token.
 struct Session {
     client: Client,
 }
 
 /// One file to fetch.
-struct RemoteFile {
+pub struct RemoteFile {
     /// Path relative to the download root, folders included.
-    relative: PathBuf,
+    pub relative: PathBuf,
     /// Leaf name, for the progress line.
-    name: String,
+    pub name: String,
     /// Signed, ranged, and good for about an hour.
-    url: String,
+    pub url: String,
     /// What the file is, durably, when the URL is not: a drive item id.
-    id: String,
+    pub id: String,
+    /// Bytes as the listing reported them. `None` only matters to a caller
+    /// comparing against a local copy.
+    pub size: Option<u64>,
 }
 
 // ── Entry points ──────────────────────────────────────────
@@ -350,32 +438,59 @@ pub async fn download_folder(
     download_dir: &str,
     options: OneDriveOptions,
     cancel: CancellationToken,
-    quiet: bool,
+    progress: Progress,
 ) -> Result<OneDriveSummary> {
-    let workers = options.workers.clamp(1, WORKERS_MAX);
-    let (files, dirs) = walk(&folder.session, &folder.id, &options).await?;
-    let root = destination_root(output, download_dir, folder.name.as_deref());
+    let listing = list_folder(&folder, &options).await?;
+    let root = destination_root(output, download_dir, folder.name());
 
-    fs::create_dir_all(&root)
+    create_tree(&root, &listing.dirs).await?;
+    download_files(&listing.files, &root, &options, cancel, progress).await
+}
+
+/// Walks a folder share without downloading anything.
+pub async fn list_folder(folder: &Folder, options: &OneDriveOptions) -> Result<Listing> {
+    walk(&folder.session, &folder.id, options).await
+}
+
+/// Creates the download root and every directory the walk saw.
+///
+/// Empty ones included: an empty folder is still part of the structure the
+/// share had. Doing it up front also means every file's parent exists before
+/// any transfer starts, so nothing below has to create anything.
+pub async fn create_tree(root: &Path, dirs: &[PathBuf]) -> Result<()> {
+    fs::create_dir_all(root)
         .await
         .with_context(|| format!("could not create {}", root.display()))?;
 
-    // Every directory the walk saw, empty ones included: an empty folder is
-    // still part of the structure the share had. Doing it here also means every
-    // file's parent exists before any transfer starts, so nothing below has to
-    // create anything.
-    for dir in &dirs {
+    for dir in dirs {
         let path = root.join(dir);
         fs::create_dir_all(&path)
             .await
             .with_context(|| format!("could not create {}", path.display()))?;
     }
 
+    Ok(())
+}
+
+/// Downloads an explicit list of files under `root`.
+///
+/// Separate from [`download_folder`] because two callers want a subset of a
+/// walk rather than all of it: `rdm sync` skips what is already on disk, and a
+/// queue item reports a whole folder into one line.
+pub async fn download_files(
+    files: &[RemoteFile],
+    root: &Path,
+    options: &OneDriveOptions,
+    cancel: CancellationToken,
+    progress: Progress,
+) -> Result<OneDriveSummary> {
+    let total = files.len();
+
     if files.is_empty() {
         // A folder share with nothing downloadable in it is a result, not a
         // failure: the directories are on disk and there is nothing to fetch.
         return Ok(OneDriveSummary {
-            root,
+            root: root.to_path_buf(),
             total: 0,
             completed: 0,
             skipped: 0,
@@ -385,8 +500,27 @@ pub async fn download_folder(
         });
     }
 
-    let total = files.len();
-    let board = (!quiet).then(|| Board::new("OneDrive", total, workers));
+    let workers = options.workers.clamp(1, WORKERS_MAX);
+
+    let (board, folder_lane) = match progress {
+        Progress::Board => (Some(Board::new("OneDrive", total, workers)), None),
+        Progress::Lane(lane) => {
+            // One file missing a size means the folder's total is unknown: a
+            // total that quietly leaves files out is worse than none, because
+            // the bar would finish while files were still downloading.
+            lane.total(files.iter().map(|file| file.size).sum::<Option<u64>>());
+            lane.state(SlotState::Downloading);
+            (
+                None,
+                Some(Arc::new(FolderLane {
+                    lane,
+                    done: AtomicU64::new(0),
+                })),
+            )
+        }
+        Progress::Silent => (None, None),
+    };
+
     let renderer = board.as_ref().map(|b| b.spawn_renderer());
 
     let completed = AtomicUsize::new(0);
@@ -398,6 +532,7 @@ pub async fn download_folder(
     {
         let root = &root;
         let board = board.as_ref();
+        let folder_lane = folder_lane.as_ref();
         let completed = &completed;
         let skipped = &skipped;
         let bytes = &bytes;
@@ -418,7 +553,14 @@ pub async fn download_folder(
                     // would hand the display slot to another worker while this
                     // one is still reporting into it.
                     let lane = board.and_then(|b| b.claim(index as u64 + 1, &file.name));
-                    let sink = lane.as_ref().map(|l| l.sink()).unwrap_or_else(ui::silent);
+                    let sink: Arc<dyn ProgressSink> = match (lane.as_ref(), folder_lane) {
+                        (Some(lane), _) => lane.sink(),
+                        (None, Some(folder)) => Arc::new(FileLane {
+                            folder: Arc::clone(folder),
+                            reported: AtomicU64::new(0),
+                        }),
+                        (None, None) => ui::silent(),
+                    };
 
                     let destination = root.join(&file.relative);
                     let request = DownloadRequest::new(
@@ -450,6 +592,12 @@ pub async fn download_folder(
                             skipped.fetch_add(1, Ordering::Relaxed);
                             if let Some(board) = board {
                                 board.file_skipped();
+                            }
+                            // Part of the total the lane was given, so it has
+                            // to count as done — a bar that can never fill is
+                            // worse than one that jumps.
+                            if let Some(folder) = folder_lane {
+                                folder.shift(0, file.size.unwrap_or(0));
                             }
                         }
                         Ok(Outcome::Cancelled) => {
@@ -485,7 +633,7 @@ pub async fn download_folder(
     }
 
     Ok(OneDriveSummary {
-        root,
+        root: root.to_path_buf(),
         total,
         completed: completed.load(Ordering::Relaxed),
         skipped: skipped.load(Ordering::Relaxed),
@@ -501,7 +649,7 @@ pub async fn download_folder(
 /// and there is no single file for a filename to name. Otherwise the folder
 /// keeps its own name, which is the one thing about a share that means anything
 /// to the person who was sent it.
-fn destination_root(
+pub fn destination_root(
     output: Option<String>,
     download_dir: &str,
     folder_name: Option<&str>,
@@ -580,7 +728,7 @@ async fn root_item(session: &Session, url: &str, options: &OneDriveOptions) -> R
 
 // ── Folder walk ───────────────────────────────────────────
 
-/// Every file under a folder, plus every directory seen on the way.
+/// Everything under a folder, plus every directory seen on the way.
 ///
 /// An explicit stack rather than recursion: an async fn that calls itself has to
 /// be boxed, and the stack keeps the collision bookkeeping in one place.
@@ -588,10 +736,11 @@ async fn walk(
     session: &Session,
     root: &str,
     options: &OneDriveOptions,
-) -> Result<(Vec<RemoteFile>, Vec<PathBuf>)> {
+) -> Result<Listing> {
     let mut files: Vec<RemoteFile> = Vec::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut taken: HashSet<PathBuf> = HashSet::new();
+    let mut skipped = 0usize;
     let mut stack: Vec<(String, PathBuf)> = vec![(root.to_owned(), PathBuf::new())];
 
     while let Some((id, parent)) = stack.pop() {
@@ -623,6 +772,7 @@ async fn walk(
                             name,
                             id: id.to_owned(),
                             url: url.to_owned(),
+                            size: item.size,
                         });
                     }
                     Some(Child::Folder { id }) => {
@@ -630,7 +780,7 @@ async fn walk(
                         dirs.push(dir.clone());
                         stack.push((id.to_owned(), dir));
                     }
-                    None => {}
+                    None => skipped += 1,
                 }
             }
 
@@ -641,7 +791,7 @@ async fn walk(
         }
     }
 
-    Ok((files, dirs))
+    Ok(Listing { files, dirs, skipped })
 }
 
 /// Turns a remote name into exactly one safe path component.

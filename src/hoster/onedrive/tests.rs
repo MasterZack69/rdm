@@ -73,7 +73,7 @@ fn a_listing_url_carries_the_drive_and_the_item() {
         "{url}"
     );
     assert!(
-        url.contains("expand=children(select=name,@content.downloadUrl,id)"),
+        url.contains("expand=children(select=name,@content.downloadUrl,id,size)"),
         "{url}"
     );
 }

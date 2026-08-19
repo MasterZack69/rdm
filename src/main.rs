@@ -395,7 +395,11 @@ fn onedrive_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Re
                     &cfg.download_dir,
                     options,
                     cancel,
-                    quiet,
+                    if opts.quiet {
+                        onedrive::Progress::Silent
+                    } else {
+                        onedrive::Progress::Board
+                    },
                 )
                 .await?;
                 report_onedrive(&summary, quiet);
