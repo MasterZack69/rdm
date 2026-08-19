@@ -42,6 +42,13 @@ pub struct Config {
     /// account per run", which is what the website does for visitors.
     #[serde(default)]
     pub gofile_token: String,
+
+    /// Files of a OneDrive folder share to download at once.
+    ///
+    /// Files, not chunks: each file takes its own connection, so a folder
+    /// share fills the pipe by running several files side by side.
+    #[serde(default = "default_onedrive_workers")]
+    pub onedrive_workers: usize,
 }
 
 fn default_mega_workers() -> usize {
@@ -50,6 +57,10 @@ fn default_mega_workers() -> usize {
 
 fn default_gofile_workers() -> usize {
     crate::hoster::gofile::WORKERS_DEFAULT
+}
+
+fn default_onedrive_workers() -> usize {
+    crate::hoster::onedrive::WORKERS_DEFAULT
 }
 
 fn default_true() -> bool {
@@ -74,6 +85,7 @@ impl Default for Config {
             mega_resume_on_ip_change: true,
             gofile_workers: default_gofile_workers(),
             gofile_token: String::new(),
+            onedrive_workers: default_onedrive_workers(),
         }
     }
 }
@@ -133,6 +145,7 @@ impl Config {
         eprintln!("  MEGA verify: {}", self.mega_verify_mac);
         eprintln!("  MEGA VPN   : {}", self.mega_resume_on_ip_change);
         eprintln!("  GoFile     : {} file(s) at a time", self.gofile_workers);
+        eprintln!("  OneDrive   : {} file(s) at a time", self.onedrive_workers);
         // Never print the token itself: config output gets pasted into bug
         // reports.
         eprintln!(
@@ -171,6 +184,10 @@ queue_parallel = 5
         assert_eq!(
             cfg.gofile_workers,
             crate::hoster::gofile::WORKERS_DEFAULT
+        );
+        assert_eq!(
+            cfg.onedrive_workers,
+            crate::hoster::onedrive::WORKERS_DEFAULT
         );
         assert!(cfg.gofile_token.is_empty());
     }

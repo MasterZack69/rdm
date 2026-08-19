@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use rdm::args::{
     Cli, ClearTarget, Command, DownloadOpts, QueueCommand, RetryTarget, normalize_extensions,
 };
-use rdm::hoster::{dropbox, gofile};
+use rdm::hoster::{dropbox, gofile, onedrive};
 use rdm::ui::{self, ProgressSink};
 use rdm::{config, engine, mega, queue, scrape, signal, sync};
 
@@ -48,6 +48,15 @@ fn main() -> Result<()> {
             // rewriting rather than normalising as a path.
             if dropbox::is_dropbox_url(&url) {
                 return dropbox_download(&cfg, &url, &opts);
+            }
+
+            // And OneDrive, for the same reason as MEGA and GoFile: a share
+            // link has no extension and no trailing slash, so the directory
+            // heuristic would call it a listing, and the generic engine would
+            // save an HTML preview page under a plausible filename. Only the
+            // API knows what is behind it.
+            if onedrive::is_onedrive_url(&url) {
+                return onedrive_download(&cfg, &url, &opts);
             }
 
             let url = engine::normalize_download_url(&url);
@@ -173,6 +182,19 @@ fn quick_download(
             );
         }
         return dropbox_download(cfg, url, opts);
+    }
+
+    // OneDrive is the same trap a fourth time: `1drv.ms/u/s!Abc` has no
+    // extension and no trailing slash either, so the listing heuristic claims
+    // it, and the generic engine would save the HTML preview page under a
+    // plausible filename. Hence the check sitting above it.
+    if onedrive::is_onedrive_url(url) {
+        if parallel.is_some() && !opts.quiet {
+            eprintln!(
+                "  \u{26a0} -p applies to directory listings; a OneDrive link is one share."
+            );
+        }
+        return onedrive_download(cfg, url, opts);
     }
 
     let url = engine::normalize_download_url(url);
@@ -335,6 +357,50 @@ fn gofile_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Resu
 
         report_gofile(&summary, quiet);
         Ok(())
+    })
+}
+
+/// `rdm <onedrive link>` \u{2014} redeem the share and download whatever it turns
+/// out to be.
+///
+/// The one request that says file-or-folder is also the one that redeems the
+/// share for the anonymous token, so there is nothing cheaper to ask first and
+/// no reason to ask twice. A file lands through the generic engine, exactly
+/// like a resolved Dropbox link; a folder is walked and downloaded by the
+/// OneDrive module itself.
+fn onedrive_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    let options = onedrive_options(cfg, opts);
+    let quiet = opts.quiet;
+
+    run_async(|cancel| async move {
+        match onedrive::resolve(reqwest::Client::new(), url, &options).await? {
+            // One file, one destination: from here it is an ordinary ranged
+            // HTTPS download, exactly like a resolved Dropbox link.
+            onedrive::Resolved::File(file) => {
+                let output = resolve_output_named(opts.output.clone(), &file.name, cfg);
+                engine::run_download(
+                    file.url,
+                    Some(output),
+                    opts.connections.unwrap_or(cfg.connections),
+                    cancel,
+                    quiet,
+                )
+                .await
+            }
+            onedrive::Resolved::Folder(folder) => {
+                let summary = onedrive::download_folder(
+                    folder,
+                    opts.output.clone(),
+                    &cfg.download_dir,
+                    options,
+                    cancel,
+                    quiet,
+                )
+                .await?;
+                report_onedrive(&summary, quiet);
+                Ok(())
+            }
+        }
     })
 }
 
@@ -669,6 +735,16 @@ fn gofile_options(cfg: &config::Config, opts: &DownloadOpts) -> gofile::GofileOp
     }
 }
 
+/// `-c` means files in flight here, the same double meaning it has for GoFile:
+/// a OneDrive folder share is downloaded one connection per file.
+fn onedrive_options(cfg: &config::Config, opts: &DownloadOpts) -> onedrive::OneDriveOptions {
+    onedrive::OneDriveOptions {
+        workers: opts.connections.unwrap_or(cfg.onedrive_workers),
+        max_retries: cfg.max_retries,
+        overwrite: false,
+    }
+}
+
 fn report_mega(outcome: &mega::MegaOutcome, quiet: bool) {
     if quiet {
         return;
@@ -739,6 +815,40 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
 /// Same shape as the MEGA folder report, for the same reason: one dead file in
 /// a content id does not make the other forty a failure.
 fn report_gofile(summary: &gofile::GofileSummary, quiet: bool) {
+    if quiet {
+        return;
+    }
+
+    eprintln!();
+    eprintln!("  \u{1f4c1} {}", summary.root.display());
+    eprintln!(
+        "     {} of {} file(s), {}",
+        summary.completed,
+        summary.total,
+        ui::format_size(summary.bytes)
+    );
+
+    if summary.skipped > 0 {
+        eprintln!("     {} already on disk", summary.skipped);
+    }
+
+    if !summary.failed.is_empty() {
+        eprintln!();
+        eprintln!("  \u{26a0} {} file(s) failed:", summary.failed.len());
+        for (path, reason) in &summary.failed {
+            eprintln!("     - {path}: {reason}");
+        }
+    }
+
+    if summary.cancelled {
+        eprintln!();
+        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
+    }
+}
+
+/// Same shape as the MEGA and GoFile folder reports, for the same reason: one
+/// dead file in a OneDrive share does not make the other forty a failure.
+fn report_onedrive(summary: &onedrive::OneDriveSummary, quiet: bool) {
     if quiet {
         return;
     }
@@ -1125,5 +1235,42 @@ mod tests {
             }
             Ok(set) => assert_eq!(dropbox::password_from_env().as_deref(), Some(set.as_str())),
         }
+    }
+
+    // -- OneDrive routing --
+
+    /// The same trap a fourth time: `u/s!AbCdEfGh` has no extension and no
+    /// trailing slash, so the heuristic calls it a listing and the scraper
+    /// would find a preview page. Hence the OneDrive check sitting above it.
+    #[test]
+    fn onedrive_links_would_be_mistaken_for_listings() {
+        let link = "https://1drv.ms/u/s!AbCdEfGh";
+        assert!(onedrive::is_onedrive_url(link));
+        assert!(
+            looks_like_directory(link),
+            "if this ever stops being true the ordering comment above is stale, not wrong"
+        );
+    }
+
+    #[test]
+    fn ordinary_links_are_not_sent_to_onedrive() {
+        assert!(!onedrive::is_onedrive_url("https://example.com/file.zip"));
+        assert!(!onedrive::is_onedrive_url("https://1drv.ms.evil.com/u/s!abc"));
+    }
+
+    #[test]
+    fn onedrive_workers_come_from_connections_then_config() {
+        let cfg = config::Config::default();
+
+        let defaults = onedrive_options(&cfg, &DownloadOpts::default());
+        assert_eq!(defaults.workers, cfg.onedrive_workers);
+        assert_eq!(defaults.max_retries, cfg.max_retries);
+        assert!(!defaults.overwrite);
+
+        let opts = DownloadOpts {
+            connections: Some(4),
+            ..DownloadOpts::default()
+        };
+        assert_eq!(onedrive_options(&cfg, &opts).workers, 4);
     }
 }
