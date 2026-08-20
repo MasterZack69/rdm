@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::engine::{self, DownloadRequest, ExistingPolicy, Outcome};
+use crate::hoster::onedrive;
 use crate::mega;
 use crate::ui;
 
@@ -58,6 +59,11 @@ impl Item {
         mega::is_mega_url(&self.url)
     }
 
+    /// Does this item need the OneDrive API before anything can be fetched?
+    pub fn is_onedrive(&self) -> bool {
+        onedrive::is_onedrive_url(&self.url)
+    }
+
     /// Human-friendly name for progress lines: the output path if we have one,
     /// otherwise the last URL segment.
     pub fn display_name(&self) -> String {
@@ -74,6 +80,13 @@ impl Item {
             return mega::parse_link(&self.url)
                 .map(|link| format!("MEGA {}", link.handle))
                 .unwrap_or_else(|_| "MEGA link".to_owned());
+        }
+
+        // A share link's last segment is an opaque token, and the real name
+        // exists only once the API has been asked. Naming the host is the
+        // honest label until then.
+        if self.is_onedrive() {
+            return "OneDrive link".to_owned();
         }
 
         let raw = self
@@ -106,13 +119,15 @@ impl Item {
         cfg.resolve_output_path(&raw_path)
     }
 
-    /// The `(exact path, fallback directory)` pair the MEGA downloader takes.
+    /// The `(explicit destination, fallback directory)` pair a share-link
+    /// downloader takes.
     ///
-    /// Unlike every other source, MEGA knows the filename and we do not: it is
-    /// encrypted in the file attributes. So an item with no explicit output
-    /// deliberately passes `None` and lets MEGA name the file, instead of
+    /// Unlike every other source, MEGA and OneDrive know the filename and we
+    /// do not: MEGA has it encrypted in the file attributes, OneDrive has it
+    /// behind an API call. So an item with no explicit output deliberately
+    /// passes `None` and lets them name the file, instead of
     /// [`Self::resolve_output`] inventing one out of the link.
-    pub fn mega_destination(&self, cfg: &Config) -> (Option<String>, String) {
+    pub fn share_destination(&self, cfg: &Config) -> (Option<String>, String) {
         match &self.output {
             Some(o) => (
                 Some(cfg.resolve_output_path(&engine::percent_decode(o))),
@@ -629,7 +644,7 @@ async fn run_item(
             return Ok(ItemOutcome::Cancelled);
         }
 
-        let (output, download_dir) = item.mega_destination(cfg);
+        let (output, download_dir) = item.share_destination(cfg);
         let options = mega::MegaOptions {
             workers: item.connections.unwrap_or(cfg.mega_workers),
             verify_mac: cfg.mega_verify_mac,
@@ -658,6 +673,10 @@ async fn run_item(
         });
     }
 
+    if item.is_onedrive() {
+        return run_onedrive_item(cfg, item, cancel, sink).await;
+    }
+
     let request = DownloadRequest::new(
         item.url.clone(),
         Some(item.resolve_output(cfg)),
@@ -670,6 +689,97 @@ async fn run_item(
         Outcome::Completed { bytes, .. } => ItemOutcome::Completed { bytes },
         Outcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent,
         Outcome::Cancelled => ItemOutcome::Cancelled,
+    })
+}
+
+/// Runs one OneDrive item.
+///
+/// A share link is not a fetchable address, so the API is asked what it points
+/// at first, and the answer decides the shape of the work. A file goes to the
+/// engine like any other download. A folder is a whole tree behind one item,
+/// which the queue cannot represent as separate rows, so it is fetched under
+/// this item and reported into this item's one progress line.
+///
+/// The link is what gets stored, never the resolved URL: that comes back signed
+/// and expires within the hour, so an item that sat in the queue overnight has
+/// to ask again.
+async fn run_onedrive_item(
+    cfg: &Config,
+    item: &Item,
+    cancel: CancellationToken,
+    sink: Arc<dyn ui::ProgressSink>,
+) -> Result<ItemOutcome> {
+    let options = onedrive::OneDriveOptions {
+        // On a folder `-c` means files at once, the way it means workers for
+        // MEGA. On a single file it stays chunks — see below.
+        workers: item.connections.unwrap_or(cfg.onedrive_workers),
+        max_retries: cfg.max_retries,
+        // The queue never re-downloads what is already there.
+        overwrite: false,
+    };
+
+    let (output, download_dir) = item.share_destination(cfg);
+
+    let folder = match onedrive::resolve(reqwest::Client::new(), &item.url, &options).await? {
+        onedrive::Resolved::File(link) => {
+            let destination = output.unwrap_or_else(|| cfg.resolve_output_path(&link.name));
+            if let Some(parent) = std::path::Path::new(&destination).parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+
+            let request = DownloadRequest::new(
+                link.url,
+                Some(destination),
+                item.connections.unwrap_or(cfg.connections),
+            )
+            .with_policy(ExistingPolicy::Reuse)
+            // A fresh signature every run, so the URL cannot be the thing
+            // resume recognises the file by.
+            .with_resume_identity(format!("onedrive:{}", link.id));
+
+            return Ok(match engine::download(request, cancel, sink).await? {
+                Outcome::Completed { bytes, .. } => ItemOutcome::Completed { bytes },
+                Outcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent,
+                Outcome::Cancelled => ItemOutcome::Cancelled,
+            });
+        }
+        onedrive::Resolved::Folder(folder) => folder,
+    };
+
+    let summary = onedrive::download_folder(
+        folder,
+        output,
+        &download_dir,
+        options,
+        cancel,
+        onedrive::Progress::Lane(sink),
+    )
+    .await?;
+
+    if summary.cancelled {
+        return Ok(ItemOutcome::Cancelled);
+    }
+
+    // One failed file must not read as a finished folder: leaving the item
+    // failed is what lets `queue retry failed` finish the job, and the files
+    // already on disk are skipped when it does.
+    if !summary.failed.is_empty() {
+        let (path, reason) = &summary.failed[0];
+        anyhow::bail!(
+            "{} of {} file(s) failed, starting with {}: {}",
+            summary.failed.len(),
+            summary.total,
+            path,
+            reason
+        );
+    }
+
+    if summary.completed == 0 && summary.skipped > 0 {
+        return Ok(ItemOutcome::AlreadyPresent);
+    }
+
+    Ok(ItemOutcome::Completed {
+        bytes: summary.bytes,
     })
 }
 
@@ -1099,7 +1209,7 @@ mod tests {
         let cfg = Config::default();
 
         let q = queue_with(&[MEGA_LINK]);
-        let (output, dir) = q.items[0].mega_destination(&cfg);
+        let (output, dir) = q.items[0].share_destination(&cfg);
         assert_eq!(output, None);
         assert_eq!(dir, cfg.download_dir);
 
@@ -1108,9 +1218,47 @@ mod tests {
 
         let mut q = Queue::default();
         q.add(MEGA_LINK.into(), Some("movies/my%20film.mkv".into()), None);
-        let (output, _) = q.items[0].mega_destination(&cfg);
+        let (output, _) = q.items[0].share_destination(&cfg);
         let output = output.expect("an explicit output must be honoured");
         assert!(output.ends_with("movies/my film.mkv"), "{output}");
+    }
+
+    const ONEDRIVE_LINK: &str = "https://1drv.ms/f/c/abc123/AbCdEfGh";
+
+    #[test]
+    fn onedrive_items_are_recognised() {
+        let q = queue_with(&[ONEDRIVE_LINK, "https://x.com/a.bin"]);
+        assert!(q.items[0].is_onedrive());
+        assert!(!q.items[1].is_onedrive());
+        assert!(!q.items[0].is_mega(), "the two dispatch paths must not overlap");
+    }
+
+    /// The last segment of a share link is an opaque token, so it names
+    /// nothing. Printing it would put a meaningless string on the board and
+    /// leave it in `queue list` afterwards.
+    #[test]
+    fn onedrive_display_name_never_shows_the_share_token() {
+        let q = queue_with(&[ONEDRIVE_LINK]);
+        assert_eq!(q.items[0].display_name(), "OneDrive link");
+        assert!(!q.items[0].display_name().contains("AbCdEfGh"));
+
+        // An explicit output still wins — that is a real filename.
+        let mut q = Queue::default();
+        q.add(ONEDRIVE_LINK.into(), Some("share/holiday.mkv".into()), None);
+        assert_eq!(q.items[0].display_name(), "holiday.mkv");
+    }
+
+    /// Same hazard as MEGA: resolve_output would carve a filename out of the
+    /// share token, so naming has to wait for the API.
+    #[test]
+    fn onedrive_naming_waits_for_the_api_too() {
+        let cfg = Config::default();
+        let q = queue_with(&[ONEDRIVE_LINK]);
+
+        let (output, dir) = q.items[0].share_destination(&cfg);
+        assert_eq!(output, None);
+        assert_eq!(dir, cfg.download_dir);
+        assert!(q.items[0].resolve_output(&cfg).contains("AbCdEfGh"));
     }
 
     #[test]

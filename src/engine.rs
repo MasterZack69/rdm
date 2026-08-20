@@ -75,6 +75,13 @@ pub struct DownloadRequest {
     /// instead of growing a downloader: ranges, chunking, resume and retries
     /// all still come from this module.
     pub client: Option<reqwest::Client>,
+    /// A stable identity for the remote content, when the URL is not one.
+    ///
+    /// The same reason `client` exists: a signed URL is a credential, not a
+    /// name. A OneDrive download URL carries a fresh `tempauth` per run, so
+    /// resume state keyed on it is discarded and the file restarts from zero.
+    /// A hoster that knows something durable — a drive item id — puts it here.
+    pub resume_identity: Option<String>,
 }
 
 impl DownloadRequest {
@@ -85,6 +92,7 @@ impl DownloadRequest {
             connections,
             policy: ExistingPolicy::Ask,
             client: None,
+            resume_identity: None,
         }
     }
 
@@ -97,6 +105,12 @@ impl DownloadRequest {
     /// session it holds.
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// Identifies the remote content for resume purposes, when the URL cannot.
+    pub fn with_resume_identity(mut self, identity: String) -> Self {
+        self.resume_identity = Some(identity);
         self
     }
 }
@@ -192,7 +206,14 @@ pub async fn download(
     let url = normalize_download_url(&req.url);
     let original_path = resolve_output_path(&url, req.output.as_deref());
 
-    let output_path = match resolve_existing_output(&original_path, &url, req.policy).await? {
+    let output_path = match resolve_existing_output(
+        &original_path,
+        &url,
+        req.resume_identity.as_deref(),
+        req.policy,
+    )
+    .await?
+    {
         OutputDecision::Use(p) => p,
         OutputDecision::AlreadyPresent => {
             sink.finish();
@@ -322,6 +343,7 @@ pub async fn download(
         chunks: &chunks,
         retry_config: &retry_config,
         cancel,
+        identity: req.resume_identity.clone(),
         etag: info.etag.clone(),
         last_modified: info.last_modified.clone(),
     };
@@ -349,7 +371,7 @@ pub async fn run_download(
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<()> {
-    run(url, output, connections, None, cancel, quiet).await
+    run(url, output, connections, None, None, cancel, quiet).await
 }
 
 /// The same, over a client the caller has already authenticated.
@@ -364,7 +386,19 @@ pub async fn run_download_with_client(
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<()> {
-    run(url, output, connections, Some(client), cancel, quiet).await
+    run(url, output, connections, Some(client), None, cancel, quiet).await
+}
+
+/// The same, for a source whose URL is a credential rather than a name.
+pub async fn run_download_with_identity(
+    url: String,
+    output: Option<String>,
+    connections: usize,
+    identity: String,
+    cancel: CancellationToken,
+    quiet: bool,
+) -> Result<()> {
+    run(url, output, connections, None, Some(identity), cancel, quiet).await
 }
 
 async fn run(
@@ -372,6 +406,7 @@ async fn run(
     output: Option<String>,
     connections: usize,
     client: Option<reqwest::Client>,
+    identity: Option<String>,
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<()> {
@@ -394,6 +429,10 @@ async fn run(
     let request = DownloadRequest::new(url, output, connections);
     let request = match client {
         Some(authenticated) => request.with_client(authenticated),
+        None => request,
+    };
+    let request = match identity {
+        Some(identity) => request.with_resume_identity(identity),
         None => request,
     };
 
@@ -582,6 +621,7 @@ async fn download_streaming(
 pub async fn resolve_existing_output(
     path: &str,
     url: &str,
+    identity: Option<&str>,
     policy: ExistingPolicy,
 ) -> Result<OutputDecision> {
     use std::io::{BufRead, IsTerminal, Write};
@@ -606,7 +646,7 @@ pub async fn resolve_existing_output(
                 end: c.end,
             })
             .collect();
-        if crate::resume::validate_against(&meta, url, meta.file_size, &chunks) {
+        if crate::resume::validate_against(&meta, url, identity, meta.file_size, &chunks) {
             return Ok(OutputDecision::Use(path.to_owned()));
         }
     }
@@ -856,7 +896,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.bin").to_string_lossy().to_string();
         assert_eq!(
-            resolve_existing_output(&path, "https://example.com/nope.bin", ExistingPolicy::Ask)
+            resolve_existing_output(&path, "https://example.com/nope.bin", None, ExistingPolicy::Ask)
                 .await
                 .unwrap(),
             OutputDecision::Use(path),
@@ -871,7 +911,7 @@ mod tests {
         let path = path.to_string_lossy().to_string();
 
         assert_eq!(
-            resolve_existing_output(&path, "https://example.com/done.bin", ExistingPolicy::Reuse)
+            resolve_existing_output(&path, "https://example.com/done.bin", None, ExistingPolicy::Reuse)
                 .await
                 .unwrap(),
             OutputDecision::AlreadyPresent,
@@ -889,6 +929,7 @@ mod tests {
             resolve_existing_output(
                 &path,
                 "https://example.com/stale.bin",
+                None,
                 ExistingPolicy::Overwrite
             )
             .await
@@ -907,7 +948,7 @@ mod tests {
         let path = path.to_string_lossy().to_string();
 
         assert_eq!(
-            resolve_existing_output(&path, "https://example.com/half.bin", ExistingPolicy::Reuse)
+            resolve_existing_output(&path, "https://example.com/half.bin", None, ExistingPolicy::Reuse)
                 .await
                 .unwrap(),
             OutputDecision::Use(path),

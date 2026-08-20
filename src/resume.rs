@@ -8,6 +8,9 @@ use crate::chunk::Chunk;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResumeMetadata {
     pub url: String,
+    /// A stable identity for the remote content, when the URL is not one.
+    #[serde(default)]
+    pub identity: Option<String>,
     pub file_size: u64,
     pub chunks: Vec<ChunkState>,
     #[serde(default)]
@@ -65,6 +68,21 @@ impl ResumeMetadata {
         true
     }
 
+    /// Whether saved state belongs to the content now being downloaded.
+    ///
+    /// The URL is a perfectly good identity for an ordinary download, but not
+    /// for a host whose direct link is a credential: OneDrive mints a fresh
+    /// `tempauth` for every run, so the same bytes arrive under a different URL
+    /// each time and address equality would discard every partial download. A
+    /// caller with something durable to say — a drive item id — says it here,
+    /// and the URL becomes the fallback for callers that have nothing.
+    pub fn describes_same_source(&self, url: &str, identity: Option<&str>) -> bool {
+        match (self.identity.as_deref(), identity) {
+            (Some(stored), Some(current)) => stored == current,
+            _ => self.url == url,
+        }
+    }
+
 }
 
 pub fn create_new(url: String, file_size: u64, chunks: &[Chunk]) -> ResumeMetadata {
@@ -80,6 +98,7 @@ pub fn create_new(url: String, file_size: u64, chunks: &[Chunk]) -> ResumeMetada
 
     ResumeMetadata {
         url,
+        identity: None,
         file_size,
         chunks: chunk_states,
         etag: None,
@@ -196,10 +215,11 @@ pub fn update_progress(meta: &mut ResumeMetadata, chunk_id: u32, completed: u64)
 pub fn validate_against(
     meta: &ResumeMetadata,
     url: &str,
+    identity: Option<&str>,
     file_size: u64,
     chunks: &[Chunk],
 ) -> bool {
-    if meta.url != url || meta.file_size != file_size {
+    if !meta.describes_same_source(url, identity) || meta.file_size != file_size {
         return false;
     }
 
@@ -336,21 +356,21 @@ mod tests {
     fn test_validate_against_matching() {
         let chunks = sample_chunks();
         let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
-        assert!(validate_against(&meta, "https://example.com/file.bin", 2000, &chunks));
+        assert!(validate_against(&meta, "https://example.com/file.bin", None, 2000, &chunks));
     }
 
     #[test]
     fn test_validate_against_url_mismatch() {
         let chunks = sample_chunks();
         let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
-        assert!(!validate_against(&meta, "https://other.com/file.bin", 2000, &chunks));
+        assert!(!validate_against(&meta, "https://other.com/file.bin", None, 2000, &chunks));
     }
 
     #[test]
     fn test_validate_against_size_mismatch() {
         let chunks = sample_chunks();
         let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
-        assert!(!validate_against(&meta, "https://example.com/file.bin", 9999, &chunks));
+        assert!(!validate_against(&meta, "https://example.com/file.bin", None, 9999, &chunks));
     }
 
     #[test]
@@ -358,7 +378,7 @@ mod tests {
         let chunks = sample_chunks();
         let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
         let fewer = &chunks[..2];
-        assert!(!validate_against(&meta, "https://example.com/file.bin", 2000, fewer));
+        assert!(!validate_against(&meta, "https://example.com/file.bin", None, 2000, fewer));
     }
 
     #[test]
@@ -366,7 +386,7 @@ mod tests {
         let chunks = sample_chunks();
         let mut meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
         meta.chunks[0].completed = 99999;
-        assert!(!validate_against(&meta, "https://example.com/file.bin", 2000, &chunks));
+        assert!(!validate_against(&meta, "https://example.com/file.bin", None, 2000, &chunks));
     }
 
     #[test]
@@ -378,7 +398,7 @@ mod tests {
         meta.chunks[2].completed = 500;
         meta.chunks[3].completed = 501;
         assert!(
-            !validate_against(&meta, "https://example.com/file.bin", 2000, &chunks),
+            !validate_against(&meta, "https://example.com/file.bin", None, 2000, &chunks),
             "total_completed (2001) exceeds file_size (2000)"
         );
     }
@@ -391,7 +411,51 @@ mod tests {
         meta.chunks[1].completed = 500;
         meta.chunks[2].completed = 500;
         meta.chunks[3].completed = 500;
-        assert!(validate_against(&meta, "https://example.com/file.bin", 2000, &chunks));
+        assert!(validate_against(&meta, "https://example.com/file.bin", None, 2000, &chunks));
+    }
+
+    /// A signed URL differs every run, so the identity is the only thing that
+    /// can say the bytes are the same. Without this, OneDrive throws away
+    /// every partial download it ever makes.
+    #[test]
+    fn a_stored_identity_outranks_a_changed_url() {
+        let chunks = sample_chunks();
+        let mut meta = create_new("https://cdn.example.com/get?tempauth=OLD".into(), 2000, &chunks);
+        meta.identity = Some("onedrive:ABC!123".into());
+
+        assert!(validate_against(
+            &meta,
+            "https://cdn.example.com/get?tempauth=NEW",
+            Some("onedrive:ABC!123"),
+            2000,
+            &chunks,
+        ));
+    }
+
+    #[test]
+    fn a_different_identity_is_never_the_same_file() {
+        let chunks = sample_chunks();
+        let mut meta = create_new("https://cdn.example.com/get?tempauth=OLD".into(), 2000, &chunks);
+        meta.identity = Some("onedrive:ABC!123".into());
+
+        assert!(!validate_against(
+            &meta,
+            "https://cdn.example.com/get?tempauth=OLD",
+            Some("onedrive:ABC!456"),
+            2000,
+            &chunks,
+        ));
+    }
+
+    /// Metadata written before identities existed, or by a host that has none:
+    /// the URL still decides, so MEGA, GoFile and Dropbox are unaffected.
+    #[test]
+    fn without_an_identity_the_url_still_decides() {
+        let chunks = sample_chunks();
+        let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
+
+        assert!(validate_against(&meta, "https://example.com/file.bin", None, 2000, &chunks));
+        assert!(!validate_against(&meta, "https://example.com/other.bin", None, 2000, &chunks));
     }
 
     #[tokio::test]

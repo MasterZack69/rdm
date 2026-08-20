@@ -7,13 +7,13 @@ rdm 'https://gofile.io/d/AbCdEf'
 rdm 'https://gofile.io/d/AbCdEf' -o ~/Videos/thatshow -c 3
 ```
 
-A GoFile link is not an address, it is a content id. rdm creates a throwaway guest account (the same thing your browser does when you open the page), asks the API what is behind the id, mirrors the folder tree locally and downloads the files.
+A GoFile link is a content id, not an address. rdm creates a throwaway guest account (same as your browser does when opening the page), asks the API what is behind the id, mirrors the folder tree locally and downloads the files.
 
-A few things worth knowing:
+Notes:
 
-- **`-o` is always a directory, never a filename**, one content id can hold a single file or a hundred in nested folders and the link does not say which.
-- **`-c` sets how many files download at once**, not chunks per file. GoFile throttles per connection, so several files side by side is what actually goes faster. Capped at 10; the API gets unfriendly beyond that.
-- **Password-protected links** need `RDM_GOFILE_PASSWORD`. It is hashed before it leaves the process, and it lives in the environment rather than in a flag so it stays out of your shell history and out of `ps` for everyone else on the machine.
+- **`-o` is always a directory, never a filename** — one content id can hold a single file or a hundred in nested folders, and the link does not say which.
+- **`-c` sets files downloading at once, not chunks per file.** GoFile throttles per connection, so several files side by side is faster. Capped at 10; the API gets unfriendly beyond that.
+- **Password-protected links** need `RDM_GOFILE_PASSWORD`. It is hashed before leaving the process, and lives in the environment rather than a flag so it stays out of shell history and `ps`.
 
   ```
   RDM_GOFILE_PASSWORD='hunter2' rdm 'https://gofile.io/d/AbCdEf'
