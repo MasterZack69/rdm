@@ -18,12 +18,12 @@ bytes and names the file in a `Content-Disposition` header.
 
 So Dropbox needs no API, no token and no downloader of its own. rdm rewrites
 the link and hands it to the normal engine.
-A **folder** share is the exception, Dropbox packs a folder share on the fly and serves it as a single response. 
+A **folder** share is the exception — Dropbox packs it on the fly and serves it as a single response.
 
 - A folder link is downloaded as a single zip file.
-- No resume on folder link.
-- No sync for folder link
-- `-c` is not applicable on a folder link.
+- No resume on a folder link.
+- No sync for a folder link.
+- `-c` does not apply to a folder link.
 
 
 Recognised link shapes:
