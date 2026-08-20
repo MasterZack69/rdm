@@ -23,6 +23,14 @@
 //!
 //! `-d/--delete` and `-e/--ext` belong to `sync` alone.
 //!
+//! ## Hoster links are not special here
+//!
+//! `parse_url` accepts any http(s) URL and rejects everything else. Which
+//! hoster a link belongs to is `main`'s problem: a `1drv.ms` share and a
+//! `mega.nz` link are ordinary URLs at this layer, and there are tests
+//! pinning that, because a parser that got clever about hostnames would
+//! start rejecting the links it had not been taught yet.
+//!
 //! Keep the `after_help` footers honest: a footer must never mention a flag
 //! that its own command does not have. There is a test for this.
 
@@ -104,7 +112,7 @@ pub enum Command {
 
     /// Mirror a remote directory listing into a local directory
     #[command(
-        after_help = "-o sets the destination directory for a sync, not a filename.\n\nDefaults for -c/-p and the download directory come from config.toml.\nRun `rdm config` to see the values currently in effect.\n\n-e accepts a comma separated list or repeated flags, with or without\nleading dots: `-e flac,mkv` and `-e .flac -e .MKV` are equivalent."
+        after_help = "-o sets the destination directory for a sync, not a filename.\n\nDefaults for -c/-p and the download directory come from config.toml.\nRun `rdm config` to see the values currently in effect.\n\n-e accepts a comma separated list or repeated flags, with or without\nleading dots: `-e flac,mkv` and `-e .flac -e .MKV` are equivalent.\n\nA MEGA or OneDrive folder share is mirrored through that hoster's own path\nrather than the queue, so -p does not apply to it. On a OneDrive share -c\nsets how many files download at once."
     )]
     Sync {
         #[arg(value_name = "URL", value_parser = parse_url)]
@@ -484,6 +492,20 @@ mod tests {
         let link = "https://mega.nz/file/AbCdEfGh#somekey";
         assert_eq!(parse_url(link).as_deref(), Ok(link));
         assert_eq!(parse(&["rdm", link]).url.as_deref(), Some(link));
+    }
+
+    /// Same for OneDrive, with less to go on: a `1drv.ms` link is a
+    /// shortener, so it carries no filename and no hint of file versus
+    /// folder. The parser must not try to be helpful about either.
+    #[test]
+    fn onedrive_links_survive_url_parsing() {
+        for link in [
+            "https://1drv.ms/f/c/abc123/AbCdEfGh",
+            "https://onedrive.live.com/?id=ABC%21123&cid=ABC",
+        ] {
+            assert_eq!(parse_url(link).as_deref(), Ok(link));
+            assert_eq!(parse(&["rdm", link]).url.as_deref(), Some(link));
+        }
     }
 
     // \u{2500}\u{2500} download \u{2500}\u{2500}
