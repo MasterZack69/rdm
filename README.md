@@ -27,11 +27,15 @@ Options:
   -c, --connections <N>   Connections per file [default: connections from config]
       --allow-private     Allow scanning private, loopback and link-local addresses [aliases: --ap]
   -q, --quiet             Suppress progress output
+  -p, --parallel <N>      Files to download concurrently if <URL> is a directory listing [default: queue_parallel from config]
   -h, --help              Print help
   -V, --version           Print version
 
-Defaults for -c and the download directory come from config.toml.
+Defaults for -c/-p and the download directory come from config.toml.
 Run `rdm config` to see the values currently in effect.
+
+-p applies only when <URL> is a directory listing, which is expanded into
+the queue and downloaded concurrently.
 
 sync and queue have options of their own — see `rdm sync --help` and
 `rdm queue --help`.
@@ -54,6 +58,8 @@ rdm sync <URL> [-o dir] [-c N] [-p N] [-d] [-e flac,mkv]
 
 `-o` sets the output path only for a sync, not a filename. `-e` takes a comma separated list or repeated flags, with or without leading dots, and is case insensitive: `-e flac,mkv` and `-e .flac -e .MKV` do the same thing.
 
+A MEGA or OneDrive folder share is mirrored through that hoster's own path rather than through the queue, so `-p` does not apply to it. On a OneDrive share `-c` sets how many files download at once, and the sizes come from the API, so there is no round of `HEAD` requests before the diff.
+
 ## Queue
 
 ```
@@ -64,7 +70,7 @@ rdm queue stop                           Stop after current download
 rdm queue skip                           Skip the download(s) in flight  [next, n]
 rdm queue remove <ID>                    Remove one item             [rm]
 rdm queue retry [ID|failed|skipped]      Requeue items               [r]
-rdm queue clear [pending|done]           Clear queue (all by default)   [c]
+rdm queue clear [pending|done]            Clear queue (all by default)   [c]
 ```
 
 `-p` on `queue start` defaults to `queue_parallel` from the config.
@@ -76,6 +82,7 @@ Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything
 - [mega - click to view](extraInfo/mega.md)
 - [gofile - click to view](extraInfo/gofile.md)
 - [dropbox - click to view](extraInfo/dropbox.md)
+- [onedrive - click to view](extraInfo/onedrive.md)
 
 # Example Config File
 
@@ -107,6 +114,9 @@ gofile_workers = 5
 
 # GoFile: your account token
 gofile_token = ""
+
+# OneDrive: how many files to download at once (max 15)
+onedrive_workers = 5
 ```
 
 Everything in the config is optional as they have their own defaults.
