@@ -147,7 +147,7 @@ cargo test
 
 ## Prior art
 
-Clean-room Rust implementations of the MEGA, GoFile and OneDrive support, but these projects are where the reverse-engineered details came from. No code was copied.
+Clean-room Rust implementations of the MEGA, GoFile and OneDrive support, but these projects are where the necessary details came from. No code was copied.
 
 - [MegaBasterd](https://github.com/tonikelope/megabasterd) by tonikelope (GPLv3) — MEGA: 509 quota is per-IP, backoff ends early on IP change, chunk workers can't share a keep-alive socket, 403 means an expired temp URL.
 - [gofile-downloader](https://github.com/ltsdw/gofile-downloader) by ltsdw (GPLv3) — GoFile: `X-Website-Token` recipe (four-hour slot), guest account required before listing, token as both `Authorization` header and `accountToken` cookie, `200` on a `Range` request means resume refused.
