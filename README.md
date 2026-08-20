@@ -70,7 +70,7 @@ rdm queue stop                           Stop after current download
 rdm queue skip                           Skip the download(s) in flight  [next, n]
 rdm queue remove <ID>                    Remove one item             [rm]
 rdm queue retry [ID|failed|skipped]      Requeue items               [r]
-rdm queue clear [pending|done]            Clear queue (all by default)   [c]
+rdm queue clear [pending|done]           Clear queue (all by default)   [c]
 ```
 
 `-p` on `queue start` defaults to `queue_parallel` from the config.
@@ -150,3 +150,5 @@ cargo test
 [MegaBasterd](https://github.com/tonikelope/megabasterd) by tonikelope (GPLv3) — the MEGA support here is a clean-room Rust implementation, but MegaBasterd is where the non-obvious parts came from: that the 509 quota is per-IP rather than per-connection, that backoff should end early when your IP changes, that chunk workers must not share a keep-alive socket, and that a 403 means an expired temp URL rather than a missing file. Years of bug reports, distilled. No MegaBasterd code was copied.
 
 [gofile-downloader](https://github.com/ltsdw/gofile-downloader) by ltsdw (GPLv3) — the GoFile support here is a clean-room Rust implementation, but gofile-downloader is where the non-obvious parts came from: the `X-Website-Token` recipe and the four-hour slot it is built from, that a guest account has to exist before anything can be listed at all, that the token has to travel as both an `Authorization` header and an `accountToken` cookie, that a `200` answering a `Range` request means the resume was refused rather than granted, and that GoFile's own top-level folder is usually named the useless default `root`. All of that is invisible in the API and obvious only after someone else has been bitten by it. No gofile-downloader code was copied.
+
+[onedrive-downloader](https://github.com/eugenenuke/onedrive-downloader) by eugenenuke (GPLv3) — the OneDrive support here is a clean-room Rust implementation, but onedrive-downloader is where the non-obvious parts came from: that a public share can be read with an anonymous badger token instead of a signed-in account, the fixed app id that token request wants, that the share link itself becomes the item address once it is base64url encoded with the padding stripped, that the driveitem call is a POST with an empty body and a `Prefer: autoredeem` header, that a child's drive id is its item id up to the first `!`, that whether a child is a file or a folder is decided by nothing but the presence of `@content.downloadUrl`, and that the download URL a listing hands back is signed and short-lived. Microsoft documents almost none of this. No onedrive-downloader code was copied.
