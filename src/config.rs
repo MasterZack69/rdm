@@ -49,6 +49,33 @@ pub struct Config {
     /// share fills the pipe by running several files side by side.
     #[serde(default = "default_onedrive_workers")]
     pub onedrive_workers: usize,
+
+    /// Files of a Google Drive folder to download at once.
+    ///
+    /// Files, not chunks again, and here the reason is quota rather than
+    /// bandwidth: Drive counts requests per key and per second, so a high
+    /// number buys 403s rather than throughput.
+    #[serde(default = "default_gdrive_workers")]
+    pub gdrive_workers: usize,
+
+    /// A Google Drive API key. Optional: a file whose link you already hold
+    /// downloads without one, but listing a folder does not, and neither does
+    /// learning a file's real name without a round trip through the warning
+    /// page. `RDM_GDRIVE_API_KEY` overrides this for a single run.
+    ///
+    /// A key is a quota identity rather than a credential — a restricted share
+    /// stays unreadable with or without one — but it is billable, so it is
+    /// treated like the GoFile token and never printed.
+    #[serde(default)]
+    pub gdrive_api_key: String,
+
+    /// What a Google Doc, Sheet, Slide deck or Drawing is exported as: an
+    /// extension (`pdf`, `docx`, `xlsx`, `csv`, `png`, …), or `office` for
+    /// whichever Microsoft format the kind has. A Google document is rendered
+    /// on request rather than stored, so there is no original to fall back on
+    /// and something has to choose.
+    #[serde(default = "default_gdrive_doc_format")]
+    pub gdrive_doc_format: String,
 }
 
 fn default_mega_workers() -> usize {
@@ -61,6 +88,16 @@ fn default_gofile_workers() -> usize {
 
 fn default_onedrive_workers() -> usize {
     crate::hoster::onedrive::WORKERS_DEFAULT
+}
+
+fn default_gdrive_workers() -> usize {
+    crate::hoster::gdrive::WORKERS_DEFAULT
+}
+
+/// PDF, because it is the one format every Google document kind exports as and
+/// the one the Docs "File \u{2192} Download" menu offers first.
+fn default_gdrive_doc_format() -> String {
+    "pdf".to_owned()
 }
 
 fn default_true() -> bool {
@@ -86,6 +123,9 @@ impl Default for Config {
             gofile_workers: default_gofile_workers(),
             gofile_token: String::new(),
             onedrive_workers: default_onedrive_workers(),
+            gdrive_workers: default_gdrive_workers(),
+            gdrive_api_key: String::new(),
+            gdrive_doc_format: default_gdrive_doc_format(),
         }
     }
 }
@@ -146,6 +186,8 @@ impl Config {
         eprintln!("  MEGA VPN   : {}", self.mega_resume_on_ip_change);
         eprintln!("  GoFile     : {} file(s) at a time", self.gofile_workers);
         eprintln!("  OneDrive   : {} file(s) at a time", self.onedrive_workers);
+        eprintln!("  Drive      : {} file(s) at a time", self.gdrive_workers);
+        eprintln!("  Drive docs : exported as {}", self.gdrive_doc_format);
         // Never print the token itself: config output gets pasted into bug
         // reports.
         eprintln!(
@@ -154,6 +196,16 @@ impl Config {
                 "guest"
             } else {
                 "account token set"
+            }
+        );
+        // Same rule, and the same reason a folder download can refuse before
+        // it starts.
+        eprintln!(
+            "  Drive key  : {}",
+            if self.gdrive_api_key.trim().is_empty() {
+                "none (folders unavailable)"
+            } else {
+                "set"
             }
         );
     }
@@ -189,7 +241,15 @@ queue_parallel = 5
             cfg.onedrive_workers,
             crate::hoster::onedrive::WORKERS_DEFAULT
         );
+        assert_eq!(
+            cfg.gdrive_workers,
+            crate::hoster::gdrive::WORKERS_DEFAULT
+        );
         assert!(cfg.gofile_token.is_empty());
+        // No key means anonymous access, which is a working configuration for
+        // everything except a folder.
+        assert!(cfg.gdrive_api_key.is_empty());
+        assert_eq!(cfg.gdrive_doc_format, "pdf");
     }
 
     #[test]
@@ -216,5 +276,20 @@ queue_parallel = 5
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.gofile_workers, 3);
         assert_eq!(back.gofile_token, "abc123");
+    }
+
+    #[test]
+    fn gdrive_settings_round_trip() {
+        let cfg = Config {
+            gdrive_workers: 7,
+            gdrive_api_key: "AIzaSyExampleKey".to_owned(),
+            gdrive_doc_format: "office".to_owned(),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.gdrive_workers, 7);
+        assert_eq!(back.gdrive_api_key, "AIzaSyExampleKey");
+        assert_eq!(back.gdrive_doc_format, "office");
     }
 }
