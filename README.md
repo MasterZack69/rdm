@@ -83,6 +83,7 @@ Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything
 - [gofile - click to view](extraInfo/gofile.md)
 - [dropbox - click to view](extraInfo/dropbox.md)
 - [onedrive - click to view](extraInfo/onedrive.md)
+- [gdrive - click to view](extraInfo/gdrive.md)
 
 # Example Config File
 
