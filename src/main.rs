@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use rdm::args::{
     Cli, ClearTarget, Command, DownloadOpts, QueueCommand, RetryTarget, normalize_extensions,
 };
-use rdm::hoster::{dropbox, gofile, onedrive};
+use rdm::hoster::{dropbox, gdrive, gofile, onedrive};
 use rdm::ui::{self, ProgressSink};
 use rdm::{config, engine, mega, queue, scrape, signal, sync};
 
@@ -57,6 +57,14 @@ fn main() -> Result<()> {
             // API knows what is behind it.
             if onedrive::is_onedrive_url(&url) {
                 return onedrive_download(&cfg, &url, &opts);
+            }
+
+            // And Google Drive, the same story a fifth time: every shape of
+            // Drive link is a viewer page or an API handle rather than the
+            // bytes, so normalising it as a path would only rename the page it
+            // gets saved under. Only resolution knows what is behind it.
+            if gdrive::is_gdrive_url(&url) {
+                return gdrive_download(&cfg, &url, &opts);
             }
 
             let url = engine::normalize_download_url(&url);
@@ -195,6 +203,18 @@ fn quick_download(
             );
         }
         return onedrive_download(cfg, url, opts);
+    }
+
+    // Google Drive is the trap a fifth time: `/file/d/<id>/view` ends in an
+    // extensionless segment too, so the heuristic claims it and hands a
+    // viewer page to the scraper. A folder link dodges the heuristic the
+    // other way \u{2014} its id is long enough to read as an opaque file id \u{2014}
+    // which would land it in the generic engine instead. Worse, not better.
+    if gdrive::is_gdrive_url(url) {
+        if parallel.is_some() && !opts.quiet {
+            eprintln!("  \u{26a0} -p applies to directory listings; Google Drive uses gdrive_workers.");
+        }
+        return gdrive_download(cfg, url, opts);
     }
 
     let url = engine::normalize_download_url(url);
@@ -403,6 +423,52 @@ fn onedrive_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Re
                 )
                 .await?;
                 report_onedrive(&summary, quiet);
+                Ok(())
+            }
+        }
+    })
+}
+
+/// `rdm <gdrive link>` \u{2014} work out what the link points at and download that.
+///
+/// The one question worth asking is also the only one there is: a Drive link
+/// never carries its own bytes, so resolution is not an optimisation but the
+/// whole job. A file or a Doc lands through the generic engine, exactly like a
+/// resolved OneDrive share; a folder is walked and downloaded by the Drive
+/// module itself.
+fn gdrive_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    let options = gdrive_options(cfg, opts);
+    let quiet = opts.quiet;
+
+    run_async(|cancel| async move {
+        match gdrive::resolve(reqwest::Client::new(), url, &options).await? {
+            // One file, one destination: from here it is an ordinary ranged
+            // HTTPS download. Resume is keyed on the Drive id rather than the
+            // URL, because a confirmed download URL carries a short-lived
+            // token and would not survive a rerun.
+            gdrive::Resolved::File(file) => {
+                let output = resolve_output_named(opts.output.clone(), &file.name, cfg);
+                engine::run_download_with_identity(
+                    file.url,
+                    Some(output),
+                    opts.connections.unwrap_or(cfg.connections),
+                    format!("gdrive:{}", file.id),
+                    cancel,
+                    opts.quiet,
+                )
+                .await
+            }
+            gdrive::Resolved::Folder(folder) => {
+                let summary = gdrive::download_folder(
+                    folder,
+                    opts.output.clone(),
+                    &cfg.download_dir,
+                    options,
+                    cancel,
+                    quiet,
+                )
+                .await?;
+                report_gdrive(&summary, quiet);
                 Ok(())
             }
         }
@@ -750,6 +816,26 @@ fn onedrive_options(cfg: &config::Config, opts: &DownloadOpts) -> onedrive::OneD
     }
 }
 
+/// `-c` means files in flight here, the same double meaning it has for GoFile
+/// and OneDrive: a Drive folder is downloaded one connection per file.
+///
+/// The API key comes from the environment ahead of the config: a billable key
+/// is one people would rather not leave on disk. A blank key from either
+/// source counts as absent \u{2014} sending one turns every call into a 400 instead
+/// of falling back to anonymous access.
+fn gdrive_options(cfg: &config::Config, opts: &DownloadOpts) -> gdrive::GdriveOptions {
+    gdrive::GdriveOptions {
+        workers: opts.connections.unwrap_or(cfg.gdrive_workers),
+        max_retries: cfg.max_retries,
+        api_key: std::env::var("RDM_GDRIVE_API_KEY")
+            .ok()
+            .or_else(|| Some(cfg.gdrive_api_key.clone()))
+            .filter(|key| !key.trim().is_empty()),
+        doc_format: cfg.gdrive_doc_format.clone(),
+        overwrite: false,
+    }
+}
+
 fn report_mega(outcome: &mega::MegaOutcome, quiet: bool) {
     if quiet {
         return;
@@ -869,6 +955,51 @@ fn report_onedrive(summary: &onedrive::OneDriveSummary, quiet: bool) {
 
     if summary.skipped > 0 {
         eprintln!("     {} already on disk", summary.skipped);
+    }
+
+    if !summary.failed.is_empty() {
+        eprintln!();
+        eprintln!("  \u{26a0} {} file(s) failed:", summary.failed.len());
+        for (path, reason) in &summary.failed {
+            eprintln!("     - {path}: {reason}");
+        }
+    }
+
+    if summary.cancelled {
+        eprintln!();
+        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
+    }
+}
+
+/// Same shape as the MEGA, GoFile and OneDrive folder reports, for the same
+/// reason: one dead file in a Drive folder does not make the other forty a
+/// failure. The one line of its own is the unsupported count, because a
+/// shortcut or an Apps Script project is not a failed download \u{2014} there was
+/// never anything to download \u{2014} but comparing the folder against a local
+/// copy needs to know its picture of it is short.
+fn report_gdrive(summary: &gdrive::GdriveSummary, quiet: bool) {
+    if quiet {
+        return;
+    }
+
+    eprintln!();
+    eprintln!("  \u{1f4c1} {}", summary.root.display());
+    eprintln!(
+        "     {} of {} file(s), {}",
+        summary.completed,
+        summary.total,
+        ui::format_size(summary.bytes)
+    );
+
+    if summary.skipped > 0 {
+        eprintln!("     {} already on disk", summary.skipped);
+    }
+
+    if summary.unsupported > 0 {
+        eprintln!(
+            "     {} with no downloadable form (shortcuts, Apps Script)",
+            summary.unsupported
+        );
     }
 
     if !summary.failed.is_empty() {
@@ -1277,5 +1408,72 @@ mod tests {
             ..DownloadOpts::default()
         };
         assert_eq!(onedrive_options(&cfg, &opts).workers, 4);
+    }
+
+    // -- Google Drive routing --
+
+    /// The same trap a fifth time: `/file/d/<id>/view` has no extension and no
+    /// trailing slash, so the heuristic calls it a listing and the scraper
+    /// would find a viewer page. Hence the Drive check sitting above it.
+    #[test]
+    fn gdrive_links_would_be_mistaken_for_listings() {
+        let link = "https://drive.google.com/file/d/1A2b3C4d5E6f/view";
+        assert!(gdrive::is_gdrive_url(link));
+        assert!(
+            looks_like_directory(link),
+            "if this ever stops being true the ordering comment above is stale, not wrong"
+        );
+    }
+
+    #[test]
+    fn ordinary_links_are_not_sent_to_gdrive() {
+        assert!(!gdrive::is_gdrive_url("https://example.com/file.zip"));
+        // A confirmed download URL is already direct: claiming it would send a
+        // resolved link back through resolution.
+        assert!(!gdrive::is_gdrive_url(
+            "https://drive.usercontent.google.com/download?id=1A2b3C4d5E6f"
+        ));
+    }
+
+    #[test]
+    fn gdrive_workers_come_from_connections_then_config() {
+        let cfg = config::Config::default();
+
+        let defaults = gdrive_options(&cfg, &DownloadOpts::default());
+        assert_eq!(defaults.workers, cfg.gdrive_workers);
+        assert_eq!(defaults.max_retries, cfg.max_retries);
+        assert_eq!(defaults.doc_format, cfg.gdrive_doc_format);
+        assert!(!defaults.overwrite);
+
+        let opts = DownloadOpts {
+            connections: Some(6),
+            ..DownloadOpts::default()
+        };
+        assert_eq!(gdrive_options(&cfg, &opts).workers, 6);
+    }
+
+    /// A configured key is used when the environment does not override it.
+    /// The environment variable itself is left alone here: tests share a
+    /// process, and setting it would leak into every other test.
+    #[test]
+    fn a_configured_api_key_is_picked_up() {
+        let cfg = config::Config {
+            gdrive_api_key: "AIzaSyExampleKey".to_owned(),
+            ..config::Config::default()
+        };
+
+        if std::env::var("RDM_GDRIVE_API_KEY").is_err() {
+            let options = gdrive_options(&cfg, &DownloadOpts::default());
+            assert_eq!(options.api_key.as_deref(), Some("AIzaSyExampleKey"));
+        }
+
+        // A blank key means "anonymous", not an empty parameter on every call.
+        let blank = config::Config {
+            gdrive_api_key: "   ".to_owned(),
+            ..config::Config::default()
+        };
+        if std::env::var("RDM_GDRIVE_API_KEY").is_err() {
+            assert!(gdrive_options(&blank, &DownloadOpts::default()).api_key.is_none());
+        }
     }
 }
