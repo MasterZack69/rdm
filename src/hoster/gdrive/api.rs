@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderMap};
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -301,20 +302,37 @@ pub(super) async fn anonymous_file(
         bail!("{}", explain(status, &body));
     }
 
-    // Taken from this response rather than by asking the URL again: Drive
-    // names the file in the answer it redirects to, and then answers a second,
-    // ranged request for the same URL with the bytes and no
-    // `Content-Disposition` at all. Asking twice is how a file ends up named
-    // after its id.
-    let disposition = crate::inspect::filename_from_content_disposition(response.headers());
+    // Bytes or a page? `Content-Disposition` is what says so: Drive sends it
+    // with an attachment and never with the warning page, and a body that is
+    // not HTML is not a page whatever else it lacks. Whether a *name* could be
+    // parsed out of that header is a separate question, and answering the two
+    // with one test is how a perfectly good download turned into "Drive served
+    // a page instead of a file".
+    let attachment = response.headers().contains_key(CONTENT_DISPOSITION);
+    let html = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    // Taken while the response is here: the URL Drive redirects to names the
+    // file once and then answers a second, ranged request for the same URL
+    // with the bytes and no `Content-Disposition` at all.
+    let named = disposition_name(response.headers());
 
-    if let Some(name) = disposition {
+    if attachment || !html {
         // Dropping the response unread is what keeps this from streaming the
         // whole file once to learn its name and again to save it.
         drop(response);
+        let name = match named {
+            Some(name) => name,
+            None => page_name(client, id, options.max_retries)
+                .await
+                .unwrap_or_else(|| fallback_name(id)),
+        };
+
         return Ok(DirectLink {
-            name: safe_component(&name),
             url: landed.into(),
+            name,
             id: id.to_owned(),
         });
     }
@@ -330,11 +348,11 @@ pub(super) async fn anonymous_file(
         )
     })?;
 
-    // The warning page prints the name of the file it is warning about, so the
-    // confirmed URL is only asked when the page did not say.
-    let name = match name_from_page(&page) {
+    // The warning page prints the name of the file it is warning about, which
+    // saves asking anything else for it.
+    let name = match name_from_page(&page).or(named) {
         Some(name) => name,
-        None => suggested_name(client, confirmed.as_str())
+        None => page_name(client, id, options.max_retries)
             .await
             .unwrap_or_else(|| fallback_name(id)),
     };
@@ -346,12 +364,67 @@ pub(super) async fn anonymous_file(
     })
 }
 
+/// The filename a response says it is serving.
+///
+/// [`crate::inspect`] holds the crate's `Content-Disposition` parser, and gets
+/// a second go at the header as lossy bytes: Drive sometimes puts a filename
+/// in it as raw UTF-8, which a header value may not hold, and `to_str` then
+/// refuses the whole thing rather than the one parameter at fault.
+fn disposition_name(headers: &HeaderMap) -> Option<String> {
+    if let Some(name) = crate::inspect::filename_from_content_disposition(headers) {
+        return Some(safe_component(&name));
+    }
+
+    let raw = String::from_utf8_lossy(headers.get(CONTENT_DISPOSITION)?.as_bytes());
+    let value = raw
+        .split(';')
+        .map(str::trim)
+        // `safe_component` percent-decodes, which is what the extended form
+        // needs and what an ordinary filename is unaffected by.
+        .filter_map(|part| {
+            part.strip_prefix("filename=")
+                .or_else(|| part.strip_prefix("filename*=UTF-8''"))
+        })
+        .map(|value| value.trim_matches('"'))
+        .find(|value| !value.is_empty())?;
+
+    Some(safe_component(value))
+}
+
+/// The name Drive shows on the file's own page.
+///
+/// The last resort before naming a file after its id, and the only naming step
+/// that costs a request of its own. The preview page is public for anything
+/// shared by link, and it carries the name in an `og:title` for the sake of
+/// everything that unfurls a URL.
+async fn page_name(client: &Client, id: &str, retries: u32) -> Option<String> {
+    let url = Url::parse(UC_ENDPOINT)
+        .ok()?
+        .join(&format!("/file/d/{id}/view"))
+        .ok()?;
+    let page = fetch(client, url.as_str(), retries)
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+
+    let title = page
+        .split("<meta")
+        .skip(1)
+        .filter_map(|candidate| candidate.split_once('>').map(|(tag, _)| tag))
+        .find(|tag| attribute(tag, "property").as_deref() == Some("og:title"))
+        .and_then(|tag| attribute(tag, "content"))?;
+    let name = unescape(title.trim());
+
+    (!name.is_empty()).then(|| safe_component(&name))
+}
+
 /// The filename a URL says it serves, if it says.
 ///
-/// The last thing tried before naming a file after its id, and the only one
-/// that costs a request \u{2014} a single ranged byte, through [`crate::inspect`],
-/// because a second `Content-Disposition` parser living here would be a copy of
-/// tested code for no gain.
+/// The one naming step [`super::resolve`] has for a document exported without
+/// a key: a Doc's title appears nowhere but the export's own headers, and
+/// asking for them costs a single ranged byte through [`crate::inspect`].
 pub(super) async fn suggested_name(client: &Client, url: &str) -> Option<String> {
     let info = crate::inspect::inspect_url(client, url).await.ok()?;
     info.suggested_filename
