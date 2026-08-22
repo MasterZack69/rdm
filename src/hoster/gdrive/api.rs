@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::header::CONTENT_DISPOSITION;
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -83,7 +82,7 @@ fn api_export_url(api_key: &str, id: &str, mime: &str) -> Result<Url> {
     Ok(url)
 }
 
-/// The same export, through the endpoint the Docs "File \u{2192} Download" menu
+/// The same export, through the endpoint the Docs \u{201c}File \u{2192} Download\u{201d} menu
 /// uses, which needs no key.
 ///
 /// Slides and Drawings take the format as a path segment while Docs and Sheets
@@ -302,14 +301,19 @@ pub(super) async fn anonymous_file(
         bail!("{}", explain(status, &body));
     }
 
-    if response.headers().contains_key(CONTENT_DISPOSITION) {
-        // Dropping the response here is what keeps this from streaming the
+    // Taken from this response rather than by asking the URL again: Drive
+    // names the file in the answer it redirects to, and then answers a second,
+    // ranged request for the same URL with the bytes and no
+    // `Content-Disposition` at all. Asking twice is how a file ends up named
+    // after its id.
+    let disposition = crate::inspect::filename_from_content_disposition(response.headers());
+
+    if let Some(name) = disposition {
+        // Dropping the response unread is what keeps this from streaming the
         // whole file once to learn its name and again to save it.
         drop(response);
         return Ok(DirectLink {
-            name: suggested_name(client, landed.as_str())
-                .await
-                .unwrap_or_else(|| fallback_name(id)),
+            name: safe_component(&name),
             url: landed.into(),
             id: id.to_owned(),
         });
@@ -326,10 +330,14 @@ pub(super) async fn anonymous_file(
         )
     })?;
 
-    let name = suggested_name(client, confirmed.as_str())
-        .await
-        .or_else(|| name_from_page(&page))
-        .unwrap_or_else(|| fallback_name(id));
+    // The warning page prints the name of the file it is warning about, so the
+    // confirmed URL is only asked when the page did not say.
+    let name = match name_from_page(&page) {
+        Some(name) => name,
+        None => suggested_name(client, confirmed.as_str())
+            .await
+            .unwrap_or_else(|| fallback_name(id)),
+    };
 
     Ok(DirectLink {
         url: confirmed.into(),
@@ -340,9 +348,10 @@ pub(super) async fn anonymous_file(
 
 /// The filename a URL says it serves, if it says.
 ///
-/// [`crate::inspect`] is this crate's one reader of `Content-Disposition`, and
-/// asking it costs a single ranged byte, so the alternative — a second header
-/// parser living here — would be a copy of tested code for no gain.
+/// The last thing tried before naming a file after its id, and the only one
+/// that costs a request \u{2014} a single ranged byte, through [`crate::inspect`],
+/// because a second `Content-Disposition` parser living here would be a copy of
+/// tested code for no gain.
 pub(super) async fn suggested_name(client: &Client, url: &str) -> Option<String> {
     let info = crate::inspect::inspect_url(client, url).await.ok()?;
     info.suggested_filename
@@ -429,7 +438,7 @@ fn download_form(page: &str) -> Option<Form<'_>> {
 ///
 /// Not filtered by `type="hidden"`, unlike the recipes this follows: Drive's
 /// form has nothing visible in it, and an input that omits its type would
-/// otherwise take `at` — the one parameter the download will not work without —
+/// otherwise take `at` \u{2014} the one parameter the download will not work without \u{2014}
 /// out of the query.
 fn hidden_inputs(body: &str) -> Vec<(String, String)> {
     body.split("<input")
