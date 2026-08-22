@@ -16,7 +16,7 @@ impl FileInfo {
     }
 }
 
-fn filename_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Option<String> {
+pub(crate) fn filename_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Option<String> {
     let val = headers.get("content-disposition")?.to_str().ok()?;
 
     // Try filename*=UTF-8''name first (RFC 5987)
@@ -60,7 +60,7 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         .header(header::RANGE, "bytes=0-0")
         .send()
         .await
-        .context("Request failed — check the URL and your network connection")?;
+        .context("Request failed \u{2014} check the URL and your network connection")?;
 
     let status = resp.status();
     let suggested_filename = filename_from_content_disposition(resp.headers());
@@ -101,12 +101,12 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         });
     }
 
-    // Some servers reject GET with Range — fall back to HEAD
+    // Some servers reject GET with Range \u{2014} fall back to HEAD
     let head_resp = client
         .head(url)
         .send()
         .await
-        .context("HEAD request failed — check the URL and your network connection")?;
+        .context("HEAD request failed \u{2014} check the URL and your network connection")?;
 
     let head_status = head_resp.status();
     if !head_status.is_success() {

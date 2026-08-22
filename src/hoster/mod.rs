@@ -46,6 +46,11 @@
 /// the generic engine.
 pub mod dropbox;
 
+/// Google Drive (drive.google.com, docs.google.com): the virus-scan warning
+/// page followed for a file, export endpoints for a Google Doc, and the Drive
+/// API for a folder listing.
+pub mod gdrive;
+
 /// GoFile (gofile.io): API-resolved content trees, guest or account tokens.
 pub mod gofile;
 
@@ -63,6 +68,7 @@ pub enum Kind {
     Gofile,
     Dropbox,
     OneDrive,
+    Gdrive,
 }
 
 /// What a link points at.
@@ -112,6 +118,9 @@ impl Kind {
         if onedrive::is_onedrive_url(url) {
             return Some(Self::OneDrive);
         }
+        if gdrive::is_gdrive_url(url) {
+            return Some(Self::Gdrive);
+        }
         None
     }
 
@@ -122,6 +131,7 @@ impl Kind {
             Self::Gofile => "gofile",
             Self::Dropbox => "dropbox",
             Self::OneDrive => "onedrive",
+            Self::Gdrive => "gdrive",
         }
     }
 
@@ -132,6 +142,7 @@ impl Kind {
             Self::Gofile => "GoFile",
             Self::Dropbox => "Dropbox",
             Self::OneDrive => "OneDrive",
+            Self::Gdrive => "Google Drive",
         }
     }
 
@@ -190,6 +201,15 @@ impl Kind {
                 integrity_check: false,
                 parallel_chunks: true,
             },
+            // No integrity check, for the OneDrive reason: the API publishes
+            // an `md5Checksum` for an uploaded file, and nothing in this crate
+            // can compute one to compare it against.
+            Self::Gdrive => Capabilities {
+                folders: true,
+                resume: true,
+                integrity_check: false,
+                parallel_chunks: true,
+            },
         }
     }
 
@@ -229,6 +249,17 @@ impl Kind {
             // undocumented tea leaves, and `link_kind` is contractually not
             // allowed to make a request.
             Self::OneDrive => LinkKind::File,
+            // The one host here whose links answer this honestly: a folder is
+            // spelled `/drive/folders/<id>` or `folderview?id=<id>`, and
+            // everything else is a file or a document. No guessing and no
+            // request, which is what the contract asks for.
+            Self::Gdrive => {
+                if gdrive::is_folder_link(url) {
+                    LinkKind::Folder
+                } else {
+                    LinkKind::File
+                }
+            }
         }
     }
 
@@ -250,7 +281,9 @@ pub fn detect(url: &str) -> Option<Kind> {
 /// rather than fetchable addresses, a Dropbox share link serves an HTML
 /// preview page until [`dropbox::resolve`] rewrites it into a direct one, and a
 /// OneDrive link is a preview page too until [`onedrive::resolve`] asks the API
-/// what is behind it.
+/// what is behind it. A Google Drive link is a viewer page, a document with no
+/// file behind it at all, or a folder id, and [`gdrive::resolve`] is what says
+/// which.
 pub fn is_hoster_url(url: &str) -> bool {
     detect(url).is_some()
 }
@@ -310,6 +343,36 @@ mod tests {
             Some(Kind::OneDrive)
         );
         assert!(is_hoster_url("https://1drv.ms/f/s!AbCdEfGh"));
+    }
+
+    #[test]
+    fn google_drive_links_are_routed_to_gdrive() {
+        assert_eq!(
+            Kind::detect("https://drive.google.com/file/d/1A2b3C4d5E6f/view"),
+            Some(Kind::Gdrive)
+        );
+        assert_eq!(
+            Kind::detect("https://docs.google.com/spreadsheets/d/1A2b3C4d5E6f/edit#gid=0"),
+            Some(Kind::Gdrive)
+        );
+        assert!(is_hoster_url(
+            "https://drive.google.com/drive/folders/1A2b3C4d5E6f"
+        ));
+
+        assert_eq!(
+            Kind::detect("https://notdrive.google.com/file/d/1A2b3C4d5E6f/view"),
+            None
+        );
+        assert_eq!(
+            Kind::detect("https://drive.google.com.evil.com/file/d/1A2b3C4d5E6f/view"),
+            None
+        );
+        // Where a confirmed Drive download lands. Already a fetchable address,
+        // so claiming it would send a resolved URL back through resolution.
+        assert_eq!(
+            Kind::detect("https://drive.usercontent.google.com/download?id=1A2b3C4d5E6f"),
+            None
+        );
     }
 
     /// Ordinary links must fall through to the generic engine, and lookalike
@@ -395,6 +458,20 @@ mod tests {
         assert!(Kind::OneDrive.capabilities().folders);
     }
 
+    /// Google Drive is the exception to both of the cases above: the link says
+    /// which it is, and it changes what happens — a folder becomes a tree of
+    /// downloads rather than one destination.
+    #[test]
+    fn a_google_drive_folder_link_says_so() {
+        let folder = "https://drive.google.com/drive/folders/1A2b3C4d5E6f";
+        let file = "https://drive.google.com/file/d/1A2b3C4d5E6f/view";
+
+        assert_eq!(Kind::Gdrive.link_kind(folder), LinkKind::Folder);
+        assert!(Kind::Gdrive.is_folder_link(folder));
+        assert_eq!(Kind::Gdrive.link_kind(file), LinkKind::File);
+        assert!(!Kind::Gdrive.is_folder_link(file));
+    }
+
     #[test]
     fn mega_advertises_what_it_implements() {
         let caps = Kind::Mega.capabilities();
@@ -439,5 +516,16 @@ mod tests {
         assert!(caps.parallel_chunks);
         assert_eq!(Kind::OneDrive.name(), "onedrive");
         assert_eq!(Kind::OneDrive.display_name(), "OneDrive");
+    }
+
+    #[test]
+    fn gdrive_advertises_what_it_implements() {
+        let caps = Kind::Gdrive.capabilities();
+        assert!(caps.folders);
+        assert!(caps.resume);
+        assert!(!caps.integrity_check);
+        assert!(caps.parallel_chunks);
+        assert_eq!(Kind::Gdrive.name(), "gdrive");
+        assert_eq!(Kind::Gdrive.display_name(), "Google Drive");
     }
 }

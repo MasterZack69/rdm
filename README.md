@@ -58,8 +58,6 @@ rdm sync <URL> [-o dir] [-c N] [-p N] [-d] [-e flac,mkv]
 
 `-o` sets the output path only for a sync, not a filename. `-e` takes a comma separated list or repeated flags, with or without leading dots, and is case insensitive: `-e flac,mkv` and `-e .flac -e .MKV` do the same thing.
 
-A MEGA or OneDrive folder share is mirrored through that hoster's own path rather than through the queue, so `-p` does not apply to it. On a OneDrive share `-c` sets how many files download at once, and the sizes come from the API, so there is no round of `HEAD` requests before the diff.
-
 ## Queue
 
 ```
@@ -70,7 +68,7 @@ rdm queue stop                           Stop after current download
 rdm queue skip                           Skip the download(s) in flight  [next, n]
 rdm queue remove <ID>                    Remove one item             [rm]
 rdm queue retry [ID|failed|skipped]      Requeue items               [r]
-rdm queue clear [pending|done]           Clear queue (all by default)   [c]
+rdm queue clear [pending|done]            Clear queue (all by default)   [c]
 ```
 
 `-p` on `queue start` defaults to `queue_parallel` from the config.
@@ -83,6 +81,7 @@ Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything
 - [gofile - click to view](extraInfo/gofile.md)
 - [dropbox - click to view](extraInfo/dropbox.md)
 - [onedrive - click to view](extraInfo/onedrive.md)
+- [gdrive - click to view](extraInfo/gdrive.md)
 
 # Example Config File
 
@@ -117,6 +116,19 @@ gofile_token = ""
 
 # OneDrive: how many files to download at once (max 15)
 onedrive_workers = 5
+
+# Google Drive: how many files to download at once (max 15)
+# Drive's quota is per key per second, so a big number buys 403s
+gdrive_workers = 5
+
+# Google Drive: API key. Optional — a folder still lists without one, but only
+# the API pages a listing to the end and gives every file a size.
+# RDM_GDRIVE_API_KEY overrides this for a single run.
+gdrive_api_key = ""
+
+# Google Drive: what a Doc, Sheet, Slide deck or Drawing is exported as.
+# An extension (pdf, docx, xlsx, csv, png, ...) or "office"
+gdrive_doc_format = "pdf"
 ```
 
 Everything in the config is optional as they have their own defaults.
@@ -147,8 +159,10 @@ cargo test
 
 ## Prior art
 
-Clean-room Rust implementations of the MEGA, GoFile and OneDrive support, but these projects are where the necessary details came from. No code was copied.
+Clean-room Rust implementations of the MEGA, GoFile, OneDrive and Google Drive support, but these projects are where the necessary details came from. No code was copied.
 
 - [MegaBasterd](https://github.com/tonikelope/megabasterd) by tonikelope (GPLv3) — MEGA: 509 quota is per-IP, backoff ends early on IP change, chunk workers can't share a keep-alive socket, 403 means an expired temp URL.
 - [gofile-downloader](https://github.com/ltsdw/gofile-downloader) by ltsdw (GPLv3) — GoFile: `X-Website-Token` recipe (four-hour slot), guest account required before listing, token as both `Authorization` header and `accountToken` cookie, `200` on a `Range` request means resume refused.
 - [onedrive-downloader](https://github.com/eugenenuke/onedrive-downloader) by eugenenuke (GPLv3) — OneDrive: anonymous badger token + fixed app id, share link is the item address (base64url, no padding), driveitem call is a POST with `Prefer: autoredeem`, drive id is item id up to the first `!`, file vs folder decided by `@content.downloadUrl`, listing URLs are signed and short-lived.
+- [goodls](https://github.com/tanaikech/goodls) by tanaike (MIT) — Google Drive: the form on the virus-scan warning page holds the real download URL and its hidden inputs carry `uuid` and `at`, a Doc has no bytes and must be exported per kind, `alt=media` for stored files against `export` for Google-native ones, `supportsAllDrives` on every call.
+- [gdown](https://github.com/wkentaro/gdown) by wkentaro (MIT) — Google Drive: a folder can be listed without a key through `embeddedfolderview`, whose children are `/file/d/<id>`, `docs.google.com/<kind>/d/<id>` and `/drive/folders/<id>` links, with the page title as the folder name — and that listing is capped by what the page renders rather than paged to the end.
