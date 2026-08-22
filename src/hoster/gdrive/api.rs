@@ -255,7 +255,9 @@ pub(super) async fn walk(
                         .map(|leaf| leaf.to_string_lossy().into_owned())
                         .unwrap_or(filename),
                     relative,
-                    url: url.into(),
+                    // The key is already on it, so there is nothing left to
+                    // resolve at download time.
+                    url: Some(url.into()),
                     id: id.to_owned(),
                 });
             }
@@ -271,6 +273,9 @@ pub(super) async fn walk(
         files,
         dirs,
         unsupported,
+        // The API pages through a folder to the end, so a listing from here is
+        // never short.
+        capped: Vec::new(),
     })
 }
 
@@ -553,7 +558,7 @@ pub(super) fn name_from_page(page: &str) -> Option<String> {
 /// one, so `data-action="…"` is not mistaken for `action`. Drive's markup is
 /// machine-written and always quotes; an unquoted-attribute parser is the point
 /// at which writing one of these by hand stops being reasonable.
-fn attribute(tag: &str, name: &str) -> Option<String> {
+pub(super) fn attribute(tag: &str, name: &str) -> Option<String> {
     for quote in ['"', '\''] {
         if let Some((_, after)) = tag.split_once(&format!(" {name}={quote}")) {
             return Some(after.split(quote).next().unwrap_or_default().to_owned());
@@ -566,7 +571,7 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 ///
 /// `&amp;` goes last on purpose: unescaping it first would turn a literal
 /// `&amp;lt;` in a filename into `<`.
-fn unescape(text: &str) -> String {
+pub(super) fn unescape(text: &str) -> String {
     text.replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&lt;", "<")
@@ -580,7 +585,7 @@ fn unescape(text: &str) -> String {
 ///
 /// A refusal comes back rather than being raised: only the caller knows whether
 /// the body is an error worth quoting or a page worth reading.
-async fn fetch(client: &Client, url: &str, retries: u32) -> Result<Response> {
+pub(super) async fn fetch(client: &Client, url: &str, retries: u32) -> Result<Response> {
     let mut last: Option<anyhow::Error> = None;
 
     for attempt in 0..retries.max(1) {
