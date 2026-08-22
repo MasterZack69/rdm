@@ -45,7 +45,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 

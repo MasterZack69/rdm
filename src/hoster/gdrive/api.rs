@@ -272,7 +272,7 @@ pub(super) async fn walk(
                     relative,
                     // The key is already on it, so there is nothing left to
                     // resolve at download time.
-                    url: Some(url.into()),
+                    url: url.into(),
                     id: id.to_owned(),
                 });
             }
