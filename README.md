@@ -58,8 +58,6 @@ rdm sync <URL> [-o dir] [-c N] [-p N] [-d] [-e flac,mkv]
 
 `-o` sets the output path only for a sync, not a filename. `-e` takes a comma separated list or repeated flags, with or without leading dots, and is case insensitive: `-e flac,mkv` and `-e .flac -e .MKV` do the same thing.
 
-A MEGA or OneDrive folder share is mirrored through that hoster's own path rather than through the queue, so `-p` does not apply to it. On a OneDrive share `-c` sets how many files download at once, and the sizes come from the API, so there is no round of `HEAD` requests before the diff.
-
 ## Queue
 
 ```
