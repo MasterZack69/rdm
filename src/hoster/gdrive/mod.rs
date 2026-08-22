@@ -16,14 +16,17 @@
 //!      at all: a Doc is rendered on request, so the link is swapped for an
 //!      export endpoint and a format.
 //!   3. **A folder** — `/drive/folders/<id>`. The listing lives behind the
-//!      Drive API, which wants an API key. Anonymous access can fetch a file
-//!      whose link you already hold, but it cannot enumerate anything.
+//!      Drive API, which wants an API key. Without one there is still the page
+//!      Drive hands websites to embed, which lists a folder's children as
+//!      links: enough to walk an ordinary share, capped by the page rather
+//!      than paged to the end, and with no sizes on it.
 //!
 //! ## What this asks for, and what it does not
 //!
-//! No login, no OAuth, no consent screen. An API key is optional and buys two
-//! things: folder listings, and real filenames without a round trip through
-//! the warning page. It is a quota identity rather than a credential, so a
+//! No login, no OAuth, no consent screen. An API key is optional and buys
+//! three things: a folder listing paged to the end rather than capped by a
+//! page, a size per file, and real filenames without a round trip through the
+//! warning page. It is a quota identity rather than a credential, so a
 //! restricted share stays unreadable either way.
 //!
 //! Transfers go through [`crate::engine`], so chunking, ranged resume, retries
@@ -59,6 +62,7 @@ mod transfer;
 mod tests;
 
 pub use link::{DocKind, Link, is_folder_link, is_gdrive_url, parse_link};
+pub use transfer::{create_tree, download_files};
 
 /// Where an anonymous file download starts.
 const UC_ENDPOINT: &str = "https://drive.google.com/uc";
@@ -203,21 +207,42 @@ struct Session {
 }
 
 /// What a walk of a folder found.
-struct Listing {
+pub struct Listing {
     /// Every file under the folder, in walk order.
-    files: Vec<RemoteFile>,
+    pub files: Vec<RemoteFile>,
     /// Every directory seen, empty ones included.
-    dirs: Vec<PathBuf>,
+    pub dirs: Vec<PathBuf>,
     /// Children with no downloadable form.
-    unsupported: usize,
+    pub unsupported: usize,
 }
 
 /// One file to fetch.
-struct RemoteFile {
-    relative: PathBuf,
-    name: String,
-    url: String,
-    id: String,
+pub struct RemoteFile {
+    /// Path relative to the download root, folders included.
+    pub relative: PathBuf,
+    /// Leaf name, for the progress line.
+    pub name: String,
+    /// Where the bytes come from: an API URL with the key on it, a document's
+    /// export, or a confirmed anonymous download.
+    pub url: String,
+    /// Bytes, when something said so. The API states a size for a stored file
+    /// and never for a Google document; the folder page states none at all. A
+    /// mirror with no size to compare cannot tell stale from current.
+    pub size: Option<u64>,
+    /// Drive id, which is what resume is keyed on.
+    pub id: String,
+}
+
+/// Where a folder download reports progress.
+pub enum Progress {
+    /// Its own board, for a download that owns the terminal.
+    Board,
+    /// Nothing at all.
+    Quiet,
+    /// One line on somebody else's board, for a folder running as a single
+    /// queue item. The queue owns the display, so nothing here may build a
+    /// second one.
+    Lane(std::sync::Arc<dyn crate::ui::ProgressSink>),
 }
 
 // ── Entry points ──────────────────────────────────────────
@@ -297,6 +322,27 @@ pub async fn resolve(client: Client, url: &str, options: &GdriveOptions) -> Resu
 /// Every file goes through [`crate::engine`], which is where `.part` files,
 /// ranged resume, retries and the already-downloaded check already live. This
 /// only decides what to fetch, where to put it, and how many at once.
+/// Lists everything under a folder, without fetching any of it.
+///
+/// The two sources differ in what they can promise: the API pages to the end
+/// and states each file's size, while the folder page renders one batch and
+/// states nothing. `api::scrape_folder` warns on stderr when a listing comes
+/// back at the length the page stops at.
+pub async fn list_folder(folder: &Folder, options: &GdriveOptions) -> Result<Listing> {
+    match &folder.source {
+        FolderSource::Api(session) => api::walk(session, &folder.id, options).await,
+        FolderSource::Page(client) => api::scrape_folder(client, &folder.id, options).await,
+    }
+}
+
+/// Downloads everything in a folder.
+///
+/// `output`, when given, is the directory the tree is written into; without it
+/// the folder keeps its own name under `download_dir`.
+///
+/// Every file goes through [`crate::engine`], which is where `.part` files,
+/// ranged resume, retries and the already-downloaded check already live. This
+/// only decides what to fetch, where to put it, and how many at once.
 pub async fn download_folder(
     folder: Folder,
     output: Option<String>,
@@ -305,14 +351,18 @@ pub async fn download_folder(
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<GdriveSummary> {
-    let listing = match &folder.source {
-    FolderSource::Api(session) => api::walk(session, &folder.id, &options).await?,
-    FolderSource::Page(client) => api::scrape_folder(client, &folder.id, &options).await?,
-};
+    let listing = list_folder(&folder, &options).await?;
     let root = destination_root(output, download_dir, folder.name());
 
-    transfer::create_tree(&root, &listing.dirs).await?;
-    transfer::download_files(&listing, &root, &options, cancel, quiet).await
+    create_tree(&root, &listing.dirs).await?;
+    let progress = if quiet { Progress::Quiet } else { Progress::Board };
+    let mut summary =
+        download_files(&listing.files, &root, &options, cancel, progress).await?;
+    // The transfer sees a slice of files rather than the listing they came
+    // from, so the count of what could not be fetched is added back here.
+    summary.unsupported = listing.unsupported;
+
+    Ok(summary)
 }
 
 // ── Naming ───────────────────────────────────────────────
@@ -323,7 +373,7 @@ pub async fn download_folder(
 /// there is no single file for a filename to name. Otherwise the folder keeps
 /// its own name, which is the one thing about it that means anything to
 /// whoever was sent the link.
-fn destination_root(
+pub fn destination_root(
     output: Option<String>,
     download_dir: &str,
     folder_name: Option<&str>,

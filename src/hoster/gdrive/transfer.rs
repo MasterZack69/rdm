@@ -12,14 +12,14 @@ use tokio_util::sync::CancellationToken;
 use crate::engine::{self, DownloadRequest, ExistingPolicy, Outcome};
 use crate::ui::{self, Board, ProgressSink};
 
-use super::{GdriveOptions, GdriveSummary, Listing, WORKERS_MAX};
+use super::{GdriveOptions, GdriveSummary, Progress, RemoteFile, WORKERS_MAX};
 
 /// Creates the download root and every directory the walk saw.
 ///
 /// Empty ones included: an empty folder is still part of the structure that was
 /// shared. Doing it up front also means every file's parent exists before any
 /// transfer starts, so nothing below has to create anything.
-pub(super) async fn create_tree(root: &Path, dirs: &[PathBuf]) -> Result<()> {
+pub async fn create_tree(root: &Path, dirs: &[PathBuf]) -> Result<()> {
     fs::create_dir_all(root)
         .await
         .with_context(|| format!("could not create {}", root.display()))?;
@@ -34,18 +34,21 @@ pub(super) async fn create_tree(root: &Path, dirs: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// Downloads a listing under `root`, several files at a time.
+/// Downloads files under `root`, several at a time.
 ///
 /// One failure is not the end of the folder: it is recorded and the rest carry
 /// on, because thirty-nine files out of forty is a better outcome than none.
-pub(super) async fn download_files(
-    listing: &Listing,
+///
+/// Takes a slice rather than a [`Listing`](super::Listing) so a mirror can
+/// download the part of a folder that is actually out of date.
+pub async fn download_files(
+    files: &[RemoteFile],
     root: &Path,
     options: &GdriveOptions,
     cancel: CancellationToken,
-    quiet: bool,
+    progress: Progress,
 ) -> Result<GdriveSummary> {
-    let total = listing.files.len();
+    let total = files.len();
 
     if total == 0 {
         // A folder with nothing fetchable in it is a result, not a failure: the
@@ -56,14 +59,26 @@ pub(super) async fn download_files(
             completed: 0,
             skipped: 0,
             bytes: 0,
-            unsupported: listing.unsupported,
+            // Filled in by the caller, which is the only thing holding the
+            // listing these files came from.
+            unsupported: 0,
             failed: Vec::new(),
             cancelled: false,
         });
     }
 
     let workers = options.workers.clamp(1, WORKERS_MAX);
-    let board = (!quiet).then(|| Board::new("Google Drive", total, workers));
+    // A lane is one line on a board somebody else is rendering, so this must
+    // not build one of its own: two renderers writing the same terminal is a
+    // scrambled display.
+    let board = match &progress {
+        Progress::Board => Some(Board::new("Google Drive", total, workers)),
+        Progress::Quiet | Progress::Lane(_) => None,
+    };
+    let lane_sink = match &progress {
+        Progress::Lane(sink) => Some(Arc::clone(sink)),
+        Progress::Board | Progress::Quiet => None,
+    };
     let renderer = board.as_ref().map(|board| board.spawn_renderer());
 
     let completed = AtomicUsize::new(0);
@@ -74,6 +89,7 @@ pub(super) async fn download_files(
 
     {
         let board = board.as_ref();
+        let lane_sink = lane_sink.as_ref();
         let completed = &completed;
         let skipped = &skipped;
         let bytes = &bytes;
@@ -81,7 +97,7 @@ pub(super) async fn download_files(
         let failed = &failed;
         let overwrite = options.overwrite;
 
-        stream::iter(listing.files.iter().enumerate())
+        stream::iter(files.iter().enumerate())
             .for_each_concurrent(workers, move |(index, file)| {
                 let cancel = cancel.clone();
                 async move {
@@ -94,9 +110,13 @@ pub(super) async fn download_files(
                     // would hand the display slot to another worker while this
                     // one is still reporting into it.
                     let lane = board.and_then(|board| board.claim(index as u64 + 1, &file.name));
-                    let sink: Arc<dyn ProgressSink> = match lane.as_ref() {
-                        Some(lane) => lane.sink(),
-                        None => ui::silent(),
+                    let sink: Arc<dyn ProgressSink> = match (lane.as_ref(), lane_sink) {
+                        (Some(lane), _) => lane.sink(),
+                        // Every file reports into the one shared line, so the
+                        // queue shows the folder's throughput rather than any
+                        // single file's.
+                        (None, Some(sink)) => Arc::clone(sink),
+                        (None, None) => ui::silent(),
                     };
 
                     let destination = root.join(&file.relative);
@@ -172,7 +192,7 @@ pub(super) async fn download_files(
         completed: completed.load(Ordering::Relaxed),
         skipped: skipped.load(Ordering::Relaxed),
         bytes: bytes.load(Ordering::Relaxed),
-        unsupported: listing.unsupported,
+        unsupported: 0,
         failed: failed.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner()),
         cancelled: cancelled.load(Ordering::Relaxed),
     })

@@ -163,6 +163,19 @@ impl Config {
         Ok(())
     }
 
+    /// The Drive API key for this run, environment first.
+    ///
+    /// `RDM_GDRIVE_API_KEY` wins over the config file, so a key can be given
+    /// for one run without being written to disk. A blank value on either side
+    /// is not a key: sending an empty one turns every call into a 400 instead
+    /// of falling back to anonymous access.
+    pub fn gdrive_key(&self) -> Option<String> {
+        std::env::var("RDM_GDRIVE_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .or_else(|| Some(self.gdrive_api_key.clone()).filter(|key| !key.trim().is_empty()))
+    }
+
     pub fn resolve_output_path(&self, filename: &str) -> String {
         let path = std::path::Path::new(filename);
         if path.is_absolute() {

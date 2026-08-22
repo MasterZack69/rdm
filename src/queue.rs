@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::engine::{self, DownloadRequest, ExistingPolicy, Outcome};
-use crate::hoster::onedrive;
+use crate::hoster::{gdrive, onedrive};
 use crate::mega;
 use crate::ui;
 
@@ -64,6 +64,12 @@ impl Item {
         onedrive::is_onedrive_url(&self.url)
     }
 
+    /// Does this item need the Drive API, or the warning page, before
+    /// anything can be fetched?
+    pub fn is_gdrive(&self) -> bool {
+        gdrive::is_gdrive_url(&self.url)
+    }
+
     /// Human-friendly name for progress lines: the output path if we have one,
     /// otherwise the last URL segment.
     pub fn display_name(&self) -> String {
@@ -87,6 +93,12 @@ impl Item {
         // honest label until then.
         if self.is_onedrive() {
             return "OneDrive link".to_owned();
+        }
+
+        // A Drive link's last segment is `view` or an id, and neither names
+        // anything.
+        if self.is_gdrive() {
+            return "Google Drive link".to_owned();
         }
 
         let raw = self
@@ -677,6 +689,10 @@ async fn run_item(
         return run_onedrive_item(cfg, item, cancel, sink).await;
     }
 
+    if item.is_gdrive() {
+        return run_gdrive_item(cfg, item, cancel, sink).await;
+    }
+
     let request = DownloadRequest::new(
         item.url.clone(),
         Some(item.resolve_output(cfg)),
@@ -753,6 +769,101 @@ async fn run_onedrive_item(
         options,
         cancel,
         onedrive::Progress::Lane(sink),
+    )
+    .await?;
+
+    if summary.cancelled {
+        return Ok(ItemOutcome::Cancelled);
+    }
+
+    // One failed file must not read as a finished folder: leaving the item
+    // failed is what lets `queue retry failed` finish the job, and the files
+    // already on disk are skipped when it does.
+    if !summary.failed.is_empty() {
+        let (path, reason) = &summary.failed[0];
+        anyhow::bail!(
+            "{} of {} file(s) failed, starting with {}: {}",
+            summary.failed.len(),
+            summary.total,
+            path,
+            reason
+        );
+    }
+
+    if summary.completed == 0 && summary.skipped > 0 {
+        return Ok(ItemOutcome::AlreadyPresent);
+    }
+
+    Ok(ItemOutcome::Completed {
+        bytes: summary.bytes,
+    })
+}
+
+/// Runs one Google Drive item.
+///
+/// Same shape as the OneDrive path and for the same reason: a link is not a
+/// fetchable address, so what it points at decides the shape of the work. A
+/// file goes to the engine; a folder is a whole tree behind one item, fetched
+/// under this item and reported into this item's one progress line.
+///
+/// The link is what gets stored, never the resolved URL: a confirmed download
+/// URL carries a short-lived `at` token, so an item that sat in the queue
+/// overnight has to ask again.
+async fn run_gdrive_item(
+    cfg: &Config,
+    item: &Item,
+    cancel: CancellationToken,
+    sink: Arc<dyn ui::ProgressSink>,
+) -> Result<ItemOutcome> {
+    let options = gdrive::GdriveOptions {
+        // On a folder `-c` means files at once. On a single file it stays
+        // chunks — see below.
+        workers: item.connections.unwrap_or(cfg.gdrive_workers),
+        max_retries: cfg.max_retries,
+        api_key: cfg.gdrive_key(),
+        doc_format: cfg.gdrive_doc_format.clone(),
+        // The queue never re-downloads what is already there.
+        overwrite: false,
+    };
+
+    let (output, download_dir) = item.share_destination(cfg);
+
+    let folder = match gdrive::resolve(reqwest::Client::new(), &item.url, &options).await? {
+        gdrive::Resolved::File(link) => {
+            let destination = output.unwrap_or_else(|| cfg.resolve_output_path(&link.name));
+            if let Some(parent) = std::path::Path::new(&destination).parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+
+            let request = DownloadRequest::new(
+                link.url,
+                Some(destination),
+                item.connections.unwrap_or(cfg.connections),
+            )
+            .with_policy(ExistingPolicy::Reuse)
+            // A fresh token every run, so the URL cannot be the thing resume
+            // recognises the file by.
+            .with_resume_identity(format!("gdrive:{}", link.id));
+
+            return Ok(match engine::download(request, cancel, sink).await? {
+                Outcome::Completed { bytes, .. } => ItemOutcome::Completed { bytes },
+                Outcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent,
+                Outcome::Cancelled => ItemOutcome::Cancelled,
+            });
+        }
+        gdrive::Resolved::Folder(folder) => folder,
+    };
+
+    let listing = gdrive::list_folder(&folder, &options).await?;
+    let root = gdrive::destination_root(output, &download_dir, folder.name());
+
+    gdrive::create_tree(&root, &listing.dirs).await?;
+    let summary = gdrive::download_files(
+        &listing.files,
+        &root,
+        &options,
+        cancel,
+        gdrive::Progress::Lane(sink),
     )
     .await?;
 

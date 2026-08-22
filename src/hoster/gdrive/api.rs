@@ -27,6 +27,10 @@ pub(super) struct FileMeta {
     /// a document to render, a folder to walk, or none of those.
     #[serde(rename = "mimeType")]
     mime_type: Option<String>,
+    /// Bytes, as the API sends it: a decimal string, and absent for anything
+    /// Google renders rather than stores.
+    #[serde(default)]
+    size: Option<String>,
 }
 
 /// One page of a folder's children.
@@ -77,7 +81,7 @@ fn files_url(api_key: &str, id: &str, action: Option<&str>) -> Result<Url> {
 fn metadata_url(api_key: &str, id: &str) -> Result<Url> {
     let mut url = files_url(api_key, id, None)?;
     url.query_pairs_mut()
-        .append_pair("fields", "id,name,mimeType")
+        .append_pair("fields", "id,name,mimeType,size")
         .append_pair("supportsAllDrives", "true");
     Ok(url)
 }
@@ -214,7 +218,7 @@ pub(super) async fn walk(
                     // Trashed children still list, and they are not there as
                     // far as anyone opening the folder is concerned.
                     .append_pair("q", &format!("'{folder}' in parents and trashed = false"))
-                    .append_pair("fields", "nextPageToken,files(id,name,mimeType)")
+                    .append_pair("fields", "nextPageToken,files(id,name,mimeType,size)")
                     .append_pair("pageSize", "1000")
                     .append_pair("supportsAllDrives", "true")
                     .append_pair("includeItemsFromAllDrives", "true")
@@ -273,6 +277,7 @@ pub(super) async fn walk(
                     // The key is already on it, so there is nothing left to
                     // resolve at download time.
                     url: url.into(),
+                    size: item.size.as_deref().and_then(|size| size.parse().ok()),
                     id: id.to_owned(),
                 });
             }
@@ -582,6 +587,9 @@ pub(super) async fn scrape_folder(
                     .unwrap_or_default(),
                 relative,
                 url,
+                // The folder page prints a rounded size like "35 KB", which
+                // is worse than nothing for comparing against a byte count.
+                size: None,
                 id,
             })
         })
