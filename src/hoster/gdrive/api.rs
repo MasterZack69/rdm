@@ -6,14 +6,16 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::{StreamExt, stream};
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderMap};
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use super::{
-    API_FILES, APPS_PREFIX, DOCS_BASE, DirectLink, DocKind, FOLDER_MIME, GdriveOptions, Listing,
-    RemoteFile, Session, UC_ENDPOINT, fallback_name, safe_component, unique, with_extension,
+    API_FILES, APPS_PREFIX, DOCS_BASE, DirectLink, DocKind, FOLDER_MIME, GdriveOptions, Link,
+    Listing, RemoteFile, Session, UC_ENDPOINT, WORKERS_MAX, fallback_name, parse_link,
+    safe_component, unique, with_extension,
 };
 
 /// The fields of a Drive file this module asks for.
@@ -35,6 +37,19 @@ struct FileList {
     #[serde(rename = "nextPageToken")]
     next: Option<String>,
 }
+
+/// The listing Drive hands websites to embed, and the only one an anonymous
+/// request can have.
+const EMBEDDED_VIEW: &str = "https://drive.google.com/embeddedfolderview";
+
+/// The point at which a folder page's listing stops being trustworthy.
+///
+/// Not a documented number. The page renders a first batch and leaves the rest
+/// to the script that would run in the iframe, and fifty is where every tool
+/// that reads it has found the edge. Treated as "this may be short" rather
+/// than as a limit, because on the day Google moves it, warning at the old
+/// number still beats saying nothing.
+const PAGE_LISTING_CAP: usize = 50;
 
 // ── URLs ─────────────────────────────────────────────────
 
@@ -273,9 +288,6 @@ pub(super) async fn walk(
         files,
         dirs,
         unsupported,
-        // The API pages through a folder to the end, so a listing from here is
-        // never short.
-        capped: Vec::new(),
     })
 }
 
@@ -436,6 +448,238 @@ pub(super) async fn suggested_name(client: &Client, url: &str) -> Option<String>
         .as_deref()
         .map(safe_component)
         .filter(|name| name != "download.bin")
+}
+
+// ── A folder without a key ───────────────────────────────
+
+/// The folder's own name, off the title of its embed page.
+pub(super) async fn scrape_folder_name(
+    client: &Client,
+    id: &str,
+    options: &GdriveOptions,
+) -> Result<Option<String>> {
+    let page = folder_page(client, id, options).await?;
+    Ok(page_title(&page))
+}
+
+/// Everything under a folder, read off the page Drive gives websites to embed.
+///
+/// `embeddedfolderview` is what an embedded Drive folder is an iframe of: a
+/// page of plain links, public for anything shared by link, and the only
+/// listing an anonymous request can have. It gives less than the API does —
+/// one page per folder instead of pagination, no mimeTypes, no choice of
+/// fields — so what it does give has to answer everything: a child is a file,
+/// a document or a folder according to the link it is shown under, which is
+/// the question [`parse_link`] already answers.
+///
+/// Two phases rather than one. The tree is walked first, then every file's URL
+/// is resolved together, because a file listed here arrives as an id and
+/// nothing else, and an id becomes bytes only by way of the warning page.
+pub(super) async fn scrape_folder(
+    client: &Client,
+    root: &str,
+    options: &GdriveOptions,
+) -> Result<Listing> {
+    let mut pending = vec![(root.to_owned(), PathBuf::new())];
+    // Every id this walk has accounted for. The page links to the folder it is
+    // showing and to the one above it, so without this the walk goes in
+    // circles.
+    let mut seen: HashSet<String> = HashSet::from([root.to_owned()]);
+    let mut taken: HashSet<PathBuf> = HashSet::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut wanted: Vec<(String, PathBuf, Option<Url>)> = Vec::new();
+    let mut unsupported = 0;
+
+    while let Some((folder, parent)) = pending.pop() {
+        let page = folder_page(client, &folder, options).await?;
+        let mut listed = 0;
+
+        for (link, text) in page_entries(&page) {
+            // An icon and a title can link to the same item, and one of those
+            // two anchors holds no text. Skipped rather than counted:
+            // whichever comes second is a duplicate, not a child.
+            if text.is_empty() {
+                continue;
+            }
+
+            match link {
+                Link::Folder { id } => {
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    listed += 1;
+                    let dir = unique(&mut taken, parent.join(safe_component(&text)));
+                    pending.push((id, dir.clone()));
+                    dirs.push(dir);
+                }
+
+                Link::File { id } => {
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    listed += 1;
+                    let relative = unique(&mut taken, parent.join(safe_component(&text)));
+                    wanted.push((id, relative, None));
+                }
+
+                Link::Doc { kind, id } => {
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    listed += 1;
+                    let (ext, _) = kind.export_as(&options.doc_format);
+                    let name = with_extension(&safe_component(&text), ext);
+                    let relative = unique(&mut taken, parent.join(name));
+                    // A document exports without a key, so this one has
+                    // nothing left to resolve.
+                    let url = docs_export_url(kind, &id, ext)?;
+                    wanted.push((id, relative, Some(url)));
+                }
+            }
+        }
+
+        if listed >= PAGE_LISTING_CAP {
+            let label = match parent.as_os_str().is_empty() {
+                true => "this folder".to_owned(),
+                false => format!("'{}'", parent.display()),
+            };
+            eprintln!(
+                "\u{26a0} {label} listed {listed} items, which is where the folder page stops: \
+                 there may be more it did not render. Set an API key (gdrive_api_key, or \
+                 RDM_GDRIVE_API_KEY) for a listing that pages to the end."
+            );
+        }
+    }
+
+    // Every file's URL, a few at a time. A warning-page round trip per file is
+    // the price of having no key, and the same ceiling the transfers run under
+    // is the right one for asking.
+    //
+    // A confirmed URL carries a short-lived token, so a folder big enough to
+    // outlast one will fail on its last files. Re-running finishes it: resume
+    // is keyed on the Drive id and the `.part` files are still there.
+    let attempted = wanted.len();
+    let workers = options.workers.clamp(1, WORKERS_MAX);
+    let resolved = stream::iter(wanted)
+        .map(|(id, relative, export)| async move {
+            let url: Option<String> = match export {
+                Some(url) => Some(url.into()),
+                None => match anonymous_file(client, &id, options).await {
+                    Ok(link) => Some(link.url),
+                    // One file that cannot be resolved is not the end of the
+                    // folder, but it is not a silent omission either.
+                    Err(error) => {
+                        eprintln!("\u{26a0} {}: {error:#}", relative.display());
+                        None
+                    }
+                },
+            };
+
+            url.map(|url| RemoteFile {
+                name: relative
+                    .file_name()
+                    .map(|leaf| leaf.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                relative,
+                url,
+                id,
+            })
+        })
+        // Ordered, not unordered: walk order is the order the folder was shown
+        // in, and it is what the progress board numbers its lanes from.
+        .buffered(workers)
+        .collect::<Vec<Option<RemoteFile>>>()
+        .await;
+
+    let files: Vec<RemoteFile> = resolved.into_iter().flatten().collect();
+    // The summary's picture of the folder is short by exactly this many.
+    unsupported += attempted - files.len();
+
+    Ok(Listing {
+        files,
+        dirs,
+        unsupported,
+    })
+}
+
+/// Fetches one folder's embed page.
+async fn folder_page(client: &Client, id: &str, options: &GdriveOptions) -> Result<String> {
+    let mut url = Url::parse(EMBEDDED_VIEW)?;
+    url.query_pairs_mut().append_pair("id", id);
+
+    let response = fetch(client, url.as_str(), options.max_retries).await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!(
+            "the Drive folder page answered HTTP {status} \u{2014} the folder is not shared with \
+             everyone holding the link, or Google is throttling anonymous listings"
+        );
+    }
+
+    response
+        .text()
+        .await
+        .context("the Drive folder page could not be read")
+}
+
+/// The name on a folder page.
+fn page_title(page: &str) -> Option<String> {
+    let inner = page.split_once("<title>")?.1.split_once("</title>")?.0;
+    let text = unescape(inner.trim());
+    let name = text.strip_suffix(" - Google Drive").unwrap_or(&text).trim();
+
+    (!name.is_empty()).then(|| safe_component(name))
+}
+
+/// Every Drive link on a page, as the item it points at and the text it was
+/// shown under.
+fn page_entries(page: &str) -> Vec<(Link, String)> {
+    let mut entries = Vec::new();
+
+    for candidate in page.split("<a").skip(1) {
+        // `<a `, not `<abbr`. The split has to leave the space that
+        // `attribute` looks for, so the tag name is checked here instead.
+        if !candidate.starts_with([' ', '\n', '\r', '\t']) {
+            continue;
+        }
+        let Some((tag, rest)) = candidate.split_once('>') else {
+            continue;
+        };
+        let Some(href) = attribute(tag, "href") else {
+            continue;
+        };
+        // Everything that is not a Drive item: the page's own furniture, and a
+        // Google Form or Site, which have nothing to download anyway.
+        let Ok(link) = parse_link(&unescape(&href)) else {
+            continue;
+        };
+
+        let inner = rest.split_once("</a").map_or(rest, |(inner, _)| inner);
+        entries.push((link, visible_text(inner)));
+    }
+
+    entries
+}
+
+/// The text of a fragment of markup, with the tags taken out.
+///
+/// An entry's title sits inside the same anchor as its icon, so the name is
+/// what is left once the markup is gone.
+fn visible_text(fragment: &str) -> String {
+    let mut text = String::new();
+    let mut depth = 0usize;
+
+    for ch in fragment.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => text.push(ch),
+            _ => {}
+        }
+    }
+
+    let spaced = text.replace("&nbsp;", " ");
+    unescape(&spaced.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 // ── The warning page ───────────────────────────────────────

@@ -201,12 +201,6 @@ impl Kind {
                 integrity_check: false,
                 parallel_chunks: true,
             },
-            // Folders, with a condition that belongs in the error message
-            // rather than here: listing one needs a Drive API key. This says
-            // what the hoster can do, not what a particular run is configured
-            // to do, in the same way `resume` does not promise the server will
-            // offer ranges.
-            //
             // No integrity check, for the OneDrive reason: the API publishes
             // an `md5Checksum` for an uploaded file, and nothing in this crate
             // can compute one to compare it against.

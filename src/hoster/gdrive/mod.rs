@@ -175,7 +175,7 @@ pub struct DirectLink {
 /// No `Debug`, here or on [`Session`]: an API key is a billable identity, and
 /// a type that prints one has a way of ending up inside an error message.
 pub struct Folder {
-    session: Session,
+    source: FolderSource,
     id: String,
     name: Option<String>,
 }
@@ -185,6 +185,15 @@ impl Folder {
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+}
+
+enum FolderSource {
+    /// The Drive API, with the key allowed to list it: paged to the end, with
+    /// every child's mimeType.
+    Api(Session),
+    /// The page Drive hands websites to embed, when there is no key: one page
+    /// per folder, capped by whatever it chooses to render.
+    Page(Client),
 }
 
 /// A client and the key its requests carry.
@@ -205,13 +214,9 @@ struct Listing {
 
 /// One file to fetch.
 struct RemoteFile {
-    /// Path relative to the download root, folders included.
     relative: PathBuf,
-    /// Leaf name, for the progress line.
     name: String,
-    /// An API URL, with the key already on it.
     url: String,
-    /// Drive id, which is what resume is keyed on.
     id: String,
 }
 
@@ -230,14 +235,22 @@ pub async fn resolve(client: Client, url: &str, options: &GdriveOptions) -> Resu
                 api_key: key.to_owned(),
             };
             let name = api::folder_name(&session, &id, options).await?;
-            Ok(Resolved::Folder(Folder { session, id, name }))
+            Ok(Resolved::Folder(Folder { source: FolderSource::Api(session), id, name }))
         }
 
-        (Link::Folder { .. }, None) => bail!(
-            "listing a Google Drive folder needs an API key \u{2014} set gdrive_api_key in the config, \
-             or RDM_GDRIVE_API_KEY in the environment. Anonymous access can fetch a file whose link \
-             you already hold, but it cannot enumerate a folder"
-        ),
+        // No key, so the folder page is the only listing there is. It is
+// written for an iframe rather than for a caller, and can only be
+// trusted as far as it goes — `api::scrape_folder` says so out loud
+// when a listing comes back at the length the page stops at.
+        //
+        (Link::Folder { id }, None) => {
+    let name = api::scrape_folder_name(&client, &id, options).await?;
+    Ok(Resolved::Folder(Folder {
+        source: FolderSource::Page(client),
+        id,
+        name,
+    }))
+}
 
         // With a key both shapes take the same path: the metadata says whether
         // there are bytes to fetch or a document to render, which is more than
@@ -292,7 +305,10 @@ pub async fn download_folder(
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<GdriveSummary> {
-    let listing = api::walk(&folder.session, &folder.id, &options).await?;
+    let listing = match &folder.source {
+    FolderSource::Api(session) => api::walk(session, &folder.id, &options).await?,
+    FolderSource::Page(client) => api::scrape_folder(client, &folder.id, &options).await?,
+};
     let root = destination_root(output, download_dir, folder.name());
 
     transfer::create_tree(&root, &listing.dirs).await?;
