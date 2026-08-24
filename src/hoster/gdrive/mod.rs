@@ -260,22 +260,26 @@ pub async fn resolve(client: Client, url: &str, options: &GdriveOptions) -> Resu
                 api_key: key.to_owned(),
             };
             let name = api::folder_name(&session, &id, options).await?;
-            Ok(Resolved::Folder(Folder { source: FolderSource::Api(session), id, name }))
+            Ok(Resolved::Folder(Folder {
+                source: FolderSource::Api(session),
+                id,
+                name,
+            }))
         }
 
         // No key, so the folder page is the only listing there is. It is
-// written for an iframe rather than for a caller, and can only be
-// trusted as far as it goes — `api::scrape_folder` says so out loud
-// when a listing comes back at the length the page stops at.
+        // written for an iframe rather than for a caller, and can only be
+        // trusted as far as it goes — `api::scrape_folder` says so out loud
+        // when a listing comes back at the length the page stops at.
         //
         (Link::Folder { id }, None) => {
-    let name = api::scrape_folder_name(&client, &id, options).await?;
-    Ok(Resolved::Folder(Folder {
-        source: FolderSource::Page(client),
-        id,
-        name,
-    }))
-}
+            let name = api::scrape_folder_name(&client, &id, options).await?;
+            Ok(Resolved::Folder(Folder {
+                source: FolderSource::Page(client),
+                id,
+                name,
+            }))
+        }
 
         // With a key both shapes take the same path: the metadata says whether
         // there are bytes to fetch or a document to render, which is more than
@@ -355,9 +359,12 @@ pub async fn download_folder(
     let root = destination_root(output, download_dir, folder.name());
 
     create_tree(&root, &listing.dirs).await?;
-    let progress = if quiet { Progress::Quiet } else { Progress::Board };
-    let mut summary =
-        download_files(&listing.files, &root, &options, cancel, progress).await?;
+    let progress = if quiet {
+        Progress::Quiet
+    } else {
+        Progress::Board
+    };
+    let mut summary = download_files(&listing.files, &root, &options, cancel, progress).await?;
     // The transfer sees a slice of files rather than the listing they came
     // from, so the count of what could not be fetched is added back here.
     summary.unsupported = listing.unsupported;
@@ -441,7 +448,10 @@ fn unique(taken: &mut HashSet<PathBuf>, candidate: PathBuf) -> PathBuf {
         return candidate;
     }
 
-    let parent = candidate.parent().map(Path::to_path_buf).unwrap_or_default();
+    let parent = candidate
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let stem = candidate
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())

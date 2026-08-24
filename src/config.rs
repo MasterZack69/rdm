@@ -76,6 +76,25 @@ pub struct Config {
     /// and something has to choose.
     #[serde(default = "default_gdrive_doc_format")]
     pub gdrive_doc_format: String,
+
+    /// Files of a pixeldrain list to download at once.
+    ///
+    /// Files, not chunks, and for a reason particular to pixeldrain: an
+    /// anonymous transfer allowance is shared across connections, so splitting
+    /// one file mostly divides the same bandwidth between its own chunks.
+    #[serde(default = "default_pixeldrain_workers")]
+    pub pixeldrain_workers: usize,
+
+    /// A pixeldrain account API key.
+    ///
+    /// Optional, and it buys speed rather than access: pixeldrain caps
+    /// anonymous transfers and lifts the cap for an account. Empty means
+    /// anonymous, which works perfectly well and is slower.
+    ///
+    /// `RDM_PIXELDRAIN_API_KEY` takes precedence, for people who would rather
+    /// not keep a credential in a file at all.
+    #[serde(default)]
+    pub pixeldrain_api_key: String,
 }
 
 fn default_mega_workers() -> usize {
@@ -98,6 +117,10 @@ fn default_gdrive_workers() -> usize {
 /// the one the Docs "File \u{2192} Download" menu offers first.
 fn default_gdrive_doc_format() -> String {
     "pdf".to_owned()
+}
+
+fn default_pixeldrain_workers() -> usize {
+    crate::hoster::pixeldrain::WORKERS_DEFAULT
 }
 
 fn default_true() -> bool {
@@ -126,6 +149,8 @@ impl Default for Config {
             gdrive_workers: default_gdrive_workers(),
             gdrive_api_key: String::new(),
             gdrive_doc_format: default_gdrive_doc_format(),
+            pixeldrain_workers: default_pixeldrain_workers(),
+            pixeldrain_api_key: String::new(),
         }
     }
 }
@@ -153,13 +178,10 @@ impl Config {
     pub fn save(&self) -> Result<()> {
         let path = config_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create config directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create config directory")?;
         }
-        let toml = toml::to_string_pretty(self)
-            .context("Failed to serialize config")?;
-        std::fs::write(&path, toml)
-            .context("Failed to write config file")?;
+        let toml = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        std::fs::write(&path, toml).context("Failed to write config file")?;
         Ok(())
     }
 
@@ -201,6 +223,17 @@ impl Config {
         eprintln!("  OneDrive   : {} file(s) at a time", self.onedrive_workers);
         eprintln!("  Drive      : {} file(s) at a time", self.gdrive_workers);
         eprintln!("  Drive docs : exported as {}", self.gdrive_doc_format);
+        // Whether a key is set, never the key: same rule as the GoFile token
+        // below.
+        eprintln!(
+            "  pixeldrain : {} file(s) at a time ({})",
+            self.pixeldrain_workers,
+            if self.pixeldrain_api_key.trim().is_empty() {
+                "anonymous"
+            } else {
+                "API key set"
+            }
+        );
         // Never print the token itself: config output gets pasted into bug
         // reports.
         eprintln!(
@@ -246,23 +279,22 @@ queue_parallel = 5
         assert_eq!(cfg.mega_workers, crate::mega::WORKERS_DEFAULT);
         assert!(cfg.mega_verify_mac);
         assert!(cfg.mega_resume_on_ip_change);
-        assert_eq!(
-            cfg.gofile_workers,
-            crate::hoster::gofile::WORKERS_DEFAULT
-        );
+        assert_eq!(cfg.gofile_workers, crate::hoster::gofile::WORKERS_DEFAULT);
         assert_eq!(
             cfg.onedrive_workers,
             crate::hoster::onedrive::WORKERS_DEFAULT
         );
+        assert_eq!(cfg.gdrive_workers, crate::hoster::gdrive::WORKERS_DEFAULT);
         assert_eq!(
-            cfg.gdrive_workers,
-            crate::hoster::gdrive::WORKERS_DEFAULT
+            cfg.pixeldrain_workers,
+            crate::hoster::pixeldrain::WORKERS_DEFAULT
         );
         assert!(cfg.gofile_token.is_empty());
         // No key means anonymous access, which is a working configuration for
         // everything except a folder.
         assert!(cfg.gdrive_api_key.is_empty());
         assert_eq!(cfg.gdrive_doc_format, "pdf");
+        assert!(cfg.pixeldrain_api_key.is_empty());
     }
 
     #[test]
@@ -304,5 +336,18 @@ queue_parallel = 5
         assert_eq!(back.gdrive_workers, 7);
         assert_eq!(back.gdrive_api_key, "AIzaSyExampleKey");
         assert_eq!(back.gdrive_doc_format, "office");
+    }
+
+    #[test]
+    fn pixeldrain_settings_round_trip() {
+        let cfg = Config {
+            pixeldrain_workers: 6,
+            pixeldrain_api_key: "deadbeef".to_owned(),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.pixeldrain_workers, 6);
+        assert_eq!(back.pixeldrain_api_key, "deadbeef");
     }
 }

@@ -144,7 +144,11 @@ pub fn parse_link(url: &str) -> Result<GofileLink> {
         bail!("GoFile links look like https://gofile.io/d/<id> — got {trimmed}");
     }
 
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         bail!("no content id in {trimmed}");
     }
 
@@ -325,10 +329,7 @@ pub async fn download(
                     // would hand the display slot to another worker while this
                     // one is still reporting into it.
                     let lane = board.and_then(|b| b.claim(index as u64 + 1, &file.name));
-                    let sink = lane
-                        .as_ref()
-                        .map(|l| l.sink())
-                        .unwrap_or_else(ui::silent);
+                    let sink = lane.as_ref().map(|l| l.sink()).unwrap_or_else(ui::silent);
 
                     if file.size > 0 {
                         sink.total(Some(file.size));
@@ -674,10 +675,7 @@ async fn list_content(
         // becomes a directory as it is walked, but the root only exists as
         // whatever we decide to call the download directory.
         if content_id == link.content_id {
-            root_name = data
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            root_name = data.get("name").and_then(Value::as_str).map(str::to_owned);
         }
 
         let Some(children) = data.get("children").and_then(Value::as_object) else {
@@ -824,7 +822,10 @@ async fn download_file(
             return Ok(FileOutcome::Cancelled);
         }
 
-        let resumed = fs::metadata(&part).await.map(|meta| meta.len()).unwrap_or(0);
+        let resumed = fs::metadata(&part)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         sink.state(SlotState::Inspecting);
         sink.progress(resumed);
 
@@ -888,9 +889,9 @@ async fn download_file(
                 }
 
                 sink.state(SlotState::Finishing);
-                fs::rename(&part, &destination)
-                    .await
-                    .with_context(|| format!("could not move {} into place", destination.display()))?;
+                fs::rename(&part, &destination).await.with_context(|| {
+                    format!("could not move {} into place", destination.display())
+                })?;
 
                 return Ok(FileOutcome::Completed(on_disk));
             }
@@ -1015,7 +1016,9 @@ mod tests {
             "AbCdEf"
         );
         assert_eq!(
-            parse_link("https://gofile.io/d/AbCdEf/").unwrap().content_id,
+            parse_link("https://gofile.io/d/AbCdEf/")
+                .unwrap()
+                .content_id,
             "AbCdEf"
         );
         assert_eq!(
@@ -1232,6 +1235,8 @@ mod tests {
         assert!(options.password.is_none());
         assert!(options.token.is_none());
         assert!(!options.overwrite);
-        const { assert!(WORKERS_DEFAULT <= WORKERS_MAX); }
+        const {
+            assert!(WORKERS_DEFAULT <= WORKERS_MAX);
+        }
     }
 }

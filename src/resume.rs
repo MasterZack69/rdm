@@ -82,7 +82,6 @@ impl ResumeMetadata {
             _ => self.url == url,
         }
     }
-
 }
 
 pub fn create_new(url: String, file_size: u64, chunks: &[Chunk]) -> ResumeMetadata {
@@ -107,8 +106,7 @@ pub fn create_new(url: String, file_size: u64, chunks: &[Chunk]) -> ResumeMetada
 }
 
 pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
-    let json = serde_json::to_string_pretty(meta)
-        .context("Failed to serialize resume metadata")?;
+    let json = serde_json::to_string_pretty(meta).context("Failed to serialize resume metadata")?;
 
     let tmp_path = format!("{}.tmp", path);
 
@@ -151,7 +149,7 @@ pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
     }
     .await;
 
-        if let Err(e) = write_result {
+    if let Err(e) = write_result {
         let _ = fs::remove_file(&tmp_path).await;
         return Err(e);
     }
@@ -160,8 +158,7 @@ pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
 }
 
 pub async fn save_best_effort(path: &str, meta: &ResumeMetadata) -> Result<()> {
-    let json = serde_json::to_string_pretty(meta)
-        .context("Failed to serialize resume metadata")?;
+    let json = serde_json::to_string_pretty(meta).context("Failed to serialize resume metadata")?;
 
     let tmp_path = format!("{}.tmp", path);
 
@@ -173,9 +170,7 @@ pub async fn save_best_effort(path: &str, meta: &ResumeMetadata) -> Result<()> {
         .await
         .context("Failed to write metadata")?;
 
-    file.flush()
-        .await
-        .context("Failed to flush metadata")?;
+    file.flush().await.context("Failed to flush metadata")?;
 
     drop(file);
 
@@ -185,7 +180,6 @@ pub async fn save_best_effort(path: &str, meta: &ResumeMetadata) -> Result<()> {
 
     Ok(())
 }
-
 
 pub async fn load(path: &str) -> Result<ResumeMetadata> {
     let data = fs::read_to_string(path)
@@ -246,10 +240,26 @@ mod tests {
 
     fn sample_chunks() -> Vec<Chunk> {
         vec![
-            Chunk { id: 1, start: 0, end: 499 },
-            Chunk { id: 2, start: 500, end: 999 },
-            Chunk { id: 3, start: 1000, end: 1499 },
-            Chunk { id: 4, start: 1500, end: 1999 },
+            Chunk {
+                id: 1,
+                start: 0,
+                end: 499,
+            },
+            Chunk {
+                id: 2,
+                start: 500,
+                end: 999,
+            },
+            Chunk {
+                id: 3,
+                start: 1000,
+                end: 1499,
+            },
+            Chunk {
+                id: 4,
+                start: 1500,
+                end: 1999,
+            },
         ]
     }
 
@@ -276,8 +286,7 @@ mod tests {
         let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
 
         let json = serde_json::to_string_pretty(&meta).expect("serialize failed");
-        let deserialized: ResumeMetadata =
-            serde_json::from_str(&json).expect("deserialize failed");
+        let deserialized: ResumeMetadata = serde_json::from_str(&json).expect("deserialize failed");
 
         assert_eq!(meta, deserialized);
     }
@@ -348,7 +357,12 @@ mod tests {
 
     #[test]
     fn test_chunk_state_total_bytes() {
-        let state = ChunkState { id: 1, start: 100, end: 599, completed: 0 };
+        let state = ChunkState {
+            id: 1,
+            start: 100,
+            end: 599,
+            completed: 0,
+        };
         assert_eq!(state.total_bytes(), 500);
     }
 
@@ -356,21 +370,39 @@ mod tests {
     fn test_validate_against_matching() {
         let chunks = sample_chunks();
         let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
-        assert!(validate_against(&meta, "https://example.com/file.bin", None, 2000, &chunks));
+        assert!(validate_against(
+            &meta,
+            "https://example.com/file.bin",
+            None,
+            2000,
+            &chunks
+        ));
     }
 
     #[test]
     fn test_validate_against_url_mismatch() {
         let chunks = sample_chunks();
         let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
-        assert!(!validate_against(&meta, "https://other.com/file.bin", None, 2000, &chunks));
+        assert!(!validate_against(
+            &meta,
+            "https://other.com/file.bin",
+            None,
+            2000,
+            &chunks
+        ));
     }
 
     #[test]
     fn test_validate_against_size_mismatch() {
         let chunks = sample_chunks();
         let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
-        assert!(!validate_against(&meta, "https://example.com/file.bin", None, 9999, &chunks));
+        assert!(!validate_against(
+            &meta,
+            "https://example.com/file.bin",
+            None,
+            9999,
+            &chunks
+        ));
     }
 
     #[test]
@@ -378,7 +410,13 @@ mod tests {
         let chunks = sample_chunks();
         let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
         let fewer = &chunks[..2];
-        assert!(!validate_against(&meta, "https://example.com/file.bin", None, 2000, fewer));
+        assert!(!validate_against(
+            &meta,
+            "https://example.com/file.bin",
+            None,
+            2000,
+            fewer
+        ));
     }
 
     #[test]
@@ -386,7 +424,13 @@ mod tests {
         let chunks = sample_chunks();
         let mut meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
         meta.chunks[0].completed = 99999;
-        assert!(!validate_against(&meta, "https://example.com/file.bin", None, 2000, &chunks));
+        assert!(!validate_against(
+            &meta,
+            "https://example.com/file.bin",
+            None,
+            2000,
+            &chunks
+        ));
     }
 
     #[test]
@@ -411,7 +455,13 @@ mod tests {
         meta.chunks[1].completed = 500;
         meta.chunks[2].completed = 500;
         meta.chunks[3].completed = 500;
-        assert!(validate_against(&meta, "https://example.com/file.bin", None, 2000, &chunks));
+        assert!(validate_against(
+            &meta,
+            "https://example.com/file.bin",
+            None,
+            2000,
+            &chunks
+        ));
     }
 
     /// A signed URL differs every run, so the identity is the only thing that
@@ -420,7 +470,11 @@ mod tests {
     #[test]
     fn a_stored_identity_outranks_a_changed_url() {
         let chunks = sample_chunks();
-        let mut meta = create_new("https://cdn.example.com/get?tempauth=OLD".into(), 2000, &chunks);
+        let mut meta = create_new(
+            "https://cdn.example.com/get?tempauth=OLD".into(),
+            2000,
+            &chunks,
+        );
         meta.identity = Some("onedrive:ABC!123".into());
 
         assert!(validate_against(
@@ -435,7 +489,11 @@ mod tests {
     #[test]
     fn a_different_identity_is_never_the_same_file() {
         let chunks = sample_chunks();
-        let mut meta = create_new("https://cdn.example.com/get?tempauth=OLD".into(), 2000, &chunks);
+        let mut meta = create_new(
+            "https://cdn.example.com/get?tempauth=OLD".into(),
+            2000,
+            &chunks,
+        );
         meta.identity = Some("onedrive:ABC!123".into());
 
         assert!(!validate_against(
@@ -454,8 +512,20 @@ mod tests {
         let chunks = sample_chunks();
         let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
 
-        assert!(validate_against(&meta, "https://example.com/file.bin", None, 2000, &chunks));
-        assert!(!validate_against(&meta, "https://example.com/other.bin", None, 2000, &chunks));
+        assert!(validate_against(
+            &meta,
+            "https://example.com/file.bin",
+            None,
+            2000,
+            &chunks
+        ));
+        assert!(!validate_against(
+            &meta,
+            "https://example.com/other.bin",
+            None,
+            2000,
+            &chunks
+        ));
     }
 
     #[tokio::test]
@@ -488,7 +558,9 @@ mod tests {
         let chunks = sample_chunks();
 
         let meta_v1 = create_new("https://example.com/v1".into(), 1000, &chunks);
-        save_atomic(path, &meta_v1).await.expect("first save failed");
+        save_atomic(path, &meta_v1)
+            .await
+            .expect("first save failed");
 
         let loaded_v1 = load(path).await.expect("load v1 failed");
         assert_eq!(loaded_v1.url, "https://example.com/v1");
@@ -496,7 +568,9 @@ mod tests {
         let mut meta_v2 = create_new("https://example.com/v2".into(), 2000, &chunks);
         update_progress(&mut meta_v2, 1, 500);
         update_progress(&mut meta_v2, 3, 250);
-        save_atomic(path, &meta_v2).await.expect("second save failed");
+        save_atomic(path, &meta_v2)
+            .await
+            .expect("second save failed");
 
         let loaded_v2 = load(path).await.expect("load v2 failed");
         assert_eq!(loaded_v2.url, "https://example.com/v2");

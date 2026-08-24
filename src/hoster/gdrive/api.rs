@@ -167,7 +167,8 @@ pub(super) fn direct_link(
         .unwrap_or_else(|| fallback_name(id));
     let mime = meta.mime_type.as_deref().unwrap_or_default();
 
-    if let Some((ext, export_mime)) = DocKind::from_mime(mime).map(|kind| kind.export_as(&options.doc_format))
+    if let Some((ext, export_mime)) =
+        DocKind::from_mime(mime).map(|kind| kind.export_as(&options.doc_format))
     {
         return Ok(DirectLink {
             url: api_export_url(&session.api_key, id, export_mime)?.into(),
@@ -251,21 +252,22 @@ pub(super) async fn walk(
                     continue;
                 }
 
-                let (url, filename) =
-                    match DocKind::from_mime(mime).map(|kind| kind.export_as(&options.doc_format)) {
-                        Some((ext, export_mime)) => (
-                            api_export_url(&session.api_key, id, export_mime)?,
-                            with_extension(&name, ext),
-                        ),
-                        // Every other Google-native type: a shortcut, which
-                        // points somewhere else, or an Apps Script project,
-                        // which the API will not export.
-                        None if mime.starts_with(APPS_PREFIX) => {
-                            unsupported += 1;
-                            continue;
-                        }
-                        None => (media_url(&session.api_key, id)?, name),
-                    };
+                let (url, filename) = match DocKind::from_mime(mime)
+                    .map(|kind| kind.export_as(&options.doc_format))
+                {
+                    Some((ext, export_mime)) => (
+                        api_export_url(&session.api_key, id, export_mime)?,
+                        with_extension(&name, ext),
+                    ),
+                    // Every other Google-native type: a shortcut, which
+                    // points somewhere else, or an Apps Script project,
+                    // which the API will not export.
+                    None if mime.starts_with(APPS_PREFIX) => {
+                        unsupported += 1;
+                        continue;
+                    }
+                    None => (media_url(&session.api_key, id)?, name),
+                };
 
                 let relative = unique(&mut taken, parent.join(&filename));
                 files.push(RemoteFile {
@@ -940,7 +942,10 @@ fn explain(status: StatusCode, body: &[u8]) -> String {
         _ => "",
     };
 
-    format!("Google Drive answered HTTP {status}{hint}: {}", snippet(body))
+    format!(
+        "Google Drive answered HTTP {status}{hint}: {}",
+        snippet(body)
+    )
 }
 
 /// As much of a body as belongs in an error message.

@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::engine::{self, DownloadRequest, ExistingPolicy, Outcome};
-use crate::hoster::{gdrive, onedrive};
+use crate::hoster::{gdrive, onedrive, pixeldrain};
 use crate::mega;
 use crate::ui;
 
@@ -70,6 +70,18 @@ impl Item {
         gdrive::is_gdrive_url(&self.url)
     }
 
+    /// Does this item need the pixeldrain client rather than a bare engine
+    /// download?
+    ///
+    /// The URL would fetch perfectly well without one — pixeldrain's is an
+    /// ordinary ranged HTTPS address with no signature on it. What would go
+    /// missing is the API key, which lives in the client's headers, so an
+    /// account holder would be throttled to anonymous speed by a queue run and
+    /// nowhere else.
+    pub fn is_pixeldrain(&self) -> bool {
+        pixeldrain::is_pixeldrain_url(&self.url)
+    }
+
     /// Human-friendly name for progress lines: the output path if we have one,
     /// otherwise the last URL segment.
     pub fn display_name(&self) -> String {
@@ -99,6 +111,17 @@ impl Item {
         // anything.
         if self.is_gdrive() {
             return "Google Drive link".to_owned();
+        }
+
+        // The id is not a secret the way a MEGA key is, so it can be shown —
+        // but `/u/AbCdEf12` still names nothing a person recognises, and the
+        // real filename only arrives with the API's answer.
+        if self.is_pixeldrain() {
+            return match pixeldrain::parse_link(&self.url) {
+                Ok(pixeldrain::Link::File(id)) => format!("pixeldrain {id}"),
+                Ok(pixeldrain::Link::List(id)) => format!("pixeldrain list {id}"),
+                Err(_) => "pixeldrain link".to_owned(),
+            };
         }
 
         let raw = self
@@ -445,11 +468,21 @@ impl Queue {
 
     /// Records the final status plus the byte count, so `queue list` can show
     /// what was actually downloaded.
-    fn finish_item(&mut self, id: u64, status: Status, size: Option<u64>) {
+    ///
+    /// `name` is the filename the downloader discovered, for the links that
+    /// carry none. Recording it is what stops `queue list` showing an id in the
+    /// File column for the rest of the item's life. An output the user chose is
+    /// never overwritten.
+    fn finish_item(&mut self, id: u64, status: Status, size: Option<u64>, name: Option<&str>) {
         if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
             item.status = status;
             if size.is_some() {
                 item.size = size;
+            }
+            if item.output.is_none()
+                && let Some(name) = name
+            {
+                item.output = Some(name.to_owned());
             }
         }
     }
@@ -628,11 +661,48 @@ fn clear_signal() {
 
 /// What happened to one item, with the differences between the two
 /// downloaders already flattened out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `path` is the file the download ended up at, and is `Some` only where the
+/// item's URL could not have named it. [`Item::display_name`] can label a share
+/// link with nothing better than its id until the API answers; this is that
+/// answer, so the finished line and `queue list` show a file instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ItemOutcome {
-    Completed { bytes: u64 },
-    AlreadyPresent,
+    Completed { bytes: u64, path: Option<String> },
+    AlreadyPresent { path: Option<String> },
     Cancelled,
+}
+
+impl ItemOutcome {
+    /// The file on disk, when the downloader ended up somewhere it can name.
+    fn path(&self) -> Option<&str> {
+        match self {
+            Self::Completed { path, .. } | Self::AlreadyPresent { path } => path.as_deref(),
+            Self::Cancelled => None,
+        }
+    }
+}
+
+/// Flattens an engine outcome, keeping the path it settled on.
+///
+/// The engine may take the server's suggested filename over the one it was
+/// asked for, so the file that exists is the only one worth naming.
+fn from_engine(outcome: Outcome) -> ItemOutcome {
+    match outcome {
+        Outcome::Completed { path, bytes } => ItemOutcome::Completed {
+            bytes,
+            path: Some(path),
+        },
+        Outcome::AlreadyPresent { path } => ItemOutcome::AlreadyPresent { path: Some(path) },
+        Outcome::Cancelled => ItemOutcome::Cancelled,
+    }
+}
+
+/// The filename part of a path, for labelling a finished item.
+fn file_name_of(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// Runs one queue item on whichever downloader it needs.
@@ -679,8 +749,10 @@ async fn run_item(
         .await?;
 
         return Ok(match outcome {
-            mega::MegaOutcome::Completed { bytes, .. } => ItemOutcome::Completed { bytes },
-            mega::MegaOutcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent,
+            mega::MegaOutcome::Completed { bytes, .. } => {
+                ItemOutcome::Completed { bytes, path: None }
+            }
+            mega::MegaOutcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent { path: None },
             mega::MegaOutcome::Cancelled { .. } => ItemOutcome::Cancelled,
         });
     }
@@ -693,6 +765,10 @@ async fn run_item(
         return run_gdrive_item(cfg, item, cancel, sink).await;
     }
 
+    if item.is_pixeldrain() {
+        return run_pixeldrain_item(cfg, item, cancel, sink).await;
+    }
+
     let request = DownloadRequest::new(
         item.url.clone(),
         Some(item.resolve_output(cfg)),
@@ -701,11 +777,7 @@ async fn run_item(
     // Never stop a batch run to ask about an existing file.
     .with_policy(ExistingPolicy::Reuse);
 
-    Ok(match engine::download(request, cancel, sink).await? {
-        Outcome::Completed { bytes, .. } => ItemOutcome::Completed { bytes },
-        Outcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent,
-        Outcome::Cancelled => ItemOutcome::Cancelled,
-    })
+    Ok(from_engine(engine::download(request, cancel, sink).await?))
 }
 
 /// Runs one OneDrive item.
@@ -753,11 +825,7 @@ async fn run_onedrive_item(
             // resume recognises the file by.
             .with_resume_identity(format!("onedrive:{}", link.id));
 
-            return Ok(match engine::download(request, cancel, sink).await? {
-                Outcome::Completed { bytes, .. } => ItemOutcome::Completed { bytes },
-                Outcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent,
-                Outcome::Cancelled => ItemOutcome::Cancelled,
-            });
+            return Ok(from_engine(engine::download(request, cancel, sink).await?));
         }
         onedrive::Resolved::Folder(folder) => folder,
     };
@@ -791,11 +859,13 @@ async fn run_onedrive_item(
     }
 
     if summary.completed == 0 && summary.skipped > 0 {
-        return Ok(ItemOutcome::AlreadyPresent);
+        return Ok(ItemOutcome::AlreadyPresent { path: None });
     }
 
+    // A folder is many files; there is no one path to name it by.
     Ok(ItemOutcome::Completed {
         bytes: summary.bytes,
+        path: None,
     })
 }
 
@@ -845,11 +915,7 @@ async fn run_gdrive_item(
             // recognises the file by.
             .with_resume_identity(format!("gdrive:{}", link.id));
 
-            return Ok(match engine::download(request, cancel, sink).await? {
-                Outcome::Completed { bytes, .. } => ItemOutcome::Completed { bytes },
-                Outcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent,
-                Outcome::Cancelled => ItemOutcome::Cancelled,
-            });
+            return Ok(from_engine(engine::download(request, cancel, sink).await?));
         }
         gdrive::Resolved::Folder(folder) => folder,
     };
@@ -886,12 +952,74 @@ async fn run_gdrive_item(
     }
 
     if summary.completed == 0 && summary.skipped > 0 {
-        return Ok(ItemOutcome::AlreadyPresent);
+        return Ok(ItemOutcome::AlreadyPresent { path: None });
     }
 
+    // A folder is many files; there is no one path to name it by.
     Ok(ItemOutcome::Completed {
         bytes: summary.bytes,
+        path: None,
     })
+}
+
+/// Runs one pixeldrain item.
+///
+/// Much less work than OneDrive: there is no signature to refresh and no tree
+/// to walk, so the address stored at `queue add` time is still the right one.
+/// The API is asked anyway, for the two things a URL cannot carry — the real
+/// filename, and whether pixeldrain has already decided not to serve this file.
+/// Both are worth one small GET before a large transfer.
+///
+/// No resume identity either, for the same reason: the URL is stable, so it is
+/// a sound thing for resume to recognise the file by. OneDrive needs one only
+/// because its address is minted fresh every time.
+///
+/// Lists never reach here — `queue add` turns them away, because a list is many
+/// files behind one row and the queue has no way to show that. The arm below is
+/// for a hand-edited `queue.json`, and says where to go instead.
+async fn run_pixeldrain_item(
+    cfg: &Config,
+    item: &Item,
+    cancel: CancellationToken,
+    sink: Arc<dyn ui::ProgressSink>,
+) -> Result<ItemOutcome> {
+    let options = pixeldrain::PixeldrainOptions {
+        // Files-at-once, which a lone file has no use for; `-c` below stays
+        // chunks, the way it does for an ordinary download.
+        workers: cfg.pixeldrain_workers,
+        max_retries: cfg.max_retries,
+        api_key: pixeldrain::api_key(&cfg.pixeldrain_api_key),
+        // The queue never re-downloads what is already there.
+        overwrite: false,
+    };
+
+    let link = match pixeldrain::resolve(&item.url, &options).await? {
+        pixeldrain::Resolved::File(link) => link,
+        pixeldrain::Resolved::List(_) => anyhow::bail!(
+            "this is a pixeldrain list, which the queue cannot hold as one item \u{2014} \
+             run `rdm sync {}` to mirror it",
+            item.url
+        ),
+    };
+
+    let (output, _) = item.share_destination(cfg);
+    let destination = output.unwrap_or_else(|| cfg.resolve_output_path(&link.name));
+    if let Some(parent) = std::path::Path::new(&destination).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let request = DownloadRequest::new(
+        link.url,
+        Some(destination),
+        item.connections.unwrap_or(cfg.connections),
+    )
+    .with_policy(ExistingPolicy::Reuse)
+    // The key is in the client's headers, not in the URL, so handing the engine
+    // a bare address here is exactly what an account holder would feel as
+    // throttling.
+    .with_client(link.client);
+
+    Ok(from_engine(engine::download(request, cancel, sink).await?))
 }
 
 // ── Queue processor ─────────────────────────────────────────────────────
@@ -1064,15 +1192,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             };
 
             let elapsed_before = lane.as_ref().map(|l| l.elapsed());
-            let result = run_item(
-                &cfg,
-                &next,
-                child.clone(),
-                sink,
-                mega_client,
-                mega_gate,
-            )
-            .await;
+            let result = run_item(&cfg, &next, child.clone(), sink, mega_client, mega_gate).await;
             let elapsed = elapsed_before
                 .map(|_| lane.as_ref().map(|l| l.elapsed()).unwrap_or_default())
                 .unwrap_or_default();
@@ -1090,16 +1210,25 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             let was_skipped = child.is_cancelled() && !cancel_main.is_cancelled();
 
             let downloaded = match &result {
-                Ok(ItemOutcome::Completed { bytes }) => Some(*bytes),
+                Ok(ItemOutcome::Completed { bytes, .. }) => Some(*bytes),
                 _ => None,
             };
+
+            // The lane was claimed with a placeholder for anything that only
+            // learns its filename by asking. It has asked by now.
+            let found = result
+                .as_ref()
+                .ok()
+                .and_then(ItemOutcome::path)
+                .and_then(file_name_of);
 
             // Always write the final status — even during Ctrl+C.
             let _ = Queue::locked(|q| {
                 if cancel_main.is_cancelled() {
                     match &result {
-                        Ok(ItemOutcome::Completed { .. }) | Ok(ItemOutcome::AlreadyPresent) => {
-                            q.finish_item(item_id, Status::Complete, downloaded)
+                        Ok(ItemOutcome::Completed { .. })
+                        | Ok(ItemOutcome::AlreadyPresent { .. }) => {
+                            q.finish_item(item_id, Status::Complete, downloaded, found.as_deref())
                         }
                         _ => q.set_status(item_id, Status::Pending),
                     }
@@ -1107,8 +1236,9 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                     q.set_status(item_id, Status::Skipped);
                 } else {
                     match &result {
-                        Ok(ItemOutcome::Completed { .. }) | Ok(ItemOutcome::AlreadyPresent) => {
-                            q.finish_item(item_id, Status::Complete, downloaded);
+                        Ok(ItemOutcome::Completed { .. })
+                        | Ok(ItemOutcome::AlreadyPresent { .. }) => {
+                            q.finish_item(item_id, Status::Complete, downloaded, found.as_deref());
                         }
                         Ok(ItemOutcome::Cancelled) => q.set_status(item_id, Status::Skipped),
                         Err(e) => {
@@ -1130,6 +1260,8 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                 return;
             }
 
+            let name = found.unwrap_or(name);
+
             if was_skipped {
                 skipped.fetch_add(1, Ordering::Relaxed);
                 board.file_skipped();
@@ -1138,7 +1270,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             }
 
             match result {
-                Ok(ItemOutcome::Completed { bytes }) => {
+                Ok(ItemOutcome::Completed { bytes, .. }) => {
                     completed.fetch_add(1, Ordering::Relaxed);
                     bytes_total.fetch_add(bytes, Ordering::Relaxed);
                     board.file_completed(bytes);
@@ -1158,12 +1290,20 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                         ui::format_speed(avg),
                     ));
                 }
-                Ok(ItemOutcome::AlreadyPresent) => {
+                Ok(ItemOutcome::AlreadyPresent { path }) => {
                     completed.fetch_add(1, Ordering::Relaxed);
                     board.file_completed(0);
+
+                    // The claim is about a file on disk, so where there is one,
+                    // say how big it is rather than asking to be believed.
+                    let size = path
+                        .as_deref()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .map(|m| format!(" ({})", ui::format_size(m.len())))
+                        .unwrap_or_default();
                     board.log(&format!(
-                        "  \u{2713} #{}  {} — already downloaded",
-                        item_id, name
+                        "  \u{2713} #{}  {} — already downloaded{}",
+                        item_id, name, size
                     ));
                 }
                 Ok(ItemOutcome::Cancelled) => {
@@ -1197,7 +1337,9 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             Ok(())
         });
         eprintln!();
-        eprintln!("  \u{26a0} Queue interrupted — progress saved. Run `rdm queue start` to resume.");
+        eprintln!(
+            "  \u{26a0} Queue interrupted — progress saved. Run `rdm queue start` to resume."
+        );
         return Ok(());
     }
 
@@ -1341,7 +1483,10 @@ mod tests {
         let q = queue_with(&[ONEDRIVE_LINK, "https://x.com/a.bin"]);
         assert!(q.items[0].is_onedrive());
         assert!(!q.items[1].is_onedrive());
-        assert!(!q.items[0].is_mega(), "the two dispatch paths must not overlap");
+        assert!(
+            !q.items[0].is_mega(),
+            "the two dispatch paths must not overlap"
+        );
     }
 
     /// The last segment of a share link is an opaque token, so it names
@@ -1372,10 +1517,61 @@ mod tests {
         assert!(q.items[0].resolve_output(&cfg).contains("AbCdEfGh"));
     }
 
+    const PIXELDRAIN_LINK: &str = "https://pixeldrain.com/u/AbCdEf12";
+    const PIXELDRAIN_LIST: &str = "https://pixeldrain.com/l/Zz9900";
+
+    #[test]
+    fn pixeldrain_items_are_recognised() {
+        let q = queue_with(&[PIXELDRAIN_LINK, "https://x.com/a.bin"]);
+        assert!(q.items[0].is_pixeldrain());
+        assert!(!q.items[1].is_pixeldrain());
+        assert!(
+            !q.items[0].is_mega() && !q.items[0].is_onedrive(),
+            "the three dispatch paths must not overlap"
+        );
+    }
+
+    /// The id is not a secret, but it names nothing, and the board would
+    /// otherwise print it as though it were a filename.
+    #[test]
+    fn pixeldrain_display_name_says_what_the_link_is() {
+        let q = queue_with(&[PIXELDRAIN_LINK, PIXELDRAIN_LIST]);
+        assert_eq!(q.items[0].display_name(), "pixeldrain AbCdEf12");
+        assert_eq!(q.items[1].display_name(), "pixeldrain list Zz9900");
+
+        // An explicit output still wins — that is a real filename.
+        let mut q = Queue::default();
+        q.add(
+            PIXELDRAIN_LINK.into(),
+            Some("clips/holiday.mkv".into()),
+            None,
+        );
+        assert_eq!(q.items[0].display_name(), "holiday.mkv");
+    }
+
+    /// Same hazard as MEGA and OneDrive: resolve_output would carve a filename
+    /// out of the id, so naming has to wait for the API.
+    #[test]
+    fn pixeldrain_naming_waits_for_the_api_too() {
+        let cfg = Config::default();
+        let q = queue_with(&[PIXELDRAIN_LINK]);
+
+        let (output, dir) = q.items[0].share_destination(&cfg);
+        assert_eq!(output, None);
+        assert_eq!(dir, cfg.download_dir);
+        assert!(q.items[0].resolve_output(&cfg).contains("AbCdEf12"));
+    }
+
     #[test]
     fn retry_only_touches_finished_failures() {
         let mut q = queue_with(&["https://x.com/a", "https://x.com/b", "https://x.com/c"]);
-        q.set_status(1, Status::Failed { reason: "404".into(), attempts: 2 });
+        q.set_status(
+            1,
+            Status::Failed {
+                reason: "404".into(),
+                attempts: 2,
+            },
+        );
         q.set_status(2, Status::Skipped);
         q.set_status(3, Status::Complete);
 
@@ -1389,23 +1585,77 @@ mod tests {
     fn failure_attempts_accumulate() {
         let mut q = queue_with(&["https://x.com/a"]);
         assert_eq!(q.attempts_so_far(1), 0);
-        q.set_status(1, Status::Failed { reason: "boom".into(), attempts: 1 });
+        q.set_status(
+            1,
+            Status::Failed {
+                reason: "boom".into(),
+                attempts: 1,
+            },
+        );
         assert_eq!(q.attempts_so_far(1), 1);
         let attempts = q.attempts_so_far(1) + 1;
-        q.set_status(1, Status::Failed { reason: "boom".into(), attempts });
+        q.set_status(
+            1,
+            Status::Failed {
+                reason: "boom".into(),
+                attempts,
+            },
+        );
         assert_eq!(q.attempts_so_far(1), 2);
     }
 
     #[test]
     fn finish_item_records_size() {
         let mut q = queue_with(&["https://x.com/a"]);
-        q.finish_item(1, Status::Complete, Some(4096));
+        q.finish_item(1, Status::Complete, Some(4096), None);
         assert_eq!(q.items[0].size, Some(4096));
         assert_eq!(q.stats().bytes, 4096);
 
         // A later status change must not wipe a known size.
-        q.finish_item(1, Status::Complete, None);
+        q.finish_item(1, Status::Complete, None, None);
         assert_eq!(q.items[0].size, Some(4096));
+    }
+
+    /// A link that names nothing gets a real filename only once a downloader
+    /// has been there, so the item has to be told afterwards — otherwise
+    /// `queue list` shows an id in the File column forever.
+    #[test]
+    fn a_finished_item_takes_the_name_the_downloader_found() {
+        let mut q = queue_with(&[PIXELDRAIN_LINK]);
+        assert_eq!(q.items[0].display_name(), "pixeldrain AbCdEf12");
+
+        q.finish_item(1, Status::Complete, Some(4096), Some("holiday.mkv"));
+        assert_eq!(q.items[0].display_name(), "holiday.mkv");
+
+        // An output the user chose is theirs, not ours to correct.
+        let mut q = Queue::default();
+        q.add(PIXELDRAIN_LINK.into(), Some("clips/mine.mkv".into()), None);
+        q.finish_item(1, Status::Complete, Some(1), Some("theirs.mkv"));
+        assert_eq!(q.items[0].display_name(), "mine.mkv");
+    }
+
+    /// The engine may take the server's suggested filename over the one it was
+    /// asked for, so the finished line has to follow the file, not the request.
+    #[test]
+    fn an_engine_outcome_carries_the_file_it_settled_on() {
+        let completed = from_engine(Outcome::Completed {
+            path: "/home/z/Downloads/holiday.mkv".into(),
+            bytes: 4096,
+        });
+        assert_eq!(
+            completed.path().and_then(file_name_of),
+            Some("holiday.mkv".to_owned())
+        );
+
+        let present = from_engine(Outcome::AlreadyPresent {
+            path: "/home/z/Downloads/holiday.mkv".into(),
+        });
+        assert_eq!(
+            present.path().and_then(file_name_of),
+            Some("holiday.mkv".to_owned())
+        );
+
+        assert_eq!(from_engine(Outcome::Cancelled).path(), None);
     }
 
     #[test]
@@ -1421,7 +1671,13 @@ mod tests {
     fn clear_variants_target_the_right_items() {
         let mut q = queue_with(&["https://x.com/a", "https://x.com/b", "https://x.com/c"]);
         q.set_status(2, Status::Complete);
-        q.set_status(3, Status::Failed { reason: "x".into(), attempts: 1 });
+        q.set_status(
+            3,
+            Status::Failed {
+                reason: "x".into(),
+                attempts: 1,
+            },
+        );
 
         assert_eq!(q.clear_finished(), 2);
         assert_eq!(q.stats().total, 1);
@@ -1434,12 +1690,25 @@ mod tests {
         let mut q = queue_with(&["a", "b", "c", "d", "e"]);
         q.set_status(1, Status::Downloading);
         q.set_status(2, Status::Complete);
-        q.set_status(3, Status::Failed { reason: "x".into(), attempts: 1 });
+        q.set_status(
+            3,
+            Status::Failed {
+                reason: "x".into(),
+                attempts: 1,
+            },
+        );
         q.set_status(4, Status::Skipped);
 
         let s = q.stats();
         assert_eq!(
-            (s.total, s.pending, s.downloading, s.complete, s.failed, s.skipped),
+            (
+                s.total,
+                s.pending,
+                s.downloading,
+                s.complete,
+                s.failed,
+                s.skipped
+            ),
             (5, 1, 1, 1, 1, 1)
         );
     }

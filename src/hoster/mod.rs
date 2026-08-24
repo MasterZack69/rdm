@@ -16,12 +16,12 @@
 //!
 //! ## Adding a hoster
 //!
-//! Say we are adding pixeldrain:
+//! Say we are adding a host called `newhost`:
 //!
-//!   1. `mkdir src/hoster/pixeldrain/`, write `mod.rs` with a `detect`-able
+//!   1. `mkdir src/hoster/newhost/`, write `mod.rs` with a `detect`-able
 //!      URL test and a `download` entry point.
-//!   2. Add `pub mod pixeldrain;` below.
-//!   3. Add a `Pixeldrain` variant to [`Kind`].
+//!   2. Add `pub mod newhost;` below.
+//!   3. Add a `Newhost` variant to [`Kind`].
 //!   4. Run `cargo build`. Every `match` in this file is exhaustive on
 //!      purpose, so the compiler now points at each place that needs an
 //!      answer for the new host — detection, naming, capabilities. Nothing
@@ -31,6 +31,10 @@
 //! downloader: Dropbox only needs its links rewritten, after which the generic
 //! engine does the work.
 //!
+//! pixeldrain was this section's example while it was still hypothetical;
+//! `src/hoster/pixeldrain/` is what those four steps look like once somebody
+//! has actually followed them.
+//!
 //! ## Why an enum and not a trait
 //!
 //! A `Box<dyn Hoster>` looks tidier right up until the first `async fn`:
@@ -39,7 +43,7 @@
 //! allocation per call) or hand-written `Pin<Box<dyn Future>>` signatures.
 //! With a handful of hosters an enum costs nothing at runtime, keeps every
 //! hoster's own function signatures honest (MEGA needs a `FileKey`;
-//! pixeldrain will not), and turns "I forgot to wire up the new host"
+//! pixeldrain does not), and turns "I forgot to wire up the new host"
 //! from a silent fallthrough into a compile error.
 
 /// Dropbox (dropbox.com): share links rewritten to `dl=1`, then downloaded by
@@ -61,6 +65,11 @@ pub mod mega;
 /// generic engine for a file and a recursive walk for a folder.
 pub mod onedrive;
 
+/// pixeldrain (pixeldrain.com): a documented API turns a link into a stable,
+/// unsigned, ranged URL, and the generic engine does the rest. `/l/<id>`
+/// lists expand into a flat listing.
+pub mod pixeldrain;
+
 /// A supported file host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -69,6 +78,7 @@ pub enum Kind {
     Dropbox,
     OneDrive,
     Gdrive,
+    Pixeldrain,
 }
 
 /// What a link points at.
@@ -121,6 +131,9 @@ impl Kind {
         if gdrive::is_gdrive_url(url) {
             return Some(Self::Gdrive);
         }
+        if pixeldrain::is_pixeldrain_url(url) {
+            return Some(Self::Pixeldrain);
+        }
         None
     }
 
@@ -132,6 +145,7 @@ impl Kind {
             Self::Dropbox => "dropbox",
             Self::OneDrive => "onedrive",
             Self::Gdrive => "gdrive",
+            Self::Pixeldrain => "pixeldrain",
         }
     }
 
@@ -143,6 +157,11 @@ impl Kind {
             Self::Dropbox => "Dropbox",
             Self::OneDrive => "OneDrive",
             Self::Gdrive => "Google Drive",
+            // Lower-case, and identical to `name`. pixeldrain writes its own
+            // name that way, so this is the right answer rather than a
+            // copy-paste slip; there is a test below saying so, to stop it
+            // being helpfully "corrected" to `Pixeldrain` later.
+            Self::Pixeldrain => "pixeldrain",
         }
     }
 
@@ -210,6 +229,28 @@ impl Kind {
                 integrity_check: false,
                 parallel_chunks: true,
             },
+            // Folders, like OneDrive: a `/l/<id>` list expands into a real
+            // listing, and it arrives whole in one response rather than
+            // needing a walk.
+            //
+            // No integrity check, and here that is a decision rather than a
+            // limitation, which is worth being straight about: `/info` does
+            // publish a `hash_sha256`, and this crate does contain a SHA-256.
+            // Verifying it would mean reading the finished file back off disk,
+            // which the engine has no hook for, so a `true` here would be
+            // advertising a check that nothing performs.
+            //
+            // Parallel chunks: pixeldrain serves ranged requests — it is how
+            // its own in-browser player seeks — so a single file is handed to
+            // the engine whole and gets them. Note that a file carrying a
+            // `download_speed_limit` is capped whatever the connection count,
+            // so on those the chunks buy latency rather than bandwidth.
+            Self::Pixeldrain => Capabilities {
+                folders: true,
+                resume: true,
+                integrity_check: false,
+                parallel_chunks: true,
+            },
         }
     }
 
@@ -260,6 +301,20 @@ impl Kind {
                     LinkKind::File
                 }
             }
+            // The one host here that can answer this honestly without asking
+            // anybody: `/u/<id>` is a file, `/l/<id>` is a list, and the link
+            // itself says which. No opaque id, no tea leaves, no request.
+            //
+            // A link that parses as neither is reported as a file, because
+            // `pixeldrain::resolve` is where a malformed link gets a real
+            // error message and this function is not allowed to produce one.
+            Self::Pixeldrain => {
+                if pixeldrain::is_list_link(url) {
+                    LinkKind::Folder
+                } else {
+                    LinkKind::File
+                }
+            }
         }
     }
 
@@ -279,11 +334,12 @@ pub fn detect(url: &str) -> Option<Kind> {
 /// A `true` here means the generic HTTP engine must not be handed the URL as
 /// it stands: MEGA and GoFile links are API handles plus decryption keys
 /// rather than fetchable addresses, a Dropbox share link serves an HTML
-/// preview page until [`dropbox::resolve`] rewrites it into a direct one, and a
+/// preview page until [`dropbox::resolve`] rewrites it into a direct one, a
 /// OneDrive link is a preview page too until [`onedrive::resolve`] asks the API
 /// what is behind it. A Google Drive link is a viewer page, a document with no
 /// file behind it at all, or a folder id, and [`gdrive::resolve`] is what says
-/// which.
+/// which, and a pixeldrain link is a page for a viewer until
+/// [`pixeldrain::direct_url`] turns it into an API URL.
 pub fn is_hoster_url(url: &str) -> bool {
     detect(url).is_some()
 }
@@ -375,6 +431,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pixeldrain_links_are_routed_to_pixeldrain() {
+        assert_eq!(
+            Kind::detect("https://pixeldrain.com/u/AbCdEf12"),
+            Some(Kind::Pixeldrain)
+        );
+        assert_eq!(
+            Kind::detect("https://www.pixeldrain.com/l/AbCdEf12"),
+            Some(Kind::Pixeldrain)
+        );
+        // The API forms count too: anyone who has read pixeldrain's API docs
+        // will eventually paste one of these instead of the share link.
+        assert_eq!(
+            Kind::detect("https://pixeldrain.com/api/file/AbCdEf12"),
+            Some(Kind::Pixeldrain)
+        );
+        assert!(is_hoster_url("https://pixeldrain.com/u/AbCdEf12"));
+    }
+
     /// Ordinary links must fall through to the generic engine, and lookalike
     /// hosts must not be claimed by anyone.
     #[test]
@@ -384,13 +459,24 @@ mod tests {
         assert_eq!(Kind::detect("https://mega.nz.evil.com/file/abc#key"), None);
         assert_eq!(Kind::detect("https://notgofile.io/d/abc"), None);
         assert_eq!(Kind::detect("https://gofile.io.evil.com/d/abc"), None);
-        assert_eq!(Kind::detect("https://notdropbox.com/scl/fi/abc/f.zip"), None);
+        assert_eq!(
+            Kind::detect("https://notdropbox.com/scl/fi/abc/f.zip"),
+            None
+        );
         assert_eq!(
             Kind::detect("https://dropbox.com.evil.com/scl/fi/abc/f.zip"),
             None
         );
         assert_eq!(Kind::detect("https://not1drv.ms/u/s!abc"), None);
         assert_eq!(Kind::detect("https://1drv.ms.evil.com/u/s!abc"), None);
+        assert_eq!(Kind::detect("https://notpixeldrain.com/u/abc"), None);
+        assert_eq!(Kind::detect("https://pixeldrain.com.evil.com/u/abc"), None);
+        // The sneakiest of the lot: userinfo before the `@` reads like the
+        // host until it is parsed. The host here is `pixeldrain.com.evil.net`.
+        assert_eq!(
+            Kind::detect("https://evil.com@pixeldrain.com.evil.net/u/abc"),
+            None
+        );
         // A Dropbox CDN link is already direct, so no hoster claims it: there
         // is nothing to rewrite.
         assert_eq!(
@@ -450,7 +536,10 @@ mod tests {
     /// rest. Which is not the same as saying folders are unsupported.
     #[test]
     fn a_onedrive_link_does_not_say_whether_it_is_a_folder() {
-        for link in ["https://1drv.ms/u/s!AbCdEfGh", "https://1drv.ms/f/s!AbCdEfGh"] {
+        for link in [
+            "https://1drv.ms/u/s!AbCdEfGh",
+            "https://1drv.ms/f/s!AbCdEfGh",
+        ] {
             assert_eq!(Kind::OneDrive.link_kind(link), LinkKind::File);
             assert!(!Kind::OneDrive.is_folder_link(link));
         }
@@ -470,6 +559,28 @@ mod tests {
         assert!(Kind::Gdrive.is_folder_link(folder));
         assert_eq!(Kind::Gdrive.link_kind(file), LinkKind::File);
         assert!(!Kind::Gdrive.is_folder_link(file));
+    }
+
+    /// The exact opposite of the two tests above, and the reason `link_kind`
+    /// is worth having at all: pixeldrain says which it is, up front, for free.
+    #[test]
+    fn a_pixeldrain_link_says_whether_it_is_a_list() {
+        let file = "https://pixeldrain.com/u/AbCdEf12";
+        let list = "https://pixeldrain.com/l/AbCdEf12";
+
+        assert_eq!(Kind::Pixeldrain.link_kind(file), LinkKind::File);
+        assert!(!Kind::Pixeldrain.is_folder_link(file));
+
+        assert_eq!(Kind::Pixeldrain.link_kind(list), LinkKind::Folder);
+        assert!(Kind::Pixeldrain.is_folder_link(list));
+
+        // A link that parses as neither is not a list. `resolve` is what gives
+        // it a real error; this function is not allowed to make a request and
+        // so is not entitled to an opinion.
+        assert_eq!(
+            Kind::Pixeldrain.link_kind("https://pixeldrain.com/"),
+            LinkKind::File
+        );
     }
 
     #[test]
@@ -527,5 +638,19 @@ mod tests {
         assert!(caps.parallel_chunks);
         assert_eq!(Kind::Gdrive.name(), "gdrive");
         assert_eq!(Kind::Gdrive.display_name(), "Google Drive");
+    }
+
+    #[test]
+    fn pixeldrain_advertises_what_it_implements() {
+        let caps = Kind::Pixeldrain.capabilities();
+        assert!(caps.folders);
+        assert!(caps.resume);
+        assert!(!caps.integrity_check);
+        assert!(caps.parallel_chunks);
+        assert_eq!(Kind::Pixeldrain.name(), "pixeldrain");
+        // Lower-case on purpose, and identical to `name`: pixeldrain writes
+        // its own name that way. This assertion exists to stop it being
+        // helpfully "corrected" to `Pixeldrain` by someone tidying up.
+        assert_eq!(Kind::Pixeldrain.display_name(), "pixeldrain");
     }
 }

@@ -103,7 +103,12 @@ fn host_of(url: &str) -> Option<String> {
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
-    Some(parsed.host_str()?.trim_end_matches('.').to_ascii_lowercase())
+    Some(
+        parsed
+            .host_str()?
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+    )
 }
 
 /// Is this a OneDrive share link?
@@ -721,7 +726,12 @@ async fn root_item(session: &Session, url: &str, options: &OneDriveOptions) -> R
     fetch_json(
         options.max_retries,
         "could not open the OneDrive share",
-        || session.client.post(&endpoint).header("Prefer", "autoredeem"),
+        || {
+            session
+                .client
+                .post(&endpoint)
+                .header("Prefer", "autoredeem")
+        },
     )
     .await
 }
@@ -732,11 +742,7 @@ async fn root_item(session: &Session, url: &str, options: &OneDriveOptions) -> R
 ///
 /// An explicit stack rather than recursion: an async fn that calls itself has to
 /// be boxed, and the stack keeps the collision bookkeeping in one place.
-async fn walk(
-    session: &Session,
-    root: &str,
-    options: &OneDriveOptions,
-) -> Result<Listing> {
+async fn walk(session: &Session, root: &str, options: &OneDriveOptions) -> Result<Listing> {
     let mut files: Vec<RemoteFile> = Vec::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut taken: HashSet<PathBuf> = HashSet::new();
@@ -791,7 +797,11 @@ async fn walk(
         }
     }
 
-    Ok(Listing { files, dirs, skipped })
+    Ok(Listing {
+        files,
+        dirs,
+        skipped,
+    })
 }
 
 /// Turns a remote name into exactly one safe path component.

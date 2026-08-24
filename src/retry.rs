@@ -20,7 +20,7 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
-        pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
+    pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let base_ms = self.base_delay.as_millis() as u64;
         let factor = 2u64.saturating_pow(attempt.min(10));
         let delay_ms = base_ms.saturating_mul(factor);
@@ -43,10 +43,7 @@ impl RetryConfig {
 }
 
 pub fn is_transient_status(status: StatusCode) -> bool {
-    matches!(
-        status.as_u16(),
-        408 | 429 | 500 | 502 | 503 | 504
-    )
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 #[derive(Debug)]
@@ -137,7 +134,12 @@ mod tests {
         let config = RetryConfig::default();
         for attempt in [30, 50, 64, 100] {
             let delay = config.delay_for_attempt(attempt);
-            assert!(delay <= config.max_delay, "attempt {}: {:?}", attempt, delay);
+            assert!(
+                delay <= config.max_delay,
+                "attempt {}: {:?}",
+                attempt,
+                delay
+            );
         }
     }
 

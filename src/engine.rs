@@ -398,7 +398,16 @@ pub async fn run_download_with_identity(
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<()> {
-    run(url, output, connections, None, Some(identity), cancel, quiet).await
+    run(
+        url,
+        output,
+        connections,
+        None,
+        Some(identity),
+        cancel,
+        quiet,
+    )
+    .await
 }
 
 async fn run(
@@ -841,16 +850,75 @@ fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
 mod tests {
     use super::*;
 
-    #[test] fn test_extract_filename_simple() { assert_eq!(extract_filename_from_url("https://example.com/path/file.zip"), Some("file.zip".into())); }
-    #[test] fn test_extract_filename_query() { assert_eq!(extract_filename_from_url("https://example.com/file.tar.gz?t=1"), Some("file.tar.gz".into())); }
-    #[test] fn test_extract_filename_hash_download_route() { assert_eq!(extract_filename_from_url("https://mobdisc.com/dwbfc3e38e/download.html?lang=en#/download/8189-DOOM-3-v1-1-0-22-cache1.zip"), Some("8189-DOOM-3-v1-1-0-22-cache1.zip".into())); }
-    #[test] fn test_normalize_hash_download_route() { assert_eq!(normalize_download_url("https://mobdisc.com/dwbfc3e38e/download.html?lang=en#/download/8189-DOOM-3-v1-1-0-22-cache1.zip"), "https://mobdisc.com/dwbfc3e38e/download/8189-DOOM-3-v1-1-0-22-cache1.zip"); }
-    #[test] fn test_normalize_ignores_regular_fragment() { let url = "https://example.com/file.zip#section"; assert_eq!(normalize_download_url(url), url); }
-    #[test] fn test_extract_filename_percent() { assert_eq!(extract_filename_from_url("https://example.com/my%20file.zip"), Some("my file.zip".into())); }
-    #[test] fn test_extract_filename_trailing() { assert_eq!(extract_filename_from_url("https://example.com/"), None); }
-    #[test] fn test_resolve_explicit() { assert_eq!(resolve_output_path("https://example.com/f.zip", Some("out.zip")), "out.zip"); }
-    #[test] fn test_resolve_from_url() { assert_eq!(resolve_output_path("https://example.com/data.tar.gz", None), "data.tar.gz"); }
-    #[test] fn test_resolve_fallback() { assert_eq!(resolve_output_path("https://example.com/", None), "download.bin"); }
+    #[test]
+    fn test_extract_filename_simple() {
+        assert_eq!(
+            extract_filename_from_url("https://example.com/path/file.zip"),
+            Some("file.zip".into())
+        );
+    }
+    #[test]
+    fn test_extract_filename_query() {
+        assert_eq!(
+            extract_filename_from_url("https://example.com/file.tar.gz?t=1"),
+            Some("file.tar.gz".into())
+        );
+    }
+    #[test]
+    fn test_extract_filename_hash_download_route() {
+        assert_eq!(
+            extract_filename_from_url(
+                "https://mobdisc.com/dwbfc3e38e/download.html?lang=en#/download/8189-DOOM-3-v1-1-0-22-cache1.zip"
+            ),
+            Some("8189-DOOM-3-v1-1-0-22-cache1.zip".into())
+        );
+    }
+    #[test]
+    fn test_normalize_hash_download_route() {
+        assert_eq!(
+            normalize_download_url(
+                "https://mobdisc.com/dwbfc3e38e/download.html?lang=en#/download/8189-DOOM-3-v1-1-0-22-cache1.zip"
+            ),
+            "https://mobdisc.com/dwbfc3e38e/download/8189-DOOM-3-v1-1-0-22-cache1.zip"
+        );
+    }
+    #[test]
+    fn test_normalize_ignores_regular_fragment() {
+        let url = "https://example.com/file.zip#section";
+        assert_eq!(normalize_download_url(url), url);
+    }
+    #[test]
+    fn test_extract_filename_percent() {
+        assert_eq!(
+            extract_filename_from_url("https://example.com/my%20file.zip"),
+            Some("my file.zip".into())
+        );
+    }
+    #[test]
+    fn test_extract_filename_trailing() {
+        assert_eq!(extract_filename_from_url("https://example.com/"), None);
+    }
+    #[test]
+    fn test_resolve_explicit() {
+        assert_eq!(
+            resolve_output_path("https://example.com/f.zip", Some("out.zip")),
+            "out.zip"
+        );
+    }
+    #[test]
+    fn test_resolve_from_url() {
+        assert_eq!(
+            resolve_output_path("https://example.com/data.tar.gz", None),
+            "data.tar.gz"
+        );
+    }
+    #[test]
+    fn test_resolve_fallback() {
+        assert_eq!(
+            resolve_output_path("https://example.com/", None),
+            "download.bin"
+        );
+    }
 
     #[test]
     fn test_plan_chunks_even() {
@@ -865,7 +933,9 @@ mod tests {
         let chunks = plan_chunks_with_count(1003, 4);
         let total: u64 = chunks.iter().map(|c| c.end - c.start + 1).sum();
         assert_eq!(total, 1003);
-        for i in 1..chunks.len() { assert_eq!(chunks[i].start, chunks[i-1].end + 1); }
+        for i in 1..chunks.len() {
+            assert_eq!(chunks[i].start, chunks[i - 1].end + 1);
+        }
     }
 
     // ── Request builder ──
@@ -874,7 +944,10 @@ mod tests {
     fn request_defaults_to_asking_about_existing_files() {
         let req = DownloadRequest::new("https://example.com/f.zip".into(), None, 8);
         assert_eq!(req.policy, ExistingPolicy::Ask);
-        assert_eq!(req.with_policy(ExistingPolicy::Reuse).policy, ExistingPolicy::Reuse);
+        assert_eq!(
+            req.with_policy(ExistingPolicy::Reuse).policy,
+            ExistingPolicy::Reuse
+        );
     }
 
     /// A session cannot be expressed in a URL, so it travels on the request.
@@ -896,9 +969,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.bin").to_string_lossy().to_string();
         assert_eq!(
-            resolve_existing_output(&path, "https://example.com/nope.bin", None, ExistingPolicy::Ask)
-                .await
-                .unwrap(),
+            resolve_existing_output(
+                &path,
+                "https://example.com/nope.bin",
+                None,
+                ExistingPolicy::Ask
+            )
+            .await
+            .unwrap(),
             OutputDecision::Use(path),
         );
     }
@@ -911,9 +989,14 @@ mod tests {
         let path = path.to_string_lossy().to_string();
 
         assert_eq!(
-            resolve_existing_output(&path, "https://example.com/done.bin", None, ExistingPolicy::Reuse)
-                .await
-                .unwrap(),
+            resolve_existing_output(
+                &path,
+                "https://example.com/done.bin",
+                None,
+                ExistingPolicy::Reuse
+            )
+            .await
+            .unwrap(),
             OutputDecision::AlreadyPresent,
         );
     }
@@ -948,9 +1031,14 @@ mod tests {
         let path = path.to_string_lossy().to_string();
 
         assert_eq!(
-            resolve_existing_output(&path, "https://example.com/half.bin", None, ExistingPolicy::Reuse)
-                .await
-                .unwrap(),
+            resolve_existing_output(
+                &path,
+                "https://example.com/half.bin",
+                None,
+                ExistingPolicy::Reuse
+            )
+            .await
+            .unwrap(),
             OutputDecision::Use(path),
         );
     }
@@ -1003,11 +1091,7 @@ mod tests {
     #[test]
     fn test_resume_action_206_without_content_range() {
         assert_eq!(
-            resolve_resume_action(
-                reqwest::StatusCode::PARTIAL_CONTENT,
-                4096,
-                None,
-            ),
+            resolve_resume_action(reqwest::StatusCode::PARTIAL_CONTENT, 4096, None,),
             ResumeAction::Resume(4096),
         );
     }

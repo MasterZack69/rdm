@@ -288,9 +288,7 @@ pub fn parse_retry_target(value: &str) -> Result<RetryTarget, String> {
         _ => trimmed
             .parse::<u64>()
             .map(RetryTarget::Id)
-            .map_err(|_| {
-                format!("expected an item ID, `failed` or `skipped`, got `{trimmed}`")
-            }),
+            .map_err(|_| format!("expected an item ID, `failed` or `skipped`, got `{trimmed}`")),
     }
 }
 
@@ -354,7 +352,10 @@ mod tests {
     fn help_footers_only_mention_present_flags() {
         let root = render_help(&["rdm"]);
         assert!(root.contains("-c, --connections"));
-        assert!(root.contains("-p, --parallel"), "root promises -p in its footer");
+        assert!(
+            root.contains("-p, --parallel"),
+            "root promises -p in its footer"
+        );
         // -d/-e are sync-only and must not leak into the root help.
         assert!(!root.contains("--delete"));
         assert!(!root.contains("--ext"));
@@ -389,7 +390,9 @@ mod tests {
         assert!(Cli::try_parse_from(["rdm", "download", "https://e.com/f", "-d"]).is_err());
         // -p is not shared via DownloadOpts, so it must not reach these.
         assert!(Cli::try_parse_from(["rdm", "download", "https://e.com/f", "-p", "4"]).is_err());
-        assert!(Cli::try_parse_from(["rdm", "queue", "add", "https://e.com/f", "-p", "4"]).is_err());
+        assert!(
+            Cli::try_parse_from(["rdm", "queue", "add", "https://e.com/f", "-p", "4"]).is_err()
+        );
     }
 
     // \u{2500}\u{2500} Quick download \u{2500}\u{2500}
@@ -426,7 +429,11 @@ mod tests {
     /// options are flattened in.
     #[test]
     fn ap_is_an_alias_for_allow_private() {
-        assert!(parse(&["rdm", "https://example.com/f.zip", "--ap"]).opts.allow_private);
+        assert!(
+            parse(&["rdm", "https://example.com/f.zip", "--ap"])
+                .opts
+                .allow_private
+        );
 
         match parse(&["rdm", "download", "https://example.com/f.zip", "--ap"]).command {
             Some(Command::Download { opts, .. }) => assert!(opts.allow_private),
@@ -439,7 +446,9 @@ mod tests {
         }
 
         match parse(&["rdm", "queue", "add", "https://example.com/f.zip", "--ap"]).command {
-            Some(Command::Queue { command: QueueCommand::Add { opts, .. } }) => {
+            Some(Command::Queue {
+                command: QueueCommand::Add { opts, .. },
+            }) => {
                 assert!(opts.allow_private)
             }
             other => panic!("expected queue add, got {other:?}"),
@@ -448,7 +457,11 @@ mod tests {
 
     #[test]
     fn allow_private_defaults_to_off() {
-        assert!(!parse(&["rdm", "https://example.com/f.zip"]).opts.allow_private);
+        assert!(
+            !parse(&["rdm", "https://example.com/f.zip"])
+                .opts
+                .allow_private
+        );
     }
 
     /// An alias the user cannot discover is not worth having.
@@ -564,7 +577,13 @@ mod tests {
             "flac,mkv",
         ]);
         match cli.command {
-            Some(Command::Sync { url, opts, parallel, delete, ext }) => {
+            Some(Command::Sync {
+                url,
+                opts,
+                parallel,
+                delete,
+                ext,
+            }) => {
                 assert_eq!(url, "https://example.com/music/");
                 assert_eq!(opts.output.as_deref(), Some("/data/music"));
                 assert_eq!(opts.connections, Some(8));
@@ -578,9 +597,23 @@ mod tests {
 
     #[test]
     fn sync_short_flags_work() {
-        let cli = parse(&["rdm", "sync", "https://e.com/d/", "-d", "-e", "mkv", "-p", "2"]);
+        let cli = parse(&[
+            "rdm",
+            "sync",
+            "https://e.com/d/",
+            "-d",
+            "-e",
+            "mkv",
+            "-p",
+            "2",
+        ]);
         match cli.command {
-            Some(Command::Sync { parallel, delete, ext, .. }) => {
+            Some(Command::Sync {
+                parallel,
+                delete,
+                ext,
+                ..
+            }) => {
                 assert_eq!(parallel, Some(2));
                 assert!(delete);
                 assert_eq!(ext, vec!["mkv".to_owned()]);
@@ -593,7 +626,13 @@ mod tests {
     fn sync_defaults_are_left_unresolved() {
         let cli = parse(&["rdm", "sync", "https://e.com/d/"]);
         match cli.command {
-            Some(Command::Sync { opts, parallel, delete, ext, .. }) => {
+            Some(Command::Sync {
+                opts,
+                parallel,
+                delete,
+                ext,
+                ..
+            }) => {
                 assert_eq!(opts.connections, None);
                 assert_eq!(parallel, None);
                 assert!(!delete);
@@ -621,7 +660,9 @@ mod tests {
     fn queue_add_keeps_connections_unresolved() {
         let cli = parse(&["rdm", "q", "a", "https://example.com/f.zip", "-o", "name"]);
         match cli.command {
-            Some(Command::Queue { command: QueueCommand::Add { url, opts } }) => {
+            Some(Command::Queue {
+                command: QueueCommand::Add { url, opts },
+            }) => {
                 assert_eq!(url, "https://example.com/f.zip");
                 assert_eq!(opts.output.as_deref(), Some("name"));
                 assert_eq!(opts.connections, None);
@@ -636,7 +677,9 @@ mod tests {
             let cli = parse(&["rdm", "queue", name]);
             assert!(matches!(
                 cli.command,
-                Some(Command::Queue { command: QueueCommand::List })
+                Some(Command::Queue {
+                    command: QueueCommand::List
+                })
             ));
         }
     }
@@ -646,7 +689,9 @@ mod tests {
         for name in ["start", "run", "s"] {
             let cli = parse(&["rdm", "queue", name, "-p", "2"]);
             match cli.command {
-                Some(Command::Queue { command: QueueCommand::Start { parallel } }) => {
+                Some(Command::Queue {
+                    command: QueueCommand::Start { parallel },
+                }) => {
                     assert_eq!(parallel, Some(2));
                 }
                 other => panic!("expected queue start, got {other:?}"),
@@ -660,7 +705,9 @@ mod tests {
             let cli = parse(&["rdm", "queue", name]);
             assert!(matches!(
                 cli.command,
-                Some(Command::Queue { command: QueueCommand::Skip })
+                Some(Command::Queue {
+                    command: QueueCommand::Skip
+                })
             ));
         }
     }
@@ -669,7 +716,9 @@ mod tests {
     fn queue_remove_requires_numeric_id() {
         let cli = parse(&["rdm", "queue", "rm", "7"]);
         match cli.command {
-            Some(Command::Queue { command: QueueCommand::Remove { id } }) => assert_eq!(id, 7),
+            Some(Command::Queue {
+                command: QueueCommand::Remove { id },
+            }) => assert_eq!(id, 7),
             other => panic!("expected queue remove, got {other:?}"),
         }
         assert!(Cli::try_parse_from(["rdm", "queue", "rm", "abc"]).is_err());
@@ -689,7 +738,9 @@ mod tests {
         for (input, expected) in cases {
             let cli = parse(&["rdm", "queue", "retry", input]);
             match cli.command {
-                Some(Command::Queue { command: QueueCommand::Retry { target } }) => {
+                Some(Command::Queue {
+                    command: QueueCommand::Retry { target },
+                }) => {
                     assert_eq!(target, expected, "input {input}");
                 }
                 other => panic!("expected queue retry, got {other:?}"),
@@ -701,7 +752,9 @@ mod tests {
     fn queue_retry_defaults_to_all() {
         let cli = parse(&["rdm", "queue", "r"]);
         match cli.command {
-            Some(Command::Queue { command: QueueCommand::Retry { target } }) => {
+            Some(Command::Queue {
+                command: QueueCommand::Retry { target },
+            }) => {
                 assert_eq!(target, None);
             }
             other => panic!("expected queue retry, got {other:?}"),
@@ -726,7 +779,9 @@ mod tests {
         for (input, expected) in cases {
             let cli = parse(&["rdm", "queue", "clear", input]);
             match cli.command {
-                Some(Command::Queue { command: QueueCommand::Clear { target } }) => {
+                Some(Command::Queue {
+                    command: QueueCommand::Clear { target },
+                }) => {
                     assert_eq!(target, expected, "input {input}");
                 }
                 other => panic!("expected queue clear, got {other:?}"),
@@ -738,7 +793,9 @@ mod tests {
     fn queue_clear_defaults_to_everything() {
         let cli = parse(&["rdm", "queue", "c"]);
         match cli.command {
-            Some(Command::Queue { command: QueueCommand::Clear { target } }) => {
+            Some(Command::Queue {
+                command: QueueCommand::Clear { target },
+            }) => {
                 assert_eq!(target, None);
             }
             other => panic!("expected queue clear, got {other:?}"),
@@ -780,14 +837,15 @@ mod tests {
     fn empty_extensions_mean_no_filter() {
         assert_eq!(normalize_extensions(&[]), None);
         assert_eq!(normalize_extensions(&[" ".to_owned()]), None);
-        assert_eq!(normalize_extensions(&[",".to_owned(), ".".to_owned()]), None);
+        assert_eq!(
+            normalize_extensions(&[",".to_owned(), ".".to_owned()]),
+            None
+        );
     }
 
     #[test]
     fn repeated_ext_flags_accumulate() {
-        let cli = parse(&[
-            "rdm", "sync", "https://e.com/d/", "-e", "flac", "-e", "mkv",
-        ]);
+        let cli = parse(&["rdm", "sync", "https://e.com/d/", "-e", "flac", "-e", "mkv"]);
         match cli.command {
             Some(Command::Sync { ext, .. }) => {
                 let set = normalize_extensions(&ext).expect("expected a filter");
@@ -819,7 +877,10 @@ mod tests {
     #[test]
     fn parse_bounded_edges() {
         assert_eq!(parse_connections("1"), Ok(1));
-        assert_eq!(parse_connections(&MAX_CONNECTIONS.to_string()), Ok(MAX_CONNECTIONS));
+        assert_eq!(
+            parse_connections(&MAX_CONNECTIONS.to_string()),
+            Ok(MAX_CONNECTIONS)
+        );
         assert!(parse_connections(&(MAX_CONNECTIONS + 1).to_string()).is_err());
         assert_eq!(parse_parallel("1"), Ok(1));
         assert_eq!(parse_parallel(&MAX_PARALLEL.to_string()), Ok(MAX_PARALLEL));

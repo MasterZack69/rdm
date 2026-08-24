@@ -14,8 +14,12 @@ fn onedrive_links_are_recognised() {
     assert!(is_onedrive_url("https://1drv.ms/f/s!AbCdEf"));
     assert!(is_onedrive_url("  https://1drv.ms/u/s!AbCdEf  "));
     assert!(is_onedrive_url("http://1drv.ms/u/s!AbCdEf"));
-    assert!(is_onedrive_url("https://onedrive.live.com/?cid=ABC&id=ABC%21123"));
-    assert!(is_onedrive_url("https://WWW.OneDrive.Live.Com/redir?resid=ABC"));
+    assert!(is_onedrive_url(
+        "https://onedrive.live.com/?cid=ABC&id=ABC%21123"
+    ));
+    assert!(is_onedrive_url(
+        "https://WWW.OneDrive.Live.Com/redir?resid=ABC"
+    ));
 }
 
 /// Lookalikes fall through to the generic engine, and business shares are left
@@ -27,8 +31,12 @@ fn lookalikes_and_business_shares_are_not_claimed() {
     assert!(!is_onedrive_url("https://1drv.ms.evil.com/u/s!AbCdEf"));
     assert!(!is_onedrive_url("https://evil.com/1drv.ms/u/s!AbCdEf"));
     // Userinfo, which is why this parses the URL instead of matching on text.
-    assert!(!is_onedrive_url("https://evil.com@1drv.ms.evil.net/u/s!AbCdEf"));
-    assert!(!is_onedrive_url("https://contoso-my.sharepoint.com/:u:/g/personal/x"));
+    assert!(!is_onedrive_url(
+        "https://evil.com@1drv.ms.evil.net/u/s!AbCdEf"
+    ));
+    assert!(!is_onedrive_url(
+        "https://contoso-my.sharepoint.com/:u:/g/personal/x"
+    ));
     assert!(!is_onedrive_url("ftp://1drv.ms/u/s!AbCdEf"));
     assert!(!is_onedrive_url("https://example.com/file.zip"));
     assert!(!is_onedrive_url("not a url at all"));
@@ -130,7 +138,9 @@ fn children_are_read_as_files_folders_or_skipped() {
 
     let items: Vec<&DriveItem> = page.items().collect();
 
-    assert!(matches!(classify(items[0]), Some(Child::File { id, url }) if id == "D!1" && url == "https://cdn/a"));
+    assert!(
+        matches!(classify(items[0]), Some(Child::File { id, url }) if id == "D!1" && url == "https://cdn/a")
+    );
     assert!(matches!(classify(items[1]), Some(Child::Folder { id }) if id == "D!2"));
     assert!(classify(items[2]).is_none());
 }
@@ -177,7 +187,10 @@ fn remote_names_cannot_escape_the_download_directory() {
 #[test]
 fn ordinary_names_are_left_alone() {
     assert_eq!(safe_component("Holiday 2026.zip"), "Holiday 2026.zip");
-    assert_eq!(safe_component("na\u{ef}ve \u{2014} \u{444}\u{430}\u{439}\u{43b}.pdf"), "na\u{ef}ve \u{2014} \u{444}\u{430}\u{439}\u{43b}.pdf");
+    assert_eq!(
+        safe_component("na\u{ef}ve \u{2014} \u{444}\u{430}\u{439}\u{43b}.pdf"),
+        "na\u{ef}ve \u{2014} \u{444}\u{430}\u{439}\u{43b}.pdf"
+    );
     assert_eq!(safe_component("report.pdf\u{0}"), "report.pdf");
     assert_eq!(safe_component("  spaced.txt  "), "spaced.txt");
     assert_eq!(safe_component(""), "download.bin");
@@ -264,7 +277,10 @@ fn a_hostile_folder_name_stays_inside_the_download_directory() {
         destination_root(None, "/dl", Some("..")),
         PathBuf::from("/dl/onedrive")
     );
-    assert_eq!(destination_root(None, "/dl", None), PathBuf::from("/dl/onedrive"));
+    assert_eq!(
+        destination_root(None, "/dl", None),
+        PathBuf::from("/dl/onedrive")
+    );
 }
 
 // ── Failure reporting ──
