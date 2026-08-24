@@ -3,13 +3,14 @@
 //! pixeldrain is the friendliest host in here by some distance. The API is
 //! documented, reading it needs no credential, and `/api/file/<id>` is an
 //! ordinary ranged HTTPS URL that keeps working: no signature, no expiry, no
-//! redeem step. So this module does almost nothing itself. It turns a link
-//! into a name and a URL, and [`crate::engine`] does the transfer — the same
-//! trade Dropbox and OneDrive make.
+//! redeem step. So this module does very little itself. It turns a link into a
+//! name and a URL, and [`crate::engine`] does the transfer — the same trade
+//! Dropbox and OneDrive make.
 //!
 //! What it cannot do is hand the link over untouched. `pixeldrain.com/u/<id>`
 //! is a page for a viewer, so the generic engine would save an HTML document
-//! under a plausible filename rather than failing where anyone would notice.
+//! under a plausible filename rather than failing anywhere the user would
+//! notice.
 //!
 //! ## Shape of a link
 //!
@@ -19,8 +20,8 @@
 //!   * `/l/<id>` is a list — pixeldrain's word for an album — which expands
 //!     into a flat set of files.
 //!
-//! That is why [`crate::hoster::Kind::link_kind`] can answer honestly for
-//! pixeldrain, where for GoFile it has to guess and for OneDrive it has to
+//! That is why [`crate::hoster::Kind::link_kind`] can give a real answer for
+//! pixeldrain, where for GoFile it has to assume and for OneDrive it has to
 //! defer to the API.
 //!
 //! The `/api/file/<id>` and `/api/list/<id>` forms are accepted too, because
@@ -29,14 +30,8 @@
 //! ## The API key
 //!
 //! Optional, and it buys speed rather than access: pixeldrain caps anonymous
-//! transfers and lifts the cap for an account. It goes in the *password* field
-//! of HTTP Basic auth with the username ignored, which is pixeldrain's own
-//! documented scheme rather than a guess.
-//!
-//! It rides in the default headers of a client built here and handed to the
-//! engine on the request, rather than being baked into the URL. A credential
-//! in a URL ends up in `.rdm` resume state, in shell history, and on the
-//! progress line. The engine's `client` field exists for exactly this.
+//! transfers and lifts the cap for an account. See [`api::build_client`] for
+//! where it goes and why it goes there rather than into the URL.
 //!
 //! ## What this deliberately does not do
 //!
@@ -44,35 +39,33 @@
 //! rolling window, abandons a download it judges too slow, and starts it again
 //! with the API key. That is a lot of machinery to infer something the API
 //! states outright: `download_speed_limit` says whether this file is capped
-//! before a byte moves. So a capped file with no key configured gets a line
-//! saying so, and then downloads at whatever speed it downloads at, rather
-//! than being fetched, judged and thrown away.
+//! before a single byte moves. So a capped file with no key configured gets a
+//! line saying so (see [`speed_limit_note`]) and then downloads at whatever
+//! speed it downloads at, rather than being fetched, judged and thrown away.
 //!
 //! No integrity check, yet. `/info` publishes `hash_sha256`, and this crate
 //! already contains a SHA-256, but verifying it means reading the finished
 //! file back off disk and the engine has no hook for that. A digest checked by
-//! a second full read of a 40 GB file is a different feature from a digest
-//! checked as the bytes go past, and it should be built as that one.
+//! a second full read of a 40 GB file is a different feature from one checked
+//! as the bytes go past, and it deserves to be built as that one.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{self, DownloadRequest, ExistingPolicy, Outcome};
 use crate::ui::{self, Board, ProgressSink};
+
+mod api;
+mod naming;
 
 #[cfg(test)]
 mod tests;
@@ -83,9 +76,9 @@ const API_BASE: &str = "https://pixeldrain.com/api";
 /// Hosts a pixeldrain link arrives on.
 ///
 /// Only the two this module has actually been written against. A mirror or a
-/// vanity domain that turns out to serve something slightly different is worse
+/// vanity domain that turns out to serve something subtly different is worse
 /// than one that falls through to the generic engine, which at least fails
-/// visibly.
+/// where somebody can see it.
 const HOSTS: [&str; 2] = ["pixeldrain.com", "www.pixeldrain.com"];
 
 /// Files of a list to download at once when nothing else says otherwise.
@@ -131,12 +124,12 @@ pub enum Link {
 /// Reads a link as a file id or a list id.
 ///
 /// Purely syntactic — no network access — which is what lets
-/// [`crate::hoster::Kind::link_kind`] give a real answer for pixeldrain while
-/// arguments are still being parsed.
+/// [`crate::hoster::Kind::link_kind`] answer for pixeldrain while arguments
+/// are still being parsed.
 pub fn parse_link(url: &str) -> Result<Link> {
-    // The host check belongs here and not only in the callers: everything below
-    // is interpolated into an API path, and an id taken from some other site's
-    // URL has no business being asked about.
+    // The host check belongs here and not only in the callers: everything
+    // below is interpolated into an API path, and an id lifted from some other
+    // site's URL has no business being asked about.
     if !is_pixeldrain_url(url) {
         bail!("not a pixeldrain link: {}", url.trim());
     }
@@ -166,14 +159,14 @@ pub fn parse_link(url: &str) -> Result<Link> {
 
 /// Accepts a file or list id, and nothing that could mean something else.
 ///
-/// Ids go straight into an API path, so this is the only thing standing between
-/// a pasted link and a request somewhere else entirely. pixeldrain ids are
-/// short base64url strings, so anything outside that alphabet is not one.
+/// Ids go straight into an API path, so this is the only thing standing
+/// between a pasted link and a request somewhere else entirely. pixeldrain ids
+/// are short base64url strings, so anything outside that alphabet is not one.
 ///
-/// The comma is called out separately because it is the one plausible mistake:
+/// The comma gets its own message because it is the one plausible mistake:
 /// `/info` reads `a,b` as a request for two files and answers with an array,
 /// which is a shape nothing here expects, and "not a pixeldrain id" would be a
-/// poor explanation of that.
+/// poor account of that.
 fn checked_id(id: &str) -> Result<String> {
     const MAX: usize = 64;
 
@@ -207,8 +200,8 @@ pub fn is_list_link(url: &str) -> bool {
 ///
 /// `?download` asks for an attachment instead of an inline render, which makes
 /// pixeldrain send a `Content-Disposition` naming the file. The engine reads
-/// that, so a file whose name had to fall back to its id still lands under its
-/// real one.
+/// that, so even a file whose name had to fall back to its id still lands
+/// under its real one.
 fn download_url(id: &str) -> String {
     format!("{API_BASE}/file/{id}?download")
 }
@@ -218,10 +211,10 @@ fn download_url(id: &str) -> String {
 /// This is what makes a pixeldrain file queueable where a OneDrive share is
 /// not: the result carries no signature and no expiry, so it is still valid an
 /// hour later at the front of the queue, and the response names the file
-/// itself so there is no name to pin either.
+/// itself, so there is no filename to pin either.
 ///
-/// A list has no single URL and is refused here rather than quietly reduced to
-/// one of its files.
+/// A list has no single URL, and is refused here rather than quietly reduced
+/// to one of its files.
 pub fn direct_url(url: &str) -> Result<String> {
     match parse_link(url)? {
         Link::File(id) => Ok(download_url(&id)),
@@ -231,10 +224,10 @@ pub fn direct_url(url: &str) -> Result<String> {
     }
 }
 
-// ── API shapes ────────────────────────────────────────────
+// ── API shapes ─────────────────────────────────────────────
 
 /// The fields of a file this module uses, from `/file/<id>/info` or from the
-/// `files` array of a list.
+/// `files` array of a list — pixeldrain uses one shape for both.
 ///
 /// Every one of them is optional. pixeldrain does not promise partial entries,
 /// but a list that fails to parse because one of forty files is odd is a worse
@@ -261,7 +254,8 @@ struct FileInfo {
 /// A list and the files in it.
 ///
 /// pixeldrain lists are flat and arrive whole, so unlike a OneDrive folder
-/// there is no tree to walk and no continuation to follow.
+/// there is no tree to walk and no continuation token to follow. One request
+/// is the entire listing, names and sizes included.
 #[derive(Debug, Deserialize)]
 struct ListInfo {
     title: Option<String>,
@@ -269,20 +263,7 @@ struct ListInfo {
     files: Vec<FileInfo>,
 }
 
-/// pixeldrain's error body.
-///
-/// Worth parsing rather than printing raw: `value` is a stable code and
-/// `message` is a sentence written for a person, both of which beat "HTTP
-/// 404".
-#[derive(Debug, Deserialize)]
-struct ApiError {
-    #[serde(default)]
-    value: String,
-    #[serde(default)]
-    message: String,
-}
-
-// ── Options and results ───────────────────────────────────
+// ── Options and results ─────────────────────────────────────
 
 /// Knobs for a pixeldrain download.
 ///
@@ -295,7 +276,7 @@ pub struct PixeldrainOptions {
     /// Attempts per API call before giving up. Per-file retries belong to the
     /// engine, which is the thing doing the transfer.
     pub max_retries: u32,
-    /// An account API key. `None` means anonymous, which works and is slower.
+    /// An account API key. `None` means anonymous, which works, and is slower.
     pub api_key: Option<String>,
     /// Re-download files that are already on disk.
     pub overwrite: bool,
@@ -324,7 +305,7 @@ pub struct PixeldrainSummary {
     /// Files that were already on disk.
     pub skipped: usize,
     /// Entries the API described without an id, so there was nothing to fetch.
-    /// Counted rather than dropped silently, because a caller reporting
+    /// Counted rather than dropped silently, because a caller about to report
     /// "12 of 12" needs to know its picture of the list is incomplete.
     pub skipped_entries: usize,
     /// Bytes written during this run.
@@ -395,7 +376,7 @@ pub struct RemoteFile {
     /// The name it will be saved under: already one safe path component, and
     /// already made unique within the list.
     pub name: String,
-    /// Bytes as the listing reported them. `None` only matters to a caller
+    /// Bytes, as the listing reported them. `None` only matters to a caller
     /// comparing against a local copy.
     pub size: Option<u64>,
 }
@@ -408,11 +389,11 @@ pub struct RemoteFile {
 /// needs its contents, which arrive whole in one response.
 pub async fn resolve(url: &str, options: &PixeldrainOptions) -> Result<Resolved> {
     let link = parse_link(url)?;
-    let client = build_client(options.api_key.as_deref())?;
+    let client = api::build_client(options.api_key.as_deref())?;
 
     match link {
         Link::File(id) => {
-            let info: FileInfo = fetch_json(
+            let info: FileInfo = api::fetch_json(
                 &client,
                 options.max_retries,
                 "could not look up the pixeldrain file",
@@ -424,14 +405,14 @@ pub async fn resolve(url: &str, options: &PixeldrainOptions) -> Result<Resolved>
 
             Ok(Resolved::File(FileLink {
                 url: download_url(&id),
-                name: file_name(&info, &id),
+                name: naming::choose(info.name.as_deref(), &id),
                 speed_limit: info.download_speed_limit,
                 client,
             }))
         }
 
         Link::List(id) => {
-            let info: ListInfo = fetch_json(
+            let info: ListInfo = api::fetch_json(
                 &client,
                 options.max_retries,
                 "could not look up the pixeldrain list",
@@ -454,24 +435,45 @@ pub async fn resolve(url: &str, options: &PixeldrainOptions) -> Result<Resolved>
 
                 // An entry that is present but unavailable is kept rather than
                 // refused here. It will fail in the engine and be reported as
-                // one line of the summary, which is the folder-walk contract
-                // everywhere else in this crate, and better than refusing a
-                // whole list over one blocked file.
+                // one line of the summary, which is the same bargain every
+                // folder walk in this crate makes, and better than abandoning
+                // thirty-nine good files over one blocked one.
                 files.push(RemoteFile {
                     id: id.to_owned(),
-                    name: unique(&mut taken, file_name(entry, id)),
+                    name: naming::unique(&mut taken, naming::choose(entry.name.as_deref(), id)),
                     size: entry.size,
                 });
             }
 
             Ok(Resolved::List(ListDownload {
                 client,
-                title: info.title.as_deref().and_then(safe_component),
+                title: info.title.as_deref().and_then(naming::safe_component),
                 files,
                 skipped,
             }))
         }
     }
+}
+
+/// Refuses a file pixeldrain has already said it will not serve.
+///
+/// The one failure that arrives as HTTP 200: `availability` holds a download
+/// error code — an abuse block, or the file's bandwidth share being spent —
+/// and `availability_message` explains it. Checking it here means the refusal
+/// names the reason, instead of the engine reporting a bare 403 from a URL it
+/// was told was fine.
+fn refuse_if_unavailable(info: &FileInfo) -> Result<()> {
+    let code = info.availability.trim();
+    if code.is_empty() {
+        return Ok(());
+    }
+
+    let message = info.availability_message.trim();
+    if message.is_empty() {
+        bail!("pixeldrain will not serve this file: {code}");
+    }
+
+    bail!("pixeldrain will not serve this file: {message} ({code})");
 }
 
 /// Downloads everything in a list.
@@ -520,7 +522,7 @@ pub async fn download_files(
 
     if files.is_empty() {
         // An empty list is a result, not a failure: the directory is there and
-        // there is nothing to fetch.
+        // there is nothing to put in it.
         return Ok(PixeldrainSummary {
             root: root.to_path_buf(),
             total: 0,
@@ -535,7 +537,7 @@ pub async fn download_files(
 
     let workers = options.workers.clamp(1, WORKERS_MAX);
     let board = (!quiet).then(|| Board::new("pixeldrain", total, workers));
-    let renderer = board.as_ref().map(|b| b.spawn_renderer());
+    let renderer = board.as_ref().map(|board| board.spawn_renderer());
 
     let completed = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
@@ -564,7 +566,7 @@ pub async fn download_files(
                     // The lane is held for the whole file: dropping it early
                     // would hand the display slot to another worker while this
                     // one is still reporting into it.
-                    let lane = board.and_then(|b| b.claim(index as u64 + 1, &file.name));
+                    let lane = board.and_then(|board| board.claim(index as u64 + 1, &file.name));
                     let sink: Arc<dyn ProgressSink> = match lane.as_ref() {
                         Some(lane) => lane.sink(),
                         None => ui::silent(),
@@ -615,11 +617,11 @@ pub async fn download_files(
                             }
                             failed
                                 .lock()
-                                .unwrap_or_else(|e| e.into_inner())
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .push((file.name.clone(), reason));
                             // The engine closes the sink on every outcome it
                             // returns; an error is the one way out that leaves
-                            // the lane open.
+                            // the lane still drawing.
                             sink.finish();
                         }
                     }
@@ -640,9 +642,12 @@ pub async fn download_files(
         total,
         completed: completed.load(Ordering::Relaxed),
         skipped: skipped.load(Ordering::Relaxed),
+        // Filled in by `download_list`, which is the caller that knows.
         skipped_entries: 0,
         bytes: bytes.load(Ordering::Relaxed),
-        failed: failed.into_inner().unwrap_or_else(|e| e.into_inner()),
+        failed: failed
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
         cancelled: cancelled.load(Ordering::Relaxed),
     })
 }
@@ -650,9 +655,9 @@ pub async fn download_files(
 /// Where a list's files land.
 ///
 /// An explicit `-o` wins and is always a directory: a list is many files, and
-/// there is no single file for a filename to name. Otherwise the list keeps its
-/// own title, which is the one thing about it that means anything to the person
-/// who was sent the link.
+/// there is no single file for a filename to name. Otherwise the list keeps
+/// its own title, which is the one thing about it that means anything to the
+/// person who was sent the link.
 pub fn destination_root(
     output: Option<String>,
     download_dir: &str,
@@ -663,7 +668,7 @@ pub fn destination_root(
     }
 
     let label = title
-        .and_then(safe_component)
+        .and_then(naming::safe_component)
         .unwrap_or_else(|| "pixeldrain".to_owned());
 
     PathBuf::from(download_dir).join(label)
@@ -674,10 +679,10 @@ pub fn destination_root(
 /// `download_speed_limit` is the API stating the cap up front, which is why
 /// this module does not do what the reference downloader does — sample
 /// throughput, give up, and start again with the key. There is nothing to
-/// infer, so there is nothing to throw away.
+/// infer here, so there is nothing to throw away.
 ///
 /// Says nothing when a key is already configured: the cap is then either
-/// already lifted or nothing the user can act on.
+/// already lifted or not something the user can act on.
 pub fn speed_limit_note(limit: u64, has_api_key: bool) -> Option<String> {
     if limit == 0 || has_api_key {
         return None;
@@ -689,78 +694,3 @@ pub fn speed_limit_note(limit: u64, has_api_key: bool) -> Option<String> {
         ui::format_size(limit)
     ))
 }
-
-// ── Naming ────────────────────────────────────────────────
-
-/// The name to save a file under.
-///
-/// The remote name reduced to one safe path component, falling back to the
-/// file's id — which is never empty and can never be a path, having been
-/// through [`checked_id`].
-fn file_name(info: &FileInfo, id: &str) -> String {
-    info.name
-        .as_deref()
-        .and_then(safe_component)
-        .unwrap_or_else(|| id.to_owned())
-}
-
-/// Turns a remote name into exactly one safe path component.
-///
-/// Names come off the network, and a file called `../../.ssh/authorized_keys`
-/// is somebody else's idea of a joke: everything before the last separator is
-/// dropped, and separators that arrive percent-encoded are decoded first so
-/// they cannot smuggle one past.
-///
-/// Unlike OneDrive, pixeldrain does not police filenames on upload, so the
-/// characters Windows refuses (`:` `*` `?` `"` `<` `>` `|`) have to be dealt
-/// with here rather than assumed absent. They become `_` instead of being
-/// dropped, because dropping them turns `1:2` into `12`.
-///
-/// Returns `None` when nothing usable is left, so the caller can fall back to
-/// something it trusts rather than this function inventing a name.
-fn safe_component(name: &str) -> Option<String> {
-    let decoded = engine::percent_decode(name);
-    let leaf = decoded.rsplit(['/', '\\']).next().unwrap_or_default();
-    let cleaned: String = leaf
-        .chars()
-        .filter(|c| !c.is_control())
-        .map(|c| {
-            if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    // Trailing dots go too: `.` and `..` trim away to nothing and are caught
-    // below, and Windows drops them from real names anyway.
-    let trimmed = cleaned.trim().trim_end_matches('.').trim_end();
-
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
-
-/// Keeps two files in one list from becoming one file on disk.
-///
-/// An ordinary case rather than a defensive one: pixeldrain lists are flat and
-/// names in them need not be unique, so an album with two `cover.jpg` in it is
-/// perfectly legal and must not silently arrive as a single file.
-fn unique(taken: &mut HashSet<String>, candidate: String) -> String {
-    if taken.insert(candidate.clone()) {
-        return candidate;
-    }
-
-    let path = Path::new(&candidate);
-    let stem = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let extension = path
-        .extension()
-        .map(|extension| extension.to_string_lossy().into_owned());
-    let mut copy = 2u32;
-
-    loop {
-        let mut numbered = format!("{stem} ({copy})");
-        if let Some(extension) = &extension {
-            numbered.push('.');
-            numbered.push_
