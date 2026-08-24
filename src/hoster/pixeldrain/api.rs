@@ -34,12 +34,9 @@ struct ApiError {
 /// The API key, when there is one, lives in this client's default headers
 /// rather than in the URL. The engine downloads over the client it is handed,
 /// and a credential in a URL would end up in `.rdm` resume state, in shell
-/// history and on the progress line.
-///
-/// pixeldrain's documented scheme is HTTP Basic with the key as the *password*
-/// and the username ignored, so the header is built here rather than with
-/// `RequestBuilder::basic_auth`, which is per-request and would not survive
-/// the hand-off to the engine.
+/// history and on the progress line. It has to be a default header rather than
+/// `RequestBuilder::basic_auth` for the same reason: that is per-request, and
+/// would not survive the hand-off to the engine.
 ///
 /// Note the absence of an `Accept` header: this same client fetches file
 /// bytes, and `application/json` would be a lie on that request.
@@ -47,13 +44,7 @@ pub(super) fn build_client(api_key: Option<&str>) -> Result<Client> {
     let mut headers = HeaderMap::new();
 
     if let Some(key) = api_key {
-        let encoded = STANDARD.encode(format!(":{key}"));
-        let mut value = HeaderValue::from_str(&format!("Basic {encoded}"))
-            .context("the pixeldrain API key cannot be put in an HTTP header")?;
-        // Keeps the key out of any `Debug` of the client or its headers, which
-        // is the shape a bug report tends to arrive in.
-        value.set_sensitive(true);
-        headers.insert(AUTHORIZATION, value);
+        headers.insert(AUTHORIZATION, authorization(key)?);
     }
 
     Client::builder()
@@ -62,6 +53,27 @@ pub(super) fn build_client(api_key: Option<&str>) -> Result<Client> {
         .default_headers(headers)
         .build()
         .context("could not build the pixeldrain HTTP client")
+}
+
+/// The `Authorization` header for an API key.
+///
+/// pixeldrain's documented scheme is HTTP Basic with the key as the *password*
+/// and the username ignored, so the credential is `base64(":" + key)`.
+///
+/// That encoding step is also what makes this safe to build from whatever is
+/// in a config file: a stray newline or control character comes back out as
+/// base64 alphabet, so there is no header for it to break out of. Validating
+/// the key first would be guarding a door that encoding already welded shut.
+/// The `Result` is here because [`HeaderValue`] insists on one, not because a
+/// key can realistically fail it.
+fn authorization(key: &str) -> Result<HeaderValue> {
+    let encoded = STANDARD.encode(format!(":{key}"));
+    let mut value = HeaderValue::from_str(&format!("Basic {encoded}"))
+        .context("the pixeldrain API key cannot be put in an HTTP header")?;
+    // Keeps the key out of any `Debug` of the client or its headers, which is
+    // the shape a bug report tends to arrive in.
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 /// GETs `endpoint` until it answers with JSON that parses, `retries` attempts
@@ -242,14 +254,34 @@ mod tests {
         assert!(!is_final(StatusCode::BAD_GATEWAY));
     }
 
+    /// pixeldrain reads the key as the password with the username ignored, so
+    /// the credential is `base64(":" + key)`. Pinned because getting it wrong
+    /// fails as a 401, which reads as a bad key rather than a bad header.
+    #[test]
+    fn an_api_key_travels_as_documented_basic_auth() {
+        let value = authorization("deadbeef").unwrap();
+        assert_eq!(value.to_str().unwrap(), "Basic OmRlYWRiZWVm");
+        // Kept out of any `Debug` of the client or its headers.
+        assert!(value.is_sensitive());
+    }
+
+    /// Keys are pasted into a config file, so a stray newline in one is a
+    /// plausible typo. Encoding is what makes it harmless rather than a header
+    /// split: it comes back out as base64 alphabet, so there is nothing left to
+    /// break the header on and nothing to validate against.
+    #[test]
+    fn a_key_with_a_newline_in_it_cannot_break_out_of_the_header() {
+        let value = authorization("bad\nkey").unwrap();
+        let text = value.to_str().expect("base64 is always header-safe");
+        assert!(!text.contains('\n') && !text.contains('\r'), "{text}");
+        assert_eq!(text, "Basic OmJhZAprZXk=");
+    }
+
     #[test]
     fn a_client_without_a_key_carries_no_authorization_header() {
         // The anonymous path must not send an empty `Basic OG==` and invite a
         // 401 where none was needed.
         assert!(build_client(None).is_ok());
         assert!(build_client(Some("deadbeef")).is_ok());
-        // Keys arrive from a config file, so a newline in one is a typo rather
-        // than an attack, and it should be a message and not a panic.
-        assert!(build_client(Some("bad\nkey")).is_err());
     }
 }
