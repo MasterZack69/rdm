@@ -718,33 +718,28 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
         None
     };
 
-    // MEGA links go in verbatim: `normalize_download_url` would touch the
-    // `#key` fragment, and there is no listing behind a file link to scrape.
-    // The queue runner recognises them and dispatches to the MEGA downloader.
     let is_mega = mega::is_mega_url(url);
+    let is_pixeldrain = pixeldrain_link.is_some();
     let url = if is_mega {
         url.trim().to_owned()
     } else if let Some(link) = &dropbox_link {
         link.url.clone()
-    } else if let Some(link) = &pixeldrain_link {
-        link.clone()
+    } else if let Some(direct) = pixeldrain_link {
+        direct
     } else {
         engine::normalize_download_url(url)
     };
 
-    let discovered = if !is_mega
-        && dropbox_link.is_none()
-        && pixeldrain_link.is_none()
-        && looks_like_directory(&url)
-    {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(scrape::discover_files(&url, true, opts.allow_private))
-            .unwrap_or(None)
-    } else {
-        None
-    };
+    let discovered =
+        if !is_mega && !is_pixeldrain && dropbox_link.is_none() && looks_like_directory(&url) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(scrape::discover_files(&url, true, opts.allow_private))
+                .unwrap_or(None)
+        } else {
+            None
+        };
 
     match discovered {
         Some(files) if !files.is_empty() => {
@@ -1654,10 +1649,25 @@ mod tests {
         }
     }
 
+    // -- pixeldrain routing --
+
     /// pixeldrain is the one host whose link says which it is, so routing must
     /// not treat every link as a listing the way GoFile has to.
     #[test]
-    fn pixeldrain_lists_are_told_apart_from_files() {
+    fn pixeldrain_links_would_be_mistaken_for_listings() {
+        let link = "https://pixeldrain.com/u/AbCdEf12";
+        assert!(pixeldrain::is_pixeldrain_url(link));
+        assert!(
+            looks_like_directory(link),
+            "if this ever stops being true the ordering comment above is stale, not wrong"
+        );
+    }
+
+    /// pixeldrain is the one host here whose link says which shape it is, so
+    /// this is the inverse of the GoFile and OneDrive cases: nothing is
+    /// assumed and nothing is asked.
+    #[test]
+    fn a_pixeldrain_link_says_whether_it_is_a_list() {
         assert!(pixeldrain::is_list_link(
             "https://pixeldrain.com/l/AbCdEf12"
         ));
@@ -1678,29 +1688,49 @@ mod tests {
 
     #[test]
     fn pixeldrain_workers_come_from_connections_then_config() {
-        let cfg = config::Config {
-            pixeldrain_workers: 7,
-            ..config::Config::default()
-        };
-        let opts = DownloadOpts::default();
-        assert_eq!(pixeldrain_options(&cfg, &opts).workers, 7);
+        let cfg = config::Config::default();
+
+        let defaults = pixeldrain_options(&cfg, &DownloadOpts::default());
+        assert_eq!(defaults.workers, cfg.pixeldrain_workers);
+        assert_eq!(defaults.max_retries, cfg.max_retries);
+        assert!(!defaults.overwrite);
 
         let opts = DownloadOpts {
-            connections: Some(5),
+            connections: Some(7),
             ..DownloadOpts::default()
         };
-        assert_eq!(pixeldrain_options(&cfg, &opts).workers, 5);
+        assert_eq!(pixeldrain_options(&cfg, &opts).workers, 7);
     }
 
+    /// The key never comes from a flag. Same care as the GoFile and Dropbox
+    /// tests: the variable is read but never set, because tests share a
+    /// process and setting it would leak into every other one.
     #[test]
-    fn no_key_configured_means_anonymous() {
-        if std::env::var("RDM_PIXELDRAIN_API_KEY").is_err() {
-            let opts = DownloadOpts::default();
-            assert!(
-                pixeldrain_options(&config::Config::default(), &opts)
-                    .api_key
-                    .is_none()
-            );
+    fn a_configured_pixeldrain_api_key_is_picked_up() {
+        if std::env::var("RDM_PIXELDRAIN_API_KEY").is_ok() {
+            return;
         }
+
+        let cfg = config::Config {
+            pixeldrain_api_key: "key-from-config".to_owned(),
+            ..config::Config::default()
+        };
+        assert_eq!(
+            pixeldrain_options(&cfg, &DownloadOpts::default())
+                .api_key
+                .as_deref(),
+            Some("key-from-config")
+        );
+
+        // A blank key means anonymous, not an empty Authorization header.
+        let blank = config::Config {
+            pixeldrain_api_key: "   ".to_owned(),
+            ..config::Config::default()
+        };
+        assert!(
+            pixeldrain_options(&blank, &DownloadOpts::default())
+                .api_key
+                .is_none()
+        );
     }
 }
