@@ -125,7 +125,10 @@ fn char_width(c: char) -> usize {
         || matches!(c, 0x25fd..=0x25fe | 0x2614..=0x2615 | 0x2648..=0x2653)
         || matches!(c, 0x267f | 0x2693 | 0x26a1 | 0x26aa..=0x26ab | 0x26bd..=0x26be)
         || matches!(c, 0x26c4..=0x26c5 | 0x26ce | 0x26d4 | 0x26ea | 0x26f2..=0x26f3)
-        || matches!(c, 0x26f5 | 0x26fa | 0x26fd | 0x2705 | 0x270a..=0x270b | 0x2728)
+        || matches!(
+            c,
+            0x26f5 | 0x26fa | 0x26fd | 0x2705 | 0x270a..=0x270b | 0x2728
+        )
         || matches!(c, 0x274c | 0x274e | 0x2753..=0x2755 | 0x2757 | 0x2795..=0x2797)
         || matches!(c, 0x27b0 | 0x27bf | 0x2b1b..=0x2b1c | 0x2b50 | 0x2b55);
     if wide { 2 } else { 1 }
@@ -856,8 +859,8 @@ pub struct ScanSpinner {
 }
 
 const SPINNER_FRAMES: [&str; 10] = [
-    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
-    "\u{2827}", "\u{2807}", "\u{280f}",
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
 ];
 
 impl Default for ScanSpinner {
@@ -988,9 +991,7 @@ fn compose(
         )
     };
 
-    let name_room = width
-        .saturating_sub(display_width(&right) + 4)
-        .clamp(6, 38);
+    let name_room = width.saturating_sub(display_width(&right) + 4).clamp(6, 38);
     clip(
         &format!("  {}  {}", pad(&clip(name, name_room), name_room), right),
         width,

@@ -762,13 +762,13 @@ pub(crate) fn decrypt_attributes(at: &str, aes: &[u8; 16]) -> Option<String> {
 /// different file than the one the user asked for. Only a name made entirely
 /// of dots (`.`, `..`) is traversal, and those are replaced wholesale.
 pub fn sanitize_filename(name: &str) -> String {
-    let base = name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(name)
-        .trim();
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
 
-    let base = if base.chars().all(|c| c == '.') { "" } else { base };
+    let base = if base.chars().all(|c| c == '.') {
+        ""
+    } else {
+        base
+    };
 
     let cleaned: String = base
         .chars()
@@ -826,7 +826,9 @@ impl ResumeState {
             .and_then(|text| serde_json::from_str::<ResumeState>(&text).ok());
 
         match parsed {
-            Some(state) if state.handle == handle && state.size == size && state.target == target => {
+            Some(state)
+                if state.handle == handle && state.size == size && state.target == target =>
+            {
                 state
             }
             _ => Self::fresh(handle, size, target),
@@ -1132,10 +1134,7 @@ async fn attempt_task(shared: &Shared, task: &Task, url: &str) -> Result<(), Tas
         .await
         .map_err(|e| TaskError::Fatal(e.into()))?;
 
-    let mut cipher = Aes128Ctr::new(
-        &shared.key.aes,
-        &ctr_iv(&shared.key.nonce, task.offset),
-    );
+    let mut cipher = Aes128Ctr::new(&shared.key.aes, &ctr_iv(&shared.key.nonce, task.offset));
 
     let mut written = 0u64;
     let mut body = response.bytes_stream();
@@ -1168,9 +1167,10 @@ async fn attempt_task(shared: &Shared, task: &Task, url: &str) -> Result<(), Tas
     // A short chunk written as if it were complete shifts every later CTR
     // offset. Roll the progress back and let the caller retry the whole task.
     if written != task.len {
-        shared
-            .downloaded
-            .fetch_sub(written.min(shared.downloaded.load(Ordering::Relaxed)), Ordering::Relaxed);
+        shared.downloaded.fetch_sub(
+            written.min(shared.downloaded.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
         return Err(TaskError::Transient(anyhow!(
             "short read: got {written} of {} bytes",
             task.len
@@ -1251,7 +1251,8 @@ pub(crate) async fn run_download(
     // it" case; anything else gets overwritten via the .mctemp path.
     if !options.overwrite
         && let Ok(meta) = tokio::fs::metadata(&final_path).await
-        && meta.is_file() && meta.len() == info.size
+        && meta.is_file()
+        && meta.len() == info.size
     {
         sink.finish();
         return Ok(MegaOutcome::AlreadyPresent { path: final_path });
@@ -1775,10 +1776,22 @@ mod tests {
         let same = ResumeState::load(&path, "handleA", 1000, 64);
         assert!(same.done.contains(&3));
 
-        assert!(ResumeState::load(&path, "handleB", 1000, 64).done.is_empty());
-        assert!(ResumeState::load(&path, "handleA", 2000, 64).done.is_empty());
+        assert!(
+            ResumeState::load(&path, "handleB", 1000, 64)
+                .done
+                .is_empty()
+        );
+        assert!(
+            ResumeState::load(&path, "handleA", 2000, 64)
+                .done
+                .is_empty()
+        );
         // A different task size means the ids mean something else entirely.
-        assert!(ResumeState::load(&path, "handleA", 1000, 32).done.is_empty());
+        assert!(
+            ResumeState::load(&path, "handleA", 1000, 32)
+                .done
+                .is_empty()
+        );
     }
 
     #[tokio::test]

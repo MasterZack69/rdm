@@ -459,7 +459,10 @@ mod tests {
         assert_eq!(Kind::detect("https://mega.nz.evil.com/file/abc#key"), None);
         assert_eq!(Kind::detect("https://notgofile.io/d/abc"), None);
         assert_eq!(Kind::detect("https://gofile.io.evil.com/d/abc"), None);
-        assert_eq!(Kind::detect("https://notdropbox.com/scl/fi/abc/f.zip"), None);
+        assert_eq!(
+            Kind::detect("https://notdropbox.com/scl/fi/abc/f.zip"),
+            None
+        );
         assert_eq!(
             Kind::detect("https://dropbox.com.evil.com/scl/fi/abc/f.zip"),
             None
@@ -533,7 +536,10 @@ mod tests {
     /// rest. Which is not the same as saying folders are unsupported.
     #[test]
     fn a_onedrive_link_does_not_say_whether_it_is_a_folder() {
-        for link in ["https://1drv.ms/u/s!AbCdEfGh", "https://1drv.ms/f/s!AbCdEfGh"] {
+        for link in [
+            "https://1drv.ms/u/s!AbCdEfGh",
+            "https://1drv.ms/f/s!AbCdEfGh",
+        ] {
             assert_eq!(Kind::OneDrive.link_kind(link), LinkKind::File);
             assert!(!Kind::OneDrive.is_folder_link(link));
         }

@@ -257,9 +257,7 @@ pub async fn run(
     to_download.sort_by(|a, b| a.1.cmp(&b.1));
 
     let mut to_delete: Vec<String> = Vec::new();
-    if delete
-        && let SyncRoot::Ok(ref root) = sync_root_result
-    {
+    if delete && let SyncRoot::Ok(ref root) = sync_root_result {
         let root_path = Path::new(root);
         if root_path.is_dir() {
             collect_orphan_files(
@@ -652,7 +650,9 @@ async fn run_mega(
 
     if cancelled {
         eprintln!();
-        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
+        eprintln!(
+            "  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off."
+        );
         return Ok(());
     }
 
@@ -826,7 +826,10 @@ async fn run_onedrive(
     eprintln!("  Into       : {}", base.display());
     eprintln!("  Up to date : {}", up_to_date);
     if unverified > 0 {
-        eprintln!("  Unverified : {} file(s) the listing gave no size for", unverified);
+        eprintln!(
+            "  Unverified : {} file(s) the listing gave no size for",
+            unverified
+        );
     }
     eprintln!("  To download: {}", to_download.len());
     if delete {
@@ -835,7 +838,10 @@ async fn run_onedrive(
     // Stated whether or not --delete was asked for: a "complete" mirror that is
     // quietly missing files is worse than a noisy one.
     if listing.skipped > 0 {
-        eprintln!("  Skipped    : {} item(s) with nothing to fetch", listing.skipped);
+        eprintln!(
+            "  Skipped    : {} item(s) with nothing to fetch",
+            listing.skipped
+        );
     }
 
     if to_download.is_empty() && to_delete.is_empty() {
@@ -931,7 +937,8 @@ async fn run_onedrive(
                 Ok(_) => {
                     deleted += 1;
                     let _ = std::fs::remove_file(format!("{}.part", full_path.display()));
-                    let meta = crate::resume::ResumeMetadata::meta_path(&full_path.to_string_lossy());
+                    let meta =
+                        crate::resume::ResumeMetadata::meta_path(&full_path.to_string_lossy());
                     let _ = std::fs::remove_file(&meta);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1089,10 +1096,20 @@ async fn run_gdrive(
     eprintln!();
     eprintln!("  Remote     : {} file(s)", total_remote);
     eprintln!("  Into       : {}", base.display());
-    eprintln!("  Listing    : {}", if key.is_some() { "Drive API" } else { "folder page (no key)" });
+    eprintln!(
+        "  Listing    : {}",
+        if key.is_some() {
+            "Drive API"
+        } else {
+            "folder page (no key)"
+        }
+    );
     eprintln!("  Up to date : {}", up_to_date);
     if unverified > 0 {
-        eprintln!("  Unverified : {} file(s) nothing gave a size for", unverified);
+        eprintln!(
+            "  Unverified : {} file(s) nothing gave a size for",
+            unverified
+        );
     }
     eprintln!("  To download: {}", to_download.len());
     if delete {
@@ -1101,7 +1118,10 @@ async fn run_gdrive(
     // Stated whether or not --delete was asked for: a "complete" mirror that is
     // quietly missing files is worse than a noisy one.
     if listing.unsupported > 0 {
-        eprintln!("  Skipped    : {} item(s) with nothing to fetch", listing.unsupported);
+        eprintln!(
+            "  Skipped    : {} item(s) with nothing to fetch",
+            listing.unsupported
+        );
     }
 
     if to_download.is_empty() && to_delete.is_empty() {
@@ -1197,7 +1217,8 @@ async fn run_gdrive(
                 Ok(_) => {
                     deleted += 1;
                     let _ = std::fs::remove_file(format!("{}.part", full_path.display()));
-                    let meta = crate::resume::ResumeMetadata::meta_path(&full_path.to_string_lossy());
+                    let meta =
+                        crate::resume::ResumeMetadata::meta_path(&full_path.to_string_lossy());
                     let _ = std::fs::remove_file(&meta);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

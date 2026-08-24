@@ -379,11 +379,28 @@ fn is_windows_reserved(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
     matches!(
         stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL"
-        | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
-        | "COM6" | "COM7" | "COM8" | "COM9"
-        | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5"
-        | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
     )
 }
 
@@ -431,7 +448,11 @@ async fn fetch_and_parse(
 }
 
 fn extract_mime_essence(ct: &str) -> String {
-    ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+    ct.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 async fn read_capped_body(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>> {
@@ -615,10 +636,7 @@ fn extract_hrefs(html: &str) -> Vec<String> {
         let boundary_ok = i > tag_start
             && (is_html_whitespace(bytes[i - 1]) || bytes[i - 1] == b'<' || bytes[i - 1] == b'/');
 
-        if boundary_ok
-            && i + 4 <= len
-            && bytes[i..i + 4].eq_ignore_ascii_case(b"href")
-        {
+        if boundary_ok && i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b"href") {
             let mut j = i + 4;
             while j < len && is_html_whitespace(bytes[j]) {
                 j += 1;
@@ -688,11 +706,11 @@ fn decode_html_entities(s: &str) -> String {
                     "quot" => Some('"'),
                     "apos" => Some('\''),
                     e if e.starts_with("#x") || e.starts_with("#X") => {
-                        u32::from_str_radix(&e[2..], 16).ok().and_then(char::from_u32)
+                        u32::from_str_radix(&e[2..], 16)
+                            .ok()
+                            .and_then(char::from_u32)
                     }
-                    e if e.starts_with('#') => {
-                        e[1..].parse::<u32>().ok().and_then(char::from_u32)
-                    }
+                    e if e.starts_with('#') => e[1..].parse::<u32>().ok().and_then(char::from_u32),
                     _ => None,
                 };
                 if let Some(ch) = replacement {
@@ -721,8 +739,14 @@ mod tests {
 
     #[test]
     fn test_ensure_trailing_slash() {
-        assert_eq!(ensure_trailing_slash(u("http://x.com/dir")).as_str(), "http://x.com/dir/");
-        assert_eq!(ensure_trailing_slash(u("http://x.com/dir/")).as_str(), "http://x.com/dir/");
+        assert_eq!(
+            ensure_trailing_slash(u("http://x.com/dir")).as_str(),
+            "http://x.com/dir/"
+        );
+        assert_eq!(
+            ensure_trailing_slash(u("http://x.com/dir/")).as_str(),
+            "http://x.com/dir/"
+        );
         // Query is preserved (unlike old behavior).
         assert_eq!(
             ensure_trailing_slash(u("http://x.com/dir?q=1")).as_str(),
@@ -755,10 +779,13 @@ mod tests {
         "#;
         let page = u("http://x.com/root/");
         let (files, dirs) = parse_links(html, &page, &page);
-        assert_eq!(files, vec![
-            "http://x.com/root/movie.mkv".to_owned(),
-            "http://x.com/root/photo.png".to_owned(),
-        ]);
+        assert_eq!(
+            files,
+            vec![
+                "http://x.com/root/movie.mkv".to_owned(),
+                "http://x.com/root/photo.png".to_owned(),
+            ]
+        );
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0].as_str(), "http://x.com/root/subdir/");
     }
@@ -841,9 +868,18 @@ mod tests {
     // (1) Sanitization tests.
     #[test]
     fn test_sanitize_relative_path_safe() {
-        assert_eq!(sanitize_relative_path("file.mkv").as_deref(), Some("file.mkv"));
-        assert_eq!(sanitize_relative_path("sub/file.mkv").as_deref(), Some("sub/file.mkv"));
-        assert_eq!(sanitize_relative_path("a/b/c/d.mp4").as_deref(), Some("a/b/c/d.mp4"));
+        assert_eq!(
+            sanitize_relative_path("file.mkv").as_deref(),
+            Some("file.mkv")
+        );
+        assert_eq!(
+            sanitize_relative_path("sub/file.mkv").as_deref(),
+            Some("sub/file.mkv")
+        );
+        assert_eq!(
+            sanitize_relative_path("a/b/c/d.mp4").as_deref(),
+            Some("a/b/c/d.mp4")
+        );
     }
 
     #[test]
@@ -945,8 +981,14 @@ mod tests {
 
     #[test]
     fn test_extract_mime_essence() {
-        assert_eq!(extract_mime_essence("text/html; charset=utf-8"), "text/html");
-        assert_eq!(extract_mime_essence("APPLICATION/XHTML+XML"), "application/xhtml+xml");
+        assert_eq!(
+            extract_mime_essence("text/html; charset=utf-8"),
+            "text/html"
+        );
+        assert_eq!(
+            extract_mime_essence("APPLICATION/XHTML+XML"),
+            "application/xhtml+xml"
+        );
         assert_eq!(extract_mime_essence(""), "");
     }
 
@@ -959,7 +1001,9 @@ mod tests {
 
     #[test]
     fn test_validate_url_allows_private_when_flag_set() {
-        unsafe { std::env::remove_var("RDM_ALLOW_PRIVATE"); }
+        unsafe {
+            std::env::remove_var("RDM_ALLOW_PRIVATE");
+        }
         assert!(parse_and_validate_url("http://10.214.89.214:8000/", true).is_ok());
         assert!(parse_and_validate_url("http://192.168.1.1/", true).is_ok());
         assert!(parse_and_validate_url("http://127.0.0.1/", true).is_ok());

@@ -125,7 +125,10 @@ fn dropbox_url(url: &str) -> Option<Url> {
 
 /// Non-empty path segments, in order.
 fn segments(parsed: &Url) -> impl Iterator<Item = &str> {
-    parsed.path().split('/').filter(|segment| !segment.is_empty())
+    parsed
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
 }
 
 /// Which share shape this is, if it is one we know.
@@ -426,7 +429,9 @@ fn prefetched(page: &str) -> Vec<String> {
             // into unrelated markup for its second string.
             let head = call.split(')').next()?;
             let payload = nth_quoted(head, 1)?;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(payload).ok()?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .ok()?;
 
             Some(String::from_utf8_lossy(&bytes).into_owned())
         })
@@ -531,7 +536,9 @@ mod tests {
 
     #[test]
     fn folder_shares_are_told_apart_without_a_request() {
-        assert!(is_folder_link("https://www.dropbox.com/scl/fo/abc123/h?rlkey=k"));
+        assert!(is_folder_link(
+            "https://www.dropbox.com/scl/fo/abc123/h?rlkey=k"
+        ));
         assert!(is_folder_link("https://www.dropbox.com/sh/abc123/AABBCC"));
         assert!(!is_folder_link(
             "https://www.dropbox.com/scl/fi/abc123/report.pdf"

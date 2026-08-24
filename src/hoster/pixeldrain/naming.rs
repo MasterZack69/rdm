@@ -101,9 +101,15 @@ mod tests {
             safe_component("../../.ssh/authorized_keys").as_deref(),
             Some("authorized_keys")
         );
-        assert_eq!(safe_component("C:\\Windows\\evil.dll").as_deref(), Some("evil.dll"));
+        assert_eq!(
+            safe_component("C:\\Windows\\evil.dll").as_deref(),
+            Some("evil.dll")
+        );
         // Decoded before splitting, or the separator survives the split.
-        assert_eq!(safe_component("..%2f..%2fpasswd").as_deref(), Some("passwd"));
+        assert_eq!(
+            safe_component("..%2f..%2fpasswd").as_deref(),
+            Some("passwd")
+        );
     }
 
     #[test]
@@ -123,7 +129,10 @@ mod tests {
     fn characters_windows_refuses_are_replaced_and_not_dropped() {
         // pixeldrain accepts these on upload where OneDrive does not, so they
         // genuinely turn up. Dropping them would turn `1:2` into `12`.
-        assert_eq!(safe_component("ep 1:2 <final>.mkv").as_deref(), Some("ep 1_2 _final_.mkv"));
+        assert_eq!(
+            safe_component("ep 1:2 <final>.mkv").as_deref(),
+            Some("ep 1_2 _final_.mkv")
+        );
         assert_eq!(safe_component("a\u{7}b.bin").as_deref(), Some("ab.bin"));
     }
 
@@ -141,7 +150,10 @@ mod tests {
     #[test]
     fn a_name_that_is_already_taken_by_a_numbered_copy_keeps_counting() {
         let mut taken = HashSet::new();
-        assert_eq!(unique(&mut taken, "clip (2).mp4".to_owned()), "clip (2).mp4");
+        assert_eq!(
+            unique(&mut taken, "clip (2).mp4".to_owned()),
+            "clip (2).mp4"
+        );
         assert_eq!(unique(&mut taken, "clip.mp4".to_owned()), "clip.mp4");
         assert_eq!(unique(&mut taken, "clip.mp4".to_owned()), "clip (3).mp4");
     }

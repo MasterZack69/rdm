@@ -114,7 +114,10 @@ fn recognises_folders_in_both_of_their_spellings() {
     let folderview = format!("https://drive.google.com/folderview?id={ID}");
 
     for url in [&folder, &with_account, &folderview] {
-        assert!(matches!(parse_link(url).unwrap(), Link::Folder { id } if id == ID), "{url}");
+        assert!(
+            matches!(parse_link(url).unwrap(), Link::Folder { id } if id == ID),
+            "{url}"
+        );
         assert!(is_folder_link(url), "{url}");
     }
 

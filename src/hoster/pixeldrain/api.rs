@@ -200,7 +200,8 @@ mod tests {
 
     #[test]
     fn a_refusal_is_reported_in_pixeldrains_own_words() {
-        let body = br#"{"success":false,"value":"file_not_found","message":"The file does not exist."}"#;
+        let body =
+            br#"{"success":false,"value":"file_not_found","message":"The file does not exist."}"#;
         assert_eq!(
             explain(StatusCode::NOT_FOUND, body),
             "pixeldrain: The file does not exist. (file_not_found)"

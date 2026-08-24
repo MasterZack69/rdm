@@ -1064,15 +1064,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             };
 
             let elapsed_before = lane.as_ref().map(|l| l.elapsed());
-            let result = run_item(
-                &cfg,
-                &next,
-                child.clone(),
-                sink,
-                mega_client,
-                mega_gate,
-            )
-            .await;
+            let result = run_item(&cfg, &next, child.clone(), sink, mega_client, mega_gate).await;
             let elapsed = elapsed_before
                 .map(|_| lane.as_ref().map(|l| l.elapsed()).unwrap_or_default())
                 .unwrap_or_default();
@@ -1197,7 +1189,9 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
             Ok(())
         });
         eprintln!();
-        eprintln!("  \u{26a0} Queue interrupted — progress saved. Run `rdm queue start` to resume.");
+        eprintln!(
+            "  \u{26a0} Queue interrupted — progress saved. Run `rdm queue start` to resume."
+        );
         return Ok(());
     }
 
@@ -1341,7 +1335,10 @@ mod tests {
         let q = queue_with(&[ONEDRIVE_LINK, "https://x.com/a.bin"]);
         assert!(q.items[0].is_onedrive());
         assert!(!q.items[1].is_onedrive());
-        assert!(!q.items[0].is_mega(), "the two dispatch paths must not overlap");
+        assert!(
+            !q.items[0].is_mega(),
+            "the two dispatch paths must not overlap"
+        );
     }
 
     /// The last segment of a share link is an opaque token, so it names
@@ -1375,7 +1372,13 @@ mod tests {
     #[test]
     fn retry_only_touches_finished_failures() {
         let mut q = queue_with(&["https://x.com/a", "https://x.com/b", "https://x.com/c"]);
-        q.set_status(1, Status::Failed { reason: "404".into(), attempts: 2 });
+        q.set_status(
+            1,
+            Status::Failed {
+                reason: "404".into(),
+                attempts: 2,
+            },
+        );
         q.set_status(2, Status::Skipped);
         q.set_status(3, Status::Complete);
 
@@ -1389,10 +1392,22 @@ mod tests {
     fn failure_attempts_accumulate() {
         let mut q = queue_with(&["https://x.com/a"]);
         assert_eq!(q.attempts_so_far(1), 0);
-        q.set_status(1, Status::Failed { reason: "boom".into(), attempts: 1 });
+        q.set_status(
+            1,
+            Status::Failed {
+                reason: "boom".into(),
+                attempts: 1,
+            },
+        );
         assert_eq!(q.attempts_so_far(1), 1);
         let attempts = q.attempts_so_far(1) + 1;
-        q.set_status(1, Status::Failed { reason: "boom".into(), attempts });
+        q.set_status(
+            1,
+            Status::Failed {
+                reason: "boom".into(),
+                attempts,
+            },
+        );
         assert_eq!(q.attempts_so_far(1), 2);
     }
 
@@ -1421,7 +1436,13 @@ mod tests {
     fn clear_variants_target_the_right_items() {
         let mut q = queue_with(&["https://x.com/a", "https://x.com/b", "https://x.com/c"]);
         q.set_status(2, Status::Complete);
-        q.set_status(3, Status::Failed { reason: "x".into(), attempts: 1 });
+        q.set_status(
+            3,
+            Status::Failed {
+                reason: "x".into(),
+                attempts: 1,
+            },
+        );
 
         assert_eq!(q.clear_finished(), 2);
         assert_eq!(q.stats().total, 1);
@@ -1434,12 +1455,25 @@ mod tests {
         let mut q = queue_with(&["a", "b", "c", "d", "e"]);
         q.set_status(1, Status::Downloading);
         q.set_status(2, Status::Complete);
-        q.set_status(3, Status::Failed { reason: "x".into(), attempts: 1 });
+        q.set_status(
+            3,
+            Status::Failed {
+                reason: "x".into(),
+                attempts: 1,
+            },
+        );
         q.set_status(4, Status::Skipped);
 
         let s = q.stats();
         assert_eq!(
-            (s.total, s.pending, s.downloading, s.complete, s.failed, s.skipped),
+            (
+                s.total,
+                s.pending,
+                s.downloading,
+                s.complete,
+                s.failed,
+                s.skipped
+            ),
             (5, 1, 1, 1, 1, 1)
         );
     }

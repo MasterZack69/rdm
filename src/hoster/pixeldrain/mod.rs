@@ -100,7 +100,12 @@ fn host_of(url: &str) -> Option<String> {
     if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
-    Some(parsed.host_str()?.trim_end_matches('.').to_ascii_lowercase())
+    Some(
+        parsed
+            .host_str()?
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+    )
 }
 
 /// Is this a pixeldrain link?

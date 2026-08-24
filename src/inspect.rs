@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use reqwest::{header, Client, StatusCode};
+use reqwest::{Client, StatusCode, header};
 
 #[derive(Debug, Clone)]
 pub struct FileInfo {
@@ -16,7 +16,9 @@ impl FileInfo {
     }
 }
 
-pub(crate) fn filename_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Option<String> {
+pub(crate) fn filename_from_content_disposition(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<String> {
     let val = headers.get("content-disposition")?.to_str().ok()?;
 
     // Try filename*=UTF-8''name first (RFC 5987)
@@ -43,13 +45,15 @@ pub(crate) fn filename_from_content_disposition(headers: &reqwest::header::Heade
 }
 
 fn extract_etag(headers: &header::HeaderMap) -> Option<String> {
-    headers.get(header::ETAG)
+    headers
+        .get(header::ETAG)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned())
 }
 
 fn extract_last_modified(headers: &header::HeaderMap) -> Option<String> {
-    headers.get(header::LAST_MODIFIED)
+    headers
+        .get(header::LAST_MODIFIED)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned())
 }
@@ -206,22 +210,37 @@ mod tests {
     #[test]
     fn test_extract_size_from_content_range_star() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_RANGE,
-            HeaderValue::from_static("bytes */0"),
-        );
+        headers.insert(header::CONTENT_RANGE, HeaderValue::from_static("bytes */0"));
         assert_eq!(extract_size_from_content_range(&headers), None);
     }
 
     #[test]
     fn test_file_info_can_chunk() {
-        let info = FileInfo { size: Some(1024), supports_range: true, suggested_filename: None, etag: None, last_modified: None };
+        let info = FileInfo {
+            size: Some(1024),
+            supports_range: true,
+            suggested_filename: None,
+            etag: None,
+            last_modified: None,
+        };
         assert!(info.can_chunk());
 
-        let info = FileInfo { size: None, supports_range: true, suggested_filename: None, etag: None, last_modified: None };
+        let info = FileInfo {
+            size: None,
+            supports_range: true,
+            suggested_filename: None,
+            etag: None,
+            last_modified: None,
+        };
         assert!(!info.can_chunk());
 
-        let info = FileInfo { size: Some(1024), supports_range: false, suggested_filename: None, etag: None, last_modified: None };
+        let info = FileInfo {
+            size: Some(1024),
+            supports_range: false,
+            suggested_filename: None,
+            etag: None,
+            last_modified: None,
+        };
         assert!(!info.can_chunk());
     }
 }

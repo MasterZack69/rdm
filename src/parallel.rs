@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Mutex;
@@ -41,16 +41,14 @@ where
     let temp_path = format!("{}.part", ctx.output_path);
     let meta_path = ResumeMetadata::meta_path(ctx.output_path);
 
-    match parallel_inner(
-        ctx,
-        &temp_path,
-        &meta_path,
-        progress_callback,
-    ).await {
+    match parallel_inner(ctx, &temp_path, &meta_path, progress_callback).await {
         Ok(total) => {
             resume::delete(&meta_path).await?;
-            fs::rename(&temp_path, ctx.output_path).await
-                .with_context(|| format!("Failed to rename '{}' to '{}'", temp_path, ctx.output_path))?;
+            fs::rename(&temp_path, ctx.output_path)
+                .await
+                .with_context(|| {
+                    format!("Failed to rename '{}' to '{}'", temp_path, ctx.output_path)
+                })?;
             Ok(total)
         }
         Err(e) => Err(e),
@@ -58,13 +56,14 @@ where
 }
 
 fn chunks_from_metadata(meta: &ResumeMetadata) -> Vec<Chunk> {
-    meta.chunks.iter().map(|c| {
-        Chunk {
+    meta.chunks
+        .iter()
+        .map(|c| Chunk {
             id: c.id,
             start: c.start,
             end: c.end,
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 async fn parallel_inner<F>(
@@ -88,7 +87,8 @@ where
         ctx.chunks,
         ctx.etag.as_deref(),
         ctx.last_modified.as_deref(),
-    ).await?;
+    )
+    .await?;
 
     let chunks = chunks_from_metadata(&meta);
 
@@ -114,8 +114,10 @@ where
             .collect()
     };
 
-    let initial_completed: u64 =
-        chunk_counters.iter().map(|(_, c)| c.load(Ordering::Relaxed)).sum();
+    let initial_completed: u64 = chunk_counters
+        .iter()
+        .map(|(_, c)| c.load(Ordering::Relaxed))
+        .sum();
 
     let retry_pressure = Arc::new(AtomicUsize::new(0));
     let done_flag = Arc::new(AtomicBool::new(false));
@@ -232,7 +234,10 @@ async fn load_or_create_metadata(
         if resume::validate_against(&existing, url, identity, file_size, chunks)
             && existing.matches_server_identity(etag, last_modified)
         {
-            eprintln!("  [Resume] Using existing chunk layout ({} chunks)", existing.chunks.len());
+            eprintln!(
+                "  [Resume] Using existing chunk layout ({} chunks)",
+                existing.chunks.len()
+            );
             return Ok(existing);
         }
 
@@ -260,19 +265,25 @@ async fn ensure_file_allocated(path: &str, size: u64, chunk_count: usize) -> Res
         Ok(m) if m.len() == size => Ok(()),
         Ok(_) => {
             // Always resize existing files to correct size
-            let file = fs::OpenOptions::new().write(true).open(path).await
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .await
                 .with_context(|| format!("Failed to open existing file: {}", path))?;
-            file.set_len(size).await
+            file.set_len(size)
+                .await
                 .with_context(|| format!("Failed to resize '{}' to {} bytes", path, size))?;
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let file = fs::File::create(path).await
+            let file = fs::File::create(path)
+                .await
                 .with_context(|| format!("Failed to create file: {}", path))?;
             if chunk_count > 1 {
                 // Multi-chunk needs pre-allocation for random-access writes
-                file.set_len(size).await
-                    .with_context(|| format!("Failed to pre-allocate {} bytes for '{}'", size, path))?;
+                file.set_len(size).await.with_context(|| {
+                    format!("Failed to pre-allocate {} bytes for '{}'", size, path)
+                })?;
             }
             // Single chunk: file starts at 0 bytes, sequential write extends naturally
             Ok(())
@@ -282,13 +293,17 @@ async fn ensure_file_allocated(path: &str, size: u64, chunk_count: usize) -> Res
 }
 
 fn spawn_autosave(
-    meta_path: String, shared_meta: Arc<Mutex<ResumeMetadata>>,
-    counters: Vec<(u32, Arc<AtomicU64>)>, done: Arc<AtomicBool>,
+    meta_path: String,
+    shared_meta: Arc<Mutex<ResumeMetadata>>,
+    counters: Vec<(u32, Arc<AtomicU64>)>,
+    done: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if done.load(Ordering::Relaxed) { break; }
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
             let snapshot = {
                 let mut meta = shared_meta.lock().await;
                 for (id, counter) in &counters {
@@ -302,8 +317,13 @@ fn spawn_autosave(
 }
 
 async fn download_chunk_with_retry(
-    client: &Client, url: &str, file_path: &str, chunk: &Chunk, config: &RetryConfig,
-    chunk_progress: Arc<AtomicU64>, cancel: CancellationToken,
+    client: &Client,
+    url: &str,
+    file_path: &str,
+    chunk: &Chunk,
+    config: &RetryConfig,
+    chunk_progress: Arc<AtomicU64>,
+    cancel: CancellationToken,
 ) -> Result<u64> {
     let full_chunk_size = chunk.end - chunk.start + 1;
     let initial_completed = chunk_progress.load(Ordering::SeqCst);
@@ -311,41 +331,67 @@ async fn download_chunk_with_retry(
     for attempt in 0..=config.max_retries {
         if cancel.is_cancelled() {
             let written = chunk_progress.load(Ordering::SeqCst);
-            anyhow::bail!("Chunk #{} cancelled before attempt {} ({} of {} bytes on disk)", chunk.id, attempt + 1, written, full_chunk_size);
+            anyhow::bail!(
+                "Chunk #{} cancelled before attempt {} ({} of {} bytes on disk)",
+                chunk.id,
+                attempt + 1,
+                written,
+                full_chunk_size
+            );
         }
 
         let resume_from = chunk_progress.load(Ordering::SeqCst);
-        if resume_from >= full_chunk_size { return Ok(full_chunk_size - initial_completed); }
+        if resume_from >= full_chunk_size {
+            return Ok(full_chunk_size - initial_completed);
+        }
 
         match range_download::download_range(
-            client, url, file_path, chunk.start, chunk.end, resume_from,
-            Arc::clone(&chunk_progress), cancel.clone(),
-        ).await {
+            client,
+            url,
+            file_path,
+            chunk.start,
+            chunk.end,
+            resume_from,
+            Arc::clone(&chunk_progress),
+            cancel.clone(),
+        )
+        .await
+        {
             Ok(DownloadStatus::Complete { bytes_written: _ }) => {
                 return Ok(chunk_progress.load(Ordering::SeqCst) - initial_completed);
             }
 
             Ok(DownloadStatus::Cancelled { .. }) => {
                 let written = chunk_progress.load(Ordering::SeqCst);
-                anyhow::bail!("Chunk #{} cancelled after {} of {} bytes", chunk.id, written, full_chunk_size);
+                anyhow::bail!(
+                    "Chunk #{} cancelled after {} of {} bytes",
+                    chunk.id,
+                    written,
+                    full_chunk_size
+                );
             }
 
-            Err(e) if e.root_cause().to_string().contains("does not support range requests")
+            Err(e)
+                if e.root_cause()
+                    .to_string()
+                    .contains("does not support range requests")
                     && attempt < config.max_retries =>
-                {
-                    chunk_progress.store(0, Ordering::SeqCst);
-                    eprintln!(
-                        "   \u{26a0} Chunk #{}: range not supported, restarting from byte 0",
-                        chunk.id,
-                    );
-                    continue;
-                }
+            {
+                chunk_progress.store(0, Ordering::SeqCst);
+                eprintln!(
+                    "   \u{26a0} Chunk #{}: range not supported, restarting from byte 0",
+                    chunk.id,
+                );
+                continue;
+            }
 
             Err(e) if retry::is_retryable(&e) && attempt < config.max_retries => {
                 let delay = config.delay_for_attempt(attempt);
                 eprintln!(
-    "   \u{26a0} Chunk #{}: {}/{} failed, retry in {:.1}s \u{2014} {}",
-                    chunk.id, attempt + 1, config.max_retries + 1,
+                    "   \u{26a0} Chunk #{}: {}/{} failed, retry in {:.1}s \u{2014} {}",
+                    chunk.id,
+                    attempt + 1,
+                    config.max_retries + 1,
                     delay.as_secs_f64(),
                     short_error(&e),
                 );
@@ -362,7 +408,10 @@ async fn download_chunk_with_retry(
                 let written = chunk_progress.load(Ordering::SeqCst);
                 return Err(e.context(format!(
                     "Chunk #{} failed permanently after {} attempt(s) ({}/{} bytes on disk)",
-                    chunk.id, attempt + 1, written, full_chunk_size,
+                    chunk.id,
+                    attempt + 1,
+                    written,
+                    full_chunk_size,
                 )));
             }
         }
@@ -370,11 +419,21 @@ async fn download_chunk_with_retry(
 
     cancel.cancel();
     let written = chunk_progress.load(Ordering::SeqCst);
-    anyhow::bail!("Chunk #{}: exhausted {} retries ({}/{} bytes on disk)", chunk.id, config.max_retries, written, full_chunk_size)
+    anyhow::bail!(
+        "Chunk #{}: exhausted {} retries ({}/{} bytes on disk)",
+        chunk.id,
+        config.max_retries,
+        written,
+        full_chunk_size
+    )
 }
 
 fn short_error(err: &anyhow::Error) -> String {
-    let msg = err.chain().last().map(|e| e.to_string()).unwrap_or_else(|| err.to_string());
+    let msg = err
+        .chain()
+        .last()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| err.to_string());
     if msg.len() > 80 {
         let mut end = 77;
         while end > 0 && !msg.is_char_boundary(end) {

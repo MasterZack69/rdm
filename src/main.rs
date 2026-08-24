@@ -9,9 +9,9 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
 use rdm::args::{
-    Cli, ClearTarget, Command, DownloadOpts, QueueCommand, RetryTarget, normalize_extensions,
+    ClearTarget, Cli, Command, DownloadOpts, QueueCommand, RetryTarget, normalize_extensions,
 };
-use rdm::hoster::{dropbox, gdrive, gofile, onedrive};
+use rdm::hoster::{dropbox, gdrive, gofile, onedrive, pixeldrain};
 use rdm::ui::{self, ProgressSink};
 use rdm::{config, engine, mega, queue, scrape, signal, sync};
 
@@ -67,6 +67,10 @@ fn main() -> Result<()> {
                 return gdrive_download(&cfg, &url, &opts);
             }
 
+            if pixeldrain::is_pixeldrain_url(&url) {
+                return pixeldrain_download(&cfg, &url, &opts);
+            }
+
             let url = engine::normalize_download_url(&url);
             let connections = opts.connections.unwrap_or(cfg.connections);
             let output_path = resolve_output(opts.output.clone(), &url, &cfg);
@@ -76,7 +80,13 @@ fn main() -> Result<()> {
             })
         }
 
-        Some(Command::Sync { url, opts, parallel, delete, ext }) => {
+        Some(Command::Sync {
+            url,
+            opts,
+            parallel,
+            delete,
+            ext,
+        }) => {
             // Sync mirrors a listing it can re-read on demand. A GoFile
             // content id is an API handle behind a throwaway account, with no
             // listing to diff and no per-file URLs to keep. Without this the
@@ -98,6 +108,15 @@ fn main() -> Result<()> {
                 anyhow::bail!(
                     "Dropbox links cannot be synced \u{2014} run `rdm <dropbox link>` instead; \
                      a share link is a single download, and a folder share arrives as one zip"
+                );
+            }
+
+            if pixeldrain::is_pixeldrain_url(&url) {
+                // A list is re-readable, so this is a missing feature rather
+                // than an impossible one.
+                anyhow::bail!(
+                    "pixeldrain links cannot be synced yet \u{2014} run `rdm <pixeldrain link>` instead; \
+                     rerunning it skips whatever is already on disk"
                 );
             }
 
@@ -198,9 +217,7 @@ fn quick_download(
     // plausible filename. Hence the check sitting above it.
     if onedrive::is_onedrive_url(url) {
         if parallel.is_some() && !opts.quiet {
-            eprintln!(
-                "  \u{26a0} -p applies to directory listings; a OneDrive link is one share."
-            );
+            eprintln!("  \u{26a0} -p applies to directory listings; a OneDrive link is one share.");
         }
         return onedrive_download(cfg, url, opts);
     }
@@ -212,9 +229,18 @@ fn quick_download(
     // which would land it in the generic engine instead. Worse, not better.
     if gdrive::is_gdrive_url(url) {
         if parallel.is_some() && !opts.quiet {
-            eprintln!("  \u{26a0} -p applies to directory listings; Google Drive uses gdrive_workers.");
+            eprintln!(
+                "  \u{26a0} -p applies to directory listings; Google Drive uses gdrive_workers."
+            );
         }
         return gdrive_download(cfg, url, opts);
+    }
+
+    if pixeldrain::is_pixeldrain_url(url) {
+        if parallel.is_some() && !opts.quiet {
+            eprintln!("  \u{26a0} -p applies to directory listings; use the list link itself.");
+        }
+        return pixeldrain_download(cfg, url, opts);
     }
 
     let url = engine::normalize_download_url(url);
@@ -290,16 +316,8 @@ fn mega_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result
     run_async(|cancel| async move {
         let sink = progress_sink(quiet, &label);
         let client = reqwest::Client::new();
-        let outcome = mega::download(
-            client,
-            &url,
-            output,
-            &download_dir,
-            options,
-            cancel,
-            sink,
-        )
-        .await?;
+        let outcome =
+            mega::download(client, &url, output, &download_dir, options, cancel, sink).await?;
 
         report_mega(&outcome, quiet);
         Ok(())
@@ -364,16 +382,8 @@ fn gofile_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Resu
     run_async(|cancel| async move {
         let client = reqwest::Client::new();
 
-        let summary = gofile::download(
-            client,
-            &url,
-            output,
-            &download_dir,
-            options,
-            cancel,
-            quiet,
-        )
-        .await?;
+        let summary =
+            gofile::download(client, &url, output, &download_dir, options, cancel, quiet).await?;
 
         report_gofile(&summary, quiet);
         Ok(())
@@ -469,6 +479,62 @@ fn gdrive_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Resu
                 )
                 .await?;
                 report_gdrive(&summary, quiet);
+                Ok(())
+            }
+        }
+    })
+}
+
+/// pixeldrain: `/u/<id>` is one file, `/l/<id>` is a list, and the link says
+/// which — so unlike GoFile or OneDrive no request is needed just to find out
+/// the shape of the download. `resolve` still makes one call, for a file's name
+/// or a list's contents.
+fn pixeldrain_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    let options = pixeldrain_options(cfg, opts);
+    let connections = opts.connections.unwrap_or(cfg.connections);
+    // Read before `options` is moved into `download_list`. It decides only
+    // whether the speed-cap note is worth printing.
+    let has_api_key = options.api_key.is_some();
+    let quiet = opts.quiet;
+
+    run_async(|cancel| async move {
+        // Bound before the match so the borrow ends here: the list arm moves
+        // `options`.
+        let resolved = pixeldrain::resolve(url, &options).await?;
+
+        match resolved {
+            pixeldrain::Resolved::File(file) => {
+                // Stated by the API up front, not inferred by watching the
+                // transfer and giving up on it.
+                if !quiet
+                    && let Some(note) = pixeldrain::speed_limit_note(file.speed_limit, has_api_key)
+                {
+                    eprintln!("  \u{26a0} {note}");
+                }
+
+                // The key lives in the client's headers rather than the URL, so
+                // the transfer has to go out over that same client.
+                engine::run_download_with_client(
+                    file.url,
+                    Some(resolve_output_named(opts.output.clone(), &file.name, cfg)),
+                    connections,
+                    file.client,
+                    cancel,
+                    quiet,
+                )
+                .await
+            }
+            pixeldrain::Resolved::List(list) => {
+                let summary = pixeldrain::download_list(
+                    list,
+                    opts.output.clone(),
+                    &cfg.download_dir,
+                    options,
+                    cancel,
+                    quiet,
+                )
+                .await?;
+                report_pixeldrain(&summary, quiet);
                 Ok(())
             }
         }
@@ -621,6 +687,21 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
         );
     }
 
+    if pixeldrain::is_list_link(url) {
+        anyhow::bail!(
+            "a pixeldrain list cannot be queued \u{2014} run `rdm {url}` to download all of it"
+        );
+    }
+
+    // Unsigned and non-expiring, so it is still valid whenever the queue reaches
+    // it. `?download` makes pixeldrain send a `Content-Disposition`, so unlike
+    // Dropbox there is no filename to pin either.
+    let pixeldrain_link = if pixeldrain::is_pixeldrain_url(url) {
+        Some(pixeldrain::direct_url(url)?)
+    } else {
+        None
+    };
+
     // Dropbox is the one hoster that queues cleanly, folder shares included:
     // rewriting the link yields an ordinary HTTPS URL for a single response,
     // so the runner can fetch it without knowing Dropbox exists. Resolving now
@@ -645,11 +726,17 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
         url.trim().to_owned()
     } else if let Some(link) = &dropbox_link {
         link.url.clone()
+    } else if let Some(link) = &pixeldrain_link {
+        link.clone()
     } else {
         engine::normalize_download_url(url)
     };
 
-    let discovered = if !is_mega && dropbox_link.is_none() && looks_like_directory(&url) {
+    let discovered = if !is_mega
+        && dropbox_link.is_none()
+        && pixeldrain_link.is_none()
+        && looks_like_directory(&url)
+    {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
@@ -806,6 +893,27 @@ fn gofile_options(cfg: &config::Config, opts: &DownloadOpts) -> gofile::GofileOp
     }
 }
 
+/// The key comes from the environment or the config file, never from a flag: an
+/// argument ends up in shell history and in `ps` output for every other user on
+/// the machine.
+fn pixeldrain_options(cfg: &config::Config, opts: &DownloadOpts) -> pixeldrain::PixeldrainOptions {
+    let api_key = std::env::var("RDM_PIXELDRAIN_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| {
+            let configured = cfg.pixeldrain_api_key.trim();
+            (!configured.is_empty()).then(|| configured.to_owned())
+        });
+
+    pixeldrain::PixeldrainOptions {
+        // On a list, -c means files at once rather than chunks within one file.
+        workers: opts.connections.unwrap_or(cfg.pixeldrain_workers),
+        max_retries: cfg.max_retries,
+        api_key,
+        overwrite: false,
+    }
+}
+
 /// `-c` means files in flight here, the same double meaning it has for GoFile:
 /// a OneDrive folder share is downloaded one connection per file.
 fn onedrive_options(cfg: &config::Config, opts: &DownloadOpts) -> onedrive::OneDriveOptions {
@@ -899,7 +1007,9 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
 
     if summary.cancelled {
         eprintln!();
-        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
+        eprintln!(
+            "  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off."
+        );
     }
 }
 
@@ -933,7 +1043,9 @@ fn report_gofile(summary: &gofile::GofileSummary, quiet: bool) {
 
     if summary.cancelled {
         eprintln!();
-        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
+        eprintln!(
+            "  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off."
+        );
     }
 }
 
@@ -967,7 +1079,9 @@ fn report_onedrive(summary: &onedrive::OneDriveSummary, quiet: bool) {
 
     if summary.cancelled {
         eprintln!();
-        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
+        eprintln!(
+            "  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off."
+        );
     }
 }
 
@@ -1012,7 +1126,50 @@ fn report_gdrive(summary: &gdrive::GdriveSummary, quiet: bool) {
 
     if summary.cancelled {
         eprintln!();
-        eprintln!("  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off.");
+        eprintln!(
+            "  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off."
+        );
+    }
+}
+
+fn report_pixeldrain(summary: &pixeldrain::PixeldrainSummary, quiet: bool) {
+    if quiet {
+        return;
+    }
+
+    eprintln!();
+    eprintln!("  \u{1f4c1} {}", summary.root.display());
+    eprintln!(
+        "     {} of {} file(s), {}",
+        summary.completed,
+        summary.total,
+        ui::format_size(summary.bytes)
+    );
+
+    if summary.skipped > 0 {
+        eprintln!("     {} already on disk", summary.skipped);
+    }
+
+    if summary.skipped_entries > 0 {
+        eprintln!(
+            "     {} entry(s) in the list had nothing to fetch",
+            summary.skipped_entries
+        );
+    }
+
+    if !summary.failed.is_empty() {
+        eprintln!();
+        eprintln!("  \u{26a0} {} file(s) failed:", summary.failed.len());
+        for (path, reason) in &summary.failed {
+            eprintln!("     - {path}: {reason}");
+        }
+    }
+
+    if summary.cancelled {
+        eprintln!();
+        eprintln!(
+            "  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off."
+        );
     }
 }
 
@@ -1121,7 +1278,9 @@ mod tests {
     #[test]
     fn extension_means_file() {
         assert!(!looks_like_directory("https://example.com/song.flac"));
-        assert!(!looks_like_directory("https://example.com/a/b/archive.tar.gz"));
+        assert!(!looks_like_directory(
+            "https://example.com/a/b/archive.tar.gz"
+        ));
     }
 
     #[test]
@@ -1138,7 +1297,9 @@ mod tests {
 
     #[test]
     fn query_string_is_ignored() {
-        assert!(!looks_like_directory("https://example.com/song.flac?token=1"));
+        assert!(!looks_like_directory(
+            "https://example.com/song.flac?token=1"
+        ));
         assert!(looks_like_directory("https://example.com/music?page=2"));
     }
 
@@ -1231,7 +1392,9 @@ mod tests {
 
     #[test]
     fn ordinary_links_are_not_sent_to_gofile() {
-        assert!(!gofile::is_gofile_url("https://example.com/gofile.io/d/abc"));
+        assert!(!gofile::is_gofile_url(
+            "https://example.com/gofile.io/d/abc"
+        ));
         assert!(!gofile::is_gofile_url("https://example.com/song.flac"));
     }
 
@@ -1285,7 +1448,11 @@ mod tests {
             ..config::Config::default()
         };
         if std::env::var("RDM_GOFILE_TOKEN").is_err() {
-            assert!(gofile_options(&blank, &DownloadOpts::default()).token.is_none());
+            assert!(
+                gofile_options(&blank, &DownloadOpts::default())
+                    .token
+                    .is_none()
+            );
         }
     }
 
@@ -1353,7 +1520,11 @@ mod tests {
 
         // A concrete -o still wins outright.
         assert_eq!(
-            resolve_output_named(Some("/data/mine.zip".to_owned()), "dropbox-abc123.zip", &cfg),
+            resolve_output_named(
+                Some("/data/mine.zip".to_owned()),
+                "dropbox-abc123.zip",
+                &cfg
+            ),
             "/data/mine.zip"
         );
     }
@@ -1391,7 +1562,9 @@ mod tests {
     #[test]
     fn ordinary_links_are_not_sent_to_onedrive() {
         assert!(!onedrive::is_onedrive_url("https://example.com/file.zip"));
-        assert!(!onedrive::is_onedrive_url("https://1drv.ms.evil.com/u/s!abc"));
+        assert!(!onedrive::is_onedrive_url(
+            "https://1drv.ms.evil.com/u/s!abc"
+        ));
     }
 
     #[test]
@@ -1473,7 +1646,61 @@ mod tests {
             ..config::Config::default()
         };
         if std::env::var("RDM_GDRIVE_API_KEY").is_err() {
-            assert!(gdrive_options(&blank, &DownloadOpts::default()).api_key.is_none());
+            assert!(
+                gdrive_options(&blank, &DownloadOpts::default())
+                    .api_key
+                    .is_none()
+            );
+        }
+    }
+
+    /// pixeldrain is the one host whose link says which it is, so routing must
+    /// not treat every link as a listing the way GoFile has to.
+    #[test]
+    fn pixeldrain_lists_are_told_apart_from_files() {
+        assert!(pixeldrain::is_list_link(
+            "https://pixeldrain.com/l/AbCdEf12"
+        ));
+        assert!(!pixeldrain::is_list_link(
+            "https://pixeldrain.com/u/AbCdEf12"
+        ));
+    }
+
+    #[test]
+    fn ordinary_links_are_not_sent_to_pixeldrain() {
+        assert!(!pixeldrain::is_pixeldrain_url(
+            "https://example.com/file.zip"
+        ));
+        assert!(!pixeldrain::is_pixeldrain_url(
+            "https://pixeldrain.com.evil.net/u/AbCdEf12"
+        ));
+    }
+
+    #[test]
+    fn pixeldrain_workers_come_from_connections_then_config() {
+        let cfg = config::Config {
+            pixeldrain_workers: 7,
+            ..config::Config::default()
+        };
+        let opts = DownloadOpts::default();
+        assert_eq!(pixeldrain_options(&cfg, &opts).workers, 7);
+
+        let opts = DownloadOpts {
+            connections: Some(5),
+            ..DownloadOpts::default()
+        };
+        assert_eq!(pixeldrain_options(&cfg, &opts).workers, 5);
+    }
+
+    #[test]
+    fn no_key_configured_means_anonymous() {
+        if std::env::var("RDM_PIXELDRAIN_API_KEY").is_err() {
+            let opts = DownloadOpts::default();
+            assert!(
+                pixeldrain_options(&config::Config::default(), &opts)
+                    .api_key
+                    .is_none()
+            );
         }
     }
 }

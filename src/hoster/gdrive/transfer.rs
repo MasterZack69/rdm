@@ -193,7 +193,9 @@ pub async fn download_files(
         skipped: skipped.load(Ordering::Relaxed),
         bytes: bytes.load(Ordering::Relaxed),
         unsupported: 0,
-        failed: failed.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        failed: failed
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
         cancelled: cancelled.load(Ordering::Relaxed),
     })
 }

@@ -178,13 +178,10 @@ impl Config {
     pub fn save(&self) -> Result<()> {
         let path = config_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create config directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create config directory")?;
         }
-        let toml = toml::to_string_pretty(self)
-            .context("Failed to serialize config")?;
-        std::fs::write(&path, toml)
-            .context("Failed to write config file")?;
+        let toml = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        std::fs::write(&path, toml).context("Failed to write config file")?;
         Ok(())
     }
 
@@ -282,18 +279,12 @@ queue_parallel = 5
         assert_eq!(cfg.mega_workers, crate::mega::WORKERS_DEFAULT);
         assert!(cfg.mega_verify_mac);
         assert!(cfg.mega_resume_on_ip_change);
-        assert_eq!(
-            cfg.gofile_workers,
-            crate::hoster::gofile::WORKERS_DEFAULT
-        );
+        assert_eq!(cfg.gofile_workers, crate::hoster::gofile::WORKERS_DEFAULT);
         assert_eq!(
             cfg.onedrive_workers,
             crate::hoster::onedrive::WORKERS_DEFAULT
         );
-        assert_eq!(
-            cfg.gdrive_workers,
-            crate::hoster::gdrive::WORKERS_DEFAULT
-        );
+        assert_eq!(cfg.gdrive_workers, crate::hoster::gdrive::WORKERS_DEFAULT);
         assert_eq!(
             cfg.pixeldrain_workers,
             crate::hoster::pixeldrain::WORKERS_DEFAULT

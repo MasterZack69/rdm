@@ -124,9 +124,7 @@ pub fn parse_folder_link(url: &str) -> Result<FolderLink> {
     let mut parts = tail.split('/');
     let key = parts.next().unwrap_or("").trim();
     let node = match (parts.next(), parts.next()) {
-        (Some("file"), Some(node)) | (Some("folder"), Some(node)) => {
-            Some(node.trim().to_owned())
-        }
+        (Some("file"), Some(node)) | (Some("folder"), Some(node)) => Some(node.trim().to_owned()),
         _ => None,
     };
 
@@ -150,10 +148,7 @@ pub fn parse_folder_link(url: &str) -> Result<FolderLink> {
 pub fn decode_folder_key(key_b64: &str) -> Result<[u8; 16]> {
     let raw = b64_decode(key_b64)?;
     if raw.len() < 16 {
-        bail!(
-            "MEGA folder key must decode to 16 bytes, got {}",
-            raw.len()
-        );
+        bail!("MEGA folder key must decode to 16 bytes, got {}", raw.len());
     }
     let mut key = [0u8; 16];
     key.copy_from_slice(&raw[..16]);
@@ -700,8 +695,12 @@ mod tests {
 
     #[test]
     fn folder_links_are_told_apart_from_file_links() {
-        assert!(is_folder_link("https://mega.nz/folder/s6lVFYbI#XKN8d1JVkhLYqpd9"));
-        assert!(is_folder_link("https://mega.nz/#F!s6lVFYbI!XKN8d1JVkhLYqpd9"));
+        assert!(is_folder_link(
+            "https://mega.nz/folder/s6lVFYbI#XKN8d1JVkhLYqpd9"
+        ));
+        assert!(is_folder_link(
+            "https://mega.nz/#F!s6lVFYbI!XKN8d1JVkhLYqpd9"
+        ));
         assert!(!is_folder_link("https://mega.nz/file/AbCdEfGh#key"));
         assert!(!is_folder_link("https://example.com/folder/x#y"));
     }
@@ -831,10 +830,7 @@ mod tests {
 
         assert!(path.starts_with(base), "{path:?}");
         assert!(!path.to_string_lossy().contains(".."), "{path:?}");
-        assert_eq!(
-            path,
-            PathBuf::from("/tmp/dl/mega-download/safe/etc/passwd")
-        );
+        assert_eq!(path, PathBuf::from("/tmp/dl/mega-download/safe/etc/passwd"));
     }
 
     /// Structure inside the share is kept; the share's own name is not part of
@@ -872,7 +868,8 @@ mod tests {
             entry_at(&["bakchodi", "two.jpg"]),
         ];
 
-        let collapsed = collapse_shared_root(Path::new("/home/zack/Downloads/bakchodi"), &mut entries);
+        let collapsed =
+            collapse_shared_root(Path::new("/home/zack/Downloads/bakchodi"), &mut entries);
 
         assert_eq!(collapsed.as_deref(), Some("bakchodi"));
         assert_eq!(entries[0].display_path(), "one.jpg");
@@ -912,10 +909,7 @@ mod tests {
         ];
         assert!(collapse_shared_root(Path::new("/dl/bakchodi"), &mut two_roots).is_none());
 
-        let mut root_file = vec![
-            entry_at(&["bakchodi", "one.jpg"]),
-            entry_at(&["loose.jpg"]),
-        ];
+        let mut root_file = vec![entry_at(&["bakchodi", "one.jpg"]), entry_at(&["loose.jpg"])];
         assert!(collapse_shared_root(Path::new("/dl/bakchodi"), &mut root_file).is_none());
         assert_eq!(root_file[0].display_path(), "bakchodi/one.jpg");
     }

@@ -36,7 +36,9 @@ fn pixeldrain_links_are_recognised() {
 #[test]
 fn lookalike_hosts_belong_to_somebody_else() {
     assert!(!is_pixeldrain_url("https://notpixeldrain.com/u/AbCdEf12"));
-    assert!(!is_pixeldrain_url("https://pixeldrain.com.evil.com/u/AbCdEf12"));
+    assert!(!is_pixeldrain_url(
+        "https://pixeldrain.com.evil.com/u/AbCdEf12"
+    ));
     // Userinfo before the host is the sneakiest of these: the host here is
     // `pixeldrain.com.evil.net`, and the part that reads like pixeldrain is a
     // username.
@@ -148,7 +150,10 @@ fn a_list_has_no_single_url() {
 /// The one failure pixeldrain reports with HTTP 200.
 #[test]
 fn a_blocked_file_is_refused_in_pixeldrains_own_words() {
-    let info = unavailable("virus_detected_unpaid", "This file has been flagged as malware");
+    let info = unavailable(
+        "virus_detected_unpaid",
+        "This file has been flagged as malware",
+    );
     let error = format!("{:#}", refuse_if_unavailable(&info).unwrap_err());
     assert!(error.contains("flagged as malware"), "{error}");
     assert!(error.contains("virus_detected_unpaid"), "{error}");
@@ -269,7 +274,11 @@ fn a_list_keeps_its_own_title_unless_told_otherwise() {
     // An explicit -o wins outright, and is a directory: a list is many files,
     // so there is no single file for a filename to name.
     assert_eq!(
-        destination_root(Some("/srv/elsewhere".to_owned()), "/tmp/dl", Some("Holiday")),
+        destination_root(
+            Some("/srv/elsewhere".to_owned()),
+            "/tmp/dl",
+            Some("Holiday")
+        ),
         PathBuf::from("/srv/elsewhere")
     );
 }
