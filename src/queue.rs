@@ -915,11 +915,7 @@ async fn run_gdrive_item(
             // recognises the file by.
             .with_resume_identity(format!("gdrive:{}", link.id));
 
-            return Ok(match engine::download(request, cancel, sink).await? {
-                Outcome::Completed { bytes, .. } => ItemOutcome::Completed { bytes },
-                Outcome::AlreadyPresent { .. } => ItemOutcome::AlreadyPresent,
-                Outcome::Cancelled => ItemOutcome::Cancelled,
-            });
+            return Ok(from_engine(engine::download(request, cancel, sink).await?));
         }
         gdrive::Resolved::Folder(folder) => folder,
     };
@@ -956,11 +952,13 @@ async fn run_gdrive_item(
     }
 
     if summary.completed == 0 && summary.skipped > 0 {
-        return Ok(ItemOutcome::AlreadyPresent);
+        return Ok(ItemOutcome::AlreadyPresent { path: None });
     }
 
+    // A folder is many files; there is no one path to name it by.
     Ok(ItemOutcome::Completed {
         bytes: summary.bytes,
+        path: None,
     })
 }
 
