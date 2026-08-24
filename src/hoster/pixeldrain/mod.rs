@@ -298,6 +298,33 @@ impl Default for PixeldrainOptions {
     }
 }
 
+/// The API key to use: the environment first, then the configured value.
+///
+/// This lives here rather than in each caller because there are now three of
+/// them — a direct download, a queue item and a sync — and a credential whose
+/// precedence rule is written out three times is one that will eventually be
+/// read two different ways. The module already names this variable in
+/// [`speed_limit_note`], so it may as well be the thing that reads it.
+///
+/// The environment wins so a key can be supplied for a single run without
+/// editing a config file.
+pub fn api_key(configured: &str) -> Option<String> {
+    std::env::var("RDM_PIXELDRAIN_API_KEY")
+        .ok()
+        .and_then(|key| present(&key))
+        .or_else(|| present(configured))
+}
+
+/// A setting that was actually set.
+///
+/// Blank and whitespace-only both mean "no key", so a stray
+/// `pixeldrain_api_key = ""` does not become a `Basic` header that invites a
+/// 401. Trimming also absorbs the newline a copied key arrives with.
+fn present(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
 /// What happened to a list.
 #[derive(Debug, Clone)]
 pub struct PixeldrainSummary {
@@ -364,6 +391,14 @@ impl ListDownload {
     /// Every file in the list, in the order pixeldrain returned them.
     pub fn files(&self) -> &[RemoteFile] {
         &self.files
+    }
+
+    /// The client the files have to be fetched over, because the API key lives
+    /// in its headers rather than in any URL. A caller that downloads a subset
+    /// itself — `rdm sync` does — needs this one, not a fresh anonymous client
+    /// that would silently drop the key.
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     /// Entries with no id behind them. See

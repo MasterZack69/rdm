@@ -111,15 +111,6 @@ fn main() -> Result<()> {
                 );
             }
 
-            if pixeldrain::is_pixeldrain_url(&url) {
-                // A list is re-readable, so this is a missing feature rather
-                // than an impossible one.
-                anyhow::bail!(
-                    "pixeldrain links cannot be synced yet \u{2014} run `rdm <pixeldrain link>` instead; \
-                     rerunning it skips whatever is already on disk"
-                );
-            }
-
             let parallel = parallel.unwrap_or(cfg.queue_parallel);
             let ext_filter = normalize_extensions(&ext);
             let allow_private = opts.allow_private;
@@ -693,15 +684,6 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
         );
     }
 
-    // Unsigned and non-expiring, so it is still valid whenever the queue reaches
-    // it. `?download` makes pixeldrain send a `Content-Disposition`, so unlike
-    // Dropbox there is no filename to pin either.
-    let pixeldrain_link = if pixeldrain::is_pixeldrain_url(url) {
-        Some(pixeldrain::direct_url(url)?)
-    } else {
-        None
-    };
-
     // Dropbox is the one hoster that queues cleanly, folder shares included:
     // rewriting the link yields an ordinary HTTPS URL for a single response,
     // so the runner can fetch it without knowing Dropbox exists. Resolving now
@@ -719,13 +701,14 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
     };
 
     let is_mega = mega::is_mega_url(url);
-    let is_pixeldrain = pixeldrain_link.is_some();
-    let url = if is_mega {
+    // Stored as pasted, like a MEGA link and unlike a Dropbox one. The queue
+    // resolves it when its turn comes, which is what applies the API key —
+    // storing the direct URL would download it over a bare client instead.
+    let is_pixeldrain = pixeldrain::is_pixeldrain_url(url);
+    let url = if is_mega || is_pixeldrain {
         url.trim().to_owned()
     } else if let Some(link) = &dropbox_link {
         link.url.clone()
-    } else if let Some(direct) = pixeldrain_link {
-        direct
     } else {
         engine::normalize_download_url(url)
     };
@@ -892,19 +875,11 @@ fn gofile_options(cfg: &config::Config, opts: &DownloadOpts) -> gofile::GofileOp
 /// argument ends up in shell history and in `ps` output for every other user on
 /// the machine.
 fn pixeldrain_options(cfg: &config::Config, opts: &DownloadOpts) -> pixeldrain::PixeldrainOptions {
-    let api_key = std::env::var("RDM_PIXELDRAIN_API_KEY")
-        .ok()
-        .filter(|key| !key.trim().is_empty())
-        .or_else(|| {
-            let configured = cfg.pixeldrain_api_key.trim();
-            (!configured.is_empty()).then(|| configured.to_owned())
-        });
-
     pixeldrain::PixeldrainOptions {
         // On a list, -c means files at once rather than chunks within one file.
         workers: opts.connections.unwrap_or(cfg.pixeldrain_workers),
         max_retries: cfg.max_retries,
-        api_key,
+        api_key: pixeldrain::api_key(&cfg.pixeldrain_api_key),
         overwrite: false,
     }
 }

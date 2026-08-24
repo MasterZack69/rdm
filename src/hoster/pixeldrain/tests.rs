@@ -302,5 +302,17 @@ fn the_defaults_agree_with_what_the_config_advertises() {
     assert!(!options.overwrite);
     // `download_files` clamps to WORKERS_MAX, so a default above it would be
     // silently ignored rather than honoured.
-    assert!(WORKERS_DEFAULT >= 1 && WORKERS_DEFAULT <= WORKERS_MAX);
+    const {
+        assert!(WORKERS_DEFAULT >= 1 && WORKERS_DEFAULT <= WORKERS_MAX);
+    }
+}
+
+/// Only the configured half is exercised: the tests share a process, so
+/// setting the variable here would leak into every other test in the run.
+#[test]
+fn a_blank_configured_key_is_no_key_at_all() {
+    assert_eq!(present("abc123"), Some("abc123".to_owned()));
+    assert_eq!(present("  abc123\n"), Some("abc123".to_owned()));
+    assert_eq!(present(""), None);
+    assert_eq!(present("   "), None);
 }
