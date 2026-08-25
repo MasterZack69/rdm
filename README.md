@@ -162,9 +162,6 @@ cargo build --release
 - DeepSeek V4 Flash - Clippy error fixer
 
 # Prior art
-
-Clean-room Rust implementations of the MEGA, GoFile, OneDrive, Google Drive and pixeldrain support, but these projects are where the necessary details came from. No code was copied.
-
 - [MegaBasterd](https://github.com/tonikelope/megabasterd)
 - [gofile-downloader](https://github.com/ltsdw/gofile-downloader)
 - [onedrive-downloader](https://github.com/eugenenuke/onedrive-downloader)
