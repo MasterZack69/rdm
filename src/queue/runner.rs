@@ -50,7 +50,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
     ));
     if pending_mega > 1 {
         board.log(&format!(
-            "  \u{2139} {} MEGA link(s) \u{b7} run one at a time \u{2014} the quota is per-IP, not per-file",
+            "  \u{2139} {} MEGA link(s) \u{b7} run one at a time — the quota is per-IP, not per-file",
             pending_mega
         ));
     }
@@ -93,8 +93,7 @@ pub async fn start(cfg: &Config, cancel: CancellationToken, parallel: usize) -> 
                 Some(ref s) if s == "stop" => {
                     clear_signal();
                     watcher_stop.store(true, Ordering::SeqCst);
-                    watcher_board
-                        .log("  \u{23f9} Stop signal — finishing active downloads\u{2026}");
+                    watcher_board.log("  \u{23f9} Stop signal — finishing active downloads\u{2026}");
                 }
                 _ => {}
             }
@@ -373,4 +372,10 @@ fn print_summary(completed: u32, failed: u32, skipped: u32, bytes: u64, elapsed:
         eprintln!(
             "  {} downloaded at {}",
             ui::format_size(bytes),
-            ui::format_speed(avg
+            ui::format_speed(avg)
+        );
+    }
+    if failed > 0 {
+        eprintln!("  Run `rdm queue retry failed` to requeue the failures.");
+    }
+}
