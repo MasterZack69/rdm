@@ -75,7 +75,7 @@ rdm queue clear [pending|done]            Clear queue (all by default)   [c]
 
 Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything it finds and starts downloading, and `rdm queue add <URL>` enqueues without starting.
 
-## Hoster section
+# Hoster Section
 
 - [mega - click to view](extraInfo/mega.md)
 - [gofile - click to view](extraInfo/gofile.md)
@@ -146,16 +146,11 @@ Everything in the config is optional as they have their own defaults.
 Zack encourages you to build from source. As some random internet person once said, "Always build from source"
 NixOS users get a flake for easy installation :)
 
-# Build from source
+# Build From Source
 ```
 git clone https://github.com/MasterZack69/rdm
 cd rdm
 cargo build --release
-```
-
-# Tests
-```
-cargo test
 ```
 
 # Credits
@@ -166,13 +161,13 @@ cargo test
 - Claude Opus 5 - Clap Migration, Queue System and Hosters
 - DeepSeek V4 Flash - Clippy error fixer
 
-## Prior art
+# Prior art
 
 Clean-room Rust implementations of the MEGA, GoFile, OneDrive, Google Drive and pixeldrain support, but these projects are where the necessary details came from. No code was copied.
 
-- [MegaBasterd](https://github.com/tonikelope/megabasterd) by tonikelope (GPLv3) — MEGA: 509 quota is per-IP, backoff ends early on IP change, chunk workers can't share a keep-alive socket, 403 means an expired temp URL.
-- [gofile-downloader](https://github.com/ltsdw/gofile-downloader) by ltsdw (GPLv3) — GoFile: `X-Website-Token` recipe (four-hour slot), guest account required before listing, token as both `Authorization` header and `accountToken` cookie, `200` on a `Range` request means resume refused.
-- [onedrive-downloader](https://github.com/eugenenuke/onedrive-downloader) by eugenenuke (GPLv3) — OneDrive: anonymous badger token + fixed app id, share link is the item address (base64url, no padding), driveitem call is a POST with `Prefer: autoredeem`, drive id is item id up to the first `!`, file vs folder decided by `@content.downloadUrl`, listing URLs are signed and short-lived.
-- [goodls](https://github.com/tanaikech/goodls) by tanaike (MIT) — Google Drive: the form on the virus-scan warning page holds the real download URL and its hidden inputs carry `uuid` and `at`, a Doc has no bytes and must be exported per kind, `alt=media` for stored files against `export` for Google-native ones, `supportsAllDrives` on every call.
-- [gdown](https://github.com/wkentaro/gdown) by wkentaro (MIT) — Google Drive: a folder can be listed without a key through `embeddedfolderview`, whose children are `/file/d/<id>`, `docs.google.com/<kind>/d/<id>` and `/drive/folders/<id>` links, with the page title as the folder name — and that listing is capped by what the page renders rather than paged to the end.
-- [pixeldrain-downloader](https://github.com/neiromaster/pixeldrain-downloader) by neiromaster (MIT) — pixeldrain: `/u/<id>` is a page for a human and `/api/file/<id>` is the file behind it, so the link cannot be fetched as given. Shorter than the entries above because pixeldrain publishes its own API, and the rest came from there.
+- [MegaBasterd](https://github.com/tonikelope/megabasterd)
+- [gofile-downloader](https://github.com/ltsdw/gofile-downloader)
+- [onedrive-downloader](https://github.com/eugenenuke/onedrive-downloader)
+- [goodls](https://github.com/tanaikech/goodls)
+- [gdown](https://github.com/wkentaro/gdown)
+- [pixeldrain-downloader](https://github.com/neiromaster/pixeldrain-downloader)
