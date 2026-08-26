@@ -1,16 +1,19 @@
 //! Download-URL normalisation and filename extraction.
 
+use super::name::safe_filename;
+
+/// The filename a URL implies, if any.
+///
+/// The last path segment is chosen by whoever published the URL, and decoding
+/// it can reveal separators that were encoded specifically to survive the split
+/// below. So the decoded result is reduced to a single component rather than
+/// trusted as one.
 pub fn extract_filename_from_url(url: &str) -> Option<String> {
     let normalized = normalize_download_url(url);
     let without_fragment = normalized.split('#').next()?;
     let path = without_fragment.split('?').next()?;
     let segment = path.rsplit('/').next()?;
-    let decoded = percent_decode(segment);
-    let trimmed = decoded.trim();
-    if trimmed.is_empty() || trimmed == "/" {
-        return None;
-    }
-    Some(trimmed.to_owned())
+    safe_filename(&percent_decode(segment))
 }
 
 pub fn normalize_download_url(url: &str) -> String {
@@ -72,12 +75,12 @@ pub fn percent_decode(input: &str) -> String {
                     bytes.push(decoded);
                     continue;
                 }
-                // Failed decode — push all three bytes back
+                // Failed decode \u{2014} push all three bytes back
                 bytes.push(b'%');
                 bytes.push(h);
                 bytes.push(l);
             } else {
-                // Incomplete sequence — push what we have
+                // Incomplete sequence \u{2014} push what we have
                 bytes.push(b'%');
                 if let Some(h) = hi {
                     bytes.push(h);
@@ -149,6 +152,35 @@ mod tests {
         assert_eq!(extract_filename_from_url("https://example.com/"), None);
     }
 
+    /// The separators are encoded, so they survive the `rsplit('/')` above and
+    /// only become separators once decoded. Reducing to a component afterwards
+    /// is what closes that gap.
+    #[test]
+    fn a_url_basename_cannot_climb_out_of_the_download_directory() {
+        assert_eq!(
+            extract_filename_from_url("https://example.com/d/..%2f..%2f.ssh%2fauthorized_keys"),
+            Some("authorized_keys".into())
+        );
+        assert_eq!(
+            extract_filename_from_url("https://example.com/d/%2fetc%2fpasswd"),
+            Some("passwd".into())
+        );
+        // Nothing usable left is None, so the caller falls back to its own
+        // default rather than to a name the server chose.
+        assert_eq!(
+            extract_filename_from_url("https://example.com/d/%2e%2e"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_url_basename_cannot_carry_terminal_escapes() {
+        assert_eq!(
+            extract_filename_from_url("https://example.com/%1b%5b2Kdone.mp4"),
+            Some("[2Kdone.mp4".into())
+        );
+    }
+
     #[test]
     fn test_percent_decode_valid() {
         assert_eq!(percent_decode("hello%20world"), "hello world");
@@ -156,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_percent_decode_invalid_hex() {
-        // %GH is not valid hex — all three bytes should be preserved
+        // %GH is not valid hex \u{2014} all three bytes should be preserved
         assert_eq!(percent_decode("test%GHvalue"), "test%GHvalue");
     }
 
