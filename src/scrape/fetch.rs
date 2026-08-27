@@ -180,6 +180,7 @@ mod tests {
     #[test]
     fn every_redirect_status_is_recognised_as_one() {
         use reqwest::StatusCode;
+        use axum::http;
 
         fn response(status: StatusCode, location: Option<&str>) -> reqwest::Response {
             let mut builder = http::Response::builder().status(status);

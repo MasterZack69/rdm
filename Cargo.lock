@@ -1221,7 +1221,6 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
- "http",
  "libc",
  "reqwest",
  "serde",
