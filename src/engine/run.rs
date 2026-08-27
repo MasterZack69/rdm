@@ -19,10 +19,11 @@ pub async fn run_download(
     url: String,
     output: Option<String>,
     connections: usize,
+    allow_private: bool,
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<()> {
-    run(url, output, connections, None, None, cancel, quiet).await
+    run(url, output, connections, allow_private, None, None, cancel, quiet).await
 }
 
 /// The same, over a client the caller has already authenticated.
@@ -37,7 +38,7 @@ pub async fn run_download_with_client(
     cancel: CancellationToken,
     quiet: bool,
 ) -> Result<()> {
-    run(url, output, connections, Some(client), None, cancel, quiet).await
+    run(url, output, connections, false, Some(client), None, cancel, quiet).await
 }
 
 /// The same, for a source whose URL is a credential rather than a name.
@@ -53,6 +54,7 @@ pub async fn run_download_with_identity(
         url,
         output,
         connections,
+        false,
         None,
         Some(identity),
         cancel,
@@ -61,10 +63,12 @@ pub async fn run_download_with_identity(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     url: String,
     output: Option<String>,
     connections: usize,
+    allow_private: bool,
     client: Option<reqwest::Client>,
     identity: Option<String>,
     cancel: CancellationToken,
@@ -87,6 +91,7 @@ async fn run(
     };
 
     let request = DownloadRequest::new(url, output, connections);
+    let request = request.with_allow_private(allow_private);
     let request = match client {
         Some(authenticated) => request.with_client(authenticated),
         None => request,

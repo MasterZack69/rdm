@@ -128,7 +128,8 @@ pub(super) async fn run_item(
         item.connections.unwrap_or(cfg.connections),
     )
     // Never stop a batch run to ask about an existing file.
-    .with_policy(ExistingPolicy::Reuse);
+    .with_policy(ExistingPolicy::Reuse)
+    .with_allow_private(item.allow_private);
 
     Ok(from_engine(engine::download(request, cancel, sink).await?))
 }

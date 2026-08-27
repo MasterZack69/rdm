@@ -4,6 +4,7 @@ pub mod config;
 pub mod engine;
 pub mod hoster;
 pub mod inspect;
+pub mod net;
 pub mod parallel;
 pub mod queue;
 pub mod range_download;

@@ -5,11 +5,9 @@
 //! per file whether the local copy is still current.
 
 use anyhow::{Context, Result};
-use reqwest::header::CONTENT_LENGTH;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +16,7 @@ use crate::config::Config;
 use crate::engine;
 use crate::hoster::{gdrive, onedrive, pixeldrain};
 use crate::mega;
+use crate::net;
 use crate::queue;
 use crate::scrape;
 use crate::ui;
@@ -210,12 +209,7 @@ pub async fn run(
     let mut up_to_date = 0u64;
 
     if !needs_head.is_empty() {
-        let client = reqwest::Client::builder()
-            .user_agent("rdm")
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("Failed to build HTTP client")?;
+        let policy = net::Policy::new(allow_private);
 
         let sem = Arc::new(Semaphore::new(8));
         let mut tasks = JoinSet::new();
@@ -224,7 +218,6 @@ pub async fn run(
         let progress = ui::CountProgress::new("Verifying local files", needs_head.len());
 
         for (file_url, relative, path, size) in needs_head {
-            let client = client.clone();
             let sem = sem.clone();
             let cancel = cancel.clone();
 
@@ -233,7 +226,7 @@ pub async fn run(
                 if cancel.is_cancelled() {
                     return None;
                 }
-                let status = head_compare(&client, &file_url, size).await;
+                let status = verify_remote_size(&policy, &file_url, size).await;
                 Some((file_url, relative, path, status))
             });
         }
@@ -331,7 +324,7 @@ pub async fn run(
         queue::Queue::locked(|q| {
             for (file_url, relative) in &to_download {
                 let decoded = engine::percent_decode(relative);
-                q.add(file_url.clone(), Some(decoded), Some(connections));
+                q.add_with_scope(file_url.clone(), Some(decoded), Some(connections), allow_private);
             }
             Ok(())
         })?;
@@ -417,20 +410,24 @@ enum SyncRoot {
     MixedRoots,
 }
 
-async fn head_compare(client: &reqwest::Client, url: &str, local_size: u64) -> HeadStatus {
-    let resp = match client.head(url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => return HeadStatus::HeadFailed,
+/// Compares the remote size with what is on disk, over a client that has
+/// resolved and judged every hop to the file first.
+///
+/// This used to take a plain `reqwest::Client`, which is how a file URL the
+/// scraper had cleared could still steer the *verification* request into
+/// 169.254.169.254: nothing looked at where the second request went. The probe
+/// is the same one-byte ranged GET the download opens with, so it also states a
+/// size that a HEAD sometimes omits — and it is still one request per file.
+async fn verify_remote_size(policy: &net::Policy, url: &str, local_size: u64) -> HeadStatus {
+    let Ok((_, response)) = policy.probe(url).await else {
+        return HeadStatus::HeadFailed;
     };
-    let remote_size = resp
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-    match remote_size {
-        Some(rs) if rs == local_size => HeadStatus::UpToDate,
+
+    match net::probed_size(&response) {
+        Some(remote) if remote == local_size => HeadStatus::UpToDate,
         Some(_) => HeadStatus::SizeMismatch,
-        None => HeadStatus::NoContentLength,
+        None if response.status().is_success() => HeadStatus::NoContentLength,
+        None => HeadStatus::HeadFailed,
     }
 }
 

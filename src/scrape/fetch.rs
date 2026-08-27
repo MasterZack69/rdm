@@ -9,33 +9,12 @@
 use anyhow::{Context, Result};
 use reqwest::Url;
 
+use crate::net::redirect_location;
+
 use super::limits::{MAX_HTML_BYTES, MAX_REDIRECTS};
 use super::parse::parse_links;
 use super::scope::ScopeGuard;
 use super::url_util::{ensure_trailing_slash, is_under_base};
-
-/// The target of a redirect response, if it is one.
-fn redirect_location(response: &reqwest::Response) -> Option<String> {
-    use reqwest::StatusCode;
-    let is_redirect = matches!(
-        response.status(),
-        StatusCode::MOVED_PERMANENTLY
-            | StatusCode::FOUND
-            | StatusCode::SEE_OTHER
-            | StatusCode::TEMPORARY_REDIRECT
-            | StatusCode::PERMANENT_REDIRECT
-    );
-
-    if !is_redirect {
-        return None;
-    }
-
-    response
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-}
 
 /// GETs `url`, following redirects by hand.
 ///

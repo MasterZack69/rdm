@@ -27,6 +27,10 @@ pub struct Item {
     /// files written by older versions loadable.
     #[serde(default)]
     pub size: Option<u64>,
+    /// Carried from the command that queued this item, because the download
+    /// happens in a different run than the flag.
+    #[serde(default)]
+    pub allow_private: bool,
 }
 
 impl Item {

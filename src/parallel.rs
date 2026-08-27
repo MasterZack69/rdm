@@ -17,6 +17,7 @@ use crate::retry::{self, RetryConfig};
 pub struct ParallelDownloadCtx<'a> {
     pub client: &'a Client,
     pub url: &'a str,
+    pub fetch_url: &'a str,
     pub output_path: &'a str,
     pub file_size: u64,
     pub chunks: &'a [Chunk],
@@ -148,7 +149,7 @@ where
             let chunk = queue.pop_front().unwrap();
 
             let client = ctx.client.clone();
-            let url = ctx.url.to_owned();
+            let url = ctx.fetch_url.to_owned();
             let path = temp_path.to_owned();
             let cancel = ctx.cancel.clone();
             let config = ctx.retry_config.clone();

@@ -6,11 +6,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::chunk::Chunk;
 use crate::inspect;
+use crate::net;
 use crate::parallel;
 use crate::retry::RetryConfig;
 use crate::ui::{self, ProgressSink, SlotState};
 
-use super::client::{shared_client, shared_config};
+use super::client::shared_config;
 use super::name::safe_filename;
 use super::output::{resolve_existing_output, resolve_output_path};
 use super::request::{DownloadRequest, Outcome, OutputDecision};
@@ -50,18 +51,29 @@ pub async fn download(
     let user_explicitly_renamed = output_path != original_path;
     let connections = req.connections.max(1);
 
-    // An authenticated client, if the caller had to obtain one: the session it
-    // holds is the authorisation, so every request below has to go out over it
-    // rather than over the shared client.
-    let client = match req.client.as_ref() {
-        Some(authenticated) => authenticated,
-        None => shared_client()?,
+    // A hoster that had to authenticate hands us its own session and does its
+    // own addressing. Everything else — every URL a listing handed us — is
+    // resolved and judged here, and fetched over a client pinned to the
+    // addresses that judgement was made about.
+    //
+    // `url` stays what the user asked for: it names the file on disk and keys
+    // the resume state. Only the fetching moves to `fetch_url`, because a
+    // redirect target is a poor filename and a worse identity.
+    let resolved;
+    let (fetch_url, client) = match req.client.as_ref() {
+        Some(session) => (url.clone(), session),
+        None => {
+            resolved = net::Policy::new(req.allow_private)
+                .resolve_target(&url)
+                .await?;
+            (resolved.url.to_string(), &resolved.client)
+        }
     };
 
     sink.state(SlotState::Inspecting);
     sink.detail(&format!("Inspecting: {}", url));
 
-    let info = inspect::inspect_url(client, &url).await?;
+    let info = inspect::inspect_url(client, &fetch_url).await?;
 
     // Use the server-suggested filename when the URL has no extension, but
     // only if the user didn't explicitly choose a name (via rename or -o).
@@ -104,7 +116,8 @@ pub async fn download(
             sink.state(SlotState::Downloading);
 
             let result =
-                download_streaming(client, &url, &output_path, cancel, Arc::clone(&sink)).await;
+                download_streaming(client, &fetch_url, &output_path, cancel, Arc::clone(&sink))
+                    .await;
             sink.finish();
 
             return match result {
@@ -172,6 +185,7 @@ pub async fn download(
     let ctx = parallel::ParallelDownloadCtx {
         client,
         url: &url,
+        fetch_url: &fetch_url,
         output_path: &output_path,
         file_size,
         chunks: &chunks,

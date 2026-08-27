@@ -18,25 +18,9 @@ pub struct DownloadRequest {
     pub output: Option<String>,
     pub connections: usize,
     pub policy: ExistingPolicy,
-    /// The client to download with, when it has to be a particular one.
-    ///
-    /// Normally `None`, and the shared client is used along with its connection
-    /// pool. A hoster that had to authenticate passes its own client instead,
-    /// because some authorisation cannot be expressed in a URL: a
-    /// password-protected Dropbox share is authorised by the cookies in a jar,
-    /// so the download has to go out over the client holding that jar.
-    ///
-    /// Keeping it on the request is what lets such a hoster stay a URL rewrite
-    /// instead of growing a downloader: ranges, chunking, resume and retries
-    /// all still come from this module.
     pub client: Option<reqwest::Client>,
-    /// A stable identity for the remote content, when the URL is not one.
-    ///
-    /// The same reason `client` exists: a signed URL is a credential, not a
-    /// name. A OneDrive download URL carries a fresh `tempauth` per run, so
-    /// resume state keyed on it is discarded and the file restarts from zero.
-    /// A hoster that knows something durable — a drive item id — puts it here.
     pub resume_identity: Option<String>,
+    pub allow_private: bool,
 }
 
 impl DownloadRequest {
@@ -48,6 +32,7 @@ impl DownloadRequest {
             policy: ExistingPolicy::Ask,
             client: None,
             resume_identity: None,
+            allow_private: false,
         }
     }
 
@@ -60,6 +45,11 @@ impl DownloadRequest {
     /// session it holds.
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    pub fn with_allow_private(mut self, allow_private: bool) -> Self {
+        self.allow_private = allow_private;
         self
     }
 
@@ -110,5 +100,14 @@ mod tests {
         let authenticated = DownloadRequest::new("https://example.com/f.zip".into(), None, 8)
             .with_client(reqwest::Client::new());
         assert!(authenticated.client.is_some());
+    }
+
+    /// The default has to be the safe one: most requests are built by code that
+    /// never heard of the flag.
+    #[test]
+    fn a_request_refuses_private_addresses_unless_told_otherwise() {
+        let req = DownloadRequest::new("https://example.com/f.zip".into(), None, 8);
+        assert!(!req.allow_private);
+        assert!(req.with_allow_private(true).allow_private);
     }
 }

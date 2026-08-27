@@ -65,7 +65,19 @@ impl Queue {
         Self::load_inner()
     }
 
+    /// Queues an item that may only be fetched from a public address.
     pub fn add(&mut self, url: String, output: Option<String>, connections: Option<usize>) -> u64 {
+        self.add_with_scope(url, output, connections, false)
+    }
+
+    /// Queues an item, remembering whether the user waived the address check.
+    pub fn add_with_scope(
+        &mut self,
+        url: String,
+        output: Option<String>,
+        connections: Option<usize>,
+        allow_private: bool,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.items.push(Item {
@@ -75,6 +87,7 @@ impl Queue {
             connections,
             status: Status::Pending,
             size: None,
+            allow_private,
         });
         id
     }
@@ -392,5 +405,13 @@ mod tests {
         let q: Queue = serde_json::from_str(json).expect("legacy queue.json must still parse");
         assert_eq!(q.pending_count(), 1);
         assert_eq!(q.items[0].size, None);
+    }
+
+    #[test]
+    fn old_queue_files_without_allow_private_still_load() {
+        let json = r#"{"next_id":2,"items":[{"id":1,"url":"https://x.com/a.bin","output":null,"connections":null,"size":null,"status":"Pending"}]}"#;
+        let q: Queue = serde_json::from_str(json).expect("legacy queue.json must still parse");
+        assert_eq!(q.pending_count(), 1);
+        assert!(!q.items[0].allow_private);
     }
 }

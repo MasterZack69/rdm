@@ -76,7 +76,15 @@ fn main() -> Result<()> {
             let output_path = resolve_output(opts.output.clone(), &url, &cfg);
 
             run_async(|cancel| async move {
-                engine::run_download(url, Some(output_path), connections, cancel, opts.quiet).await
+                engine::run_download(
+                    url,
+                    Some(output_path),
+                    connections,
+                    opts.allow_private,
+                    cancel,
+                    opts.quiet,
+                )
+                .await
             })
         }
 
@@ -249,10 +257,11 @@ fn quick_download(
 
                 queue::Queue::locked(|q| {
                     for file in &files {
-                        q.add(
+                        q.add_with_scope(
                             file.url.clone(),
                             Some(file.relative_path.clone()),
                             Some(connections),
+                            opts.allow_private,
                         );
                     }
                     Ok(())
@@ -270,7 +279,15 @@ fn quick_download(
         }
 
         let output_path = resolve_output(opts.output.clone(), &url, cfg);
-        engine::run_download(url, Some(output_path), connections, cancel, opts.quiet).await
+        engine::run_download(
+            url,
+            Some(output_path),
+            connections,
+            opts.allow_private,
+            cancel,
+            opts.quiet,
+        )
+        .await
     })
 }
 
@@ -574,7 +591,7 @@ fn dropbox_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Res
                 )
                 .await
             }
-            None => engine::run_download(link.url, Some(output), connections, cancel, quiet).await,
+            None => engine::run_download(link.url, Some(output), connections, opts.allow_private, cancel, quiet).await,
         }
     })
 }
@@ -728,10 +745,11 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
         Some(files) if !files.is_empty() => {
             queue::Queue::locked(|q| {
                 for file in &files {
-                    q.add(
+                    q.add_with_scope(
                         file.url.clone(),
                         Some(file.relative_path.clone()),
                         opts.connections,
+                        opts.allow_private,
                     );
                 }
                 Ok(())
@@ -753,7 +771,14 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
                         .as_ref()
                         .map(|link| cfg.resolve_output_path(&link.fallback_name))
                 });
-            let id = queue::Queue::locked(|q| Ok(q.add(url.clone(), output, opts.connections)))?;
+            let id = queue::Queue::locked(|q| {
+                Ok(q.add_with_scope(
+                    url.clone(),
+                    output,
+                    opts.connections,
+                    opts.allow_private,
+                ))
+            })?;
             let label = if is_mega {
                 // Never echo the link back: the fragment is the decryption key.
                 mega::parse_link(&url)
