@@ -114,7 +114,7 @@ fn default_gdrive_workers() -> usize {
 }
 
 /// PDF, because it is the one format every Google document kind exports as and
-/// the one the Docs "File \u{2192} Download" menu offers first.
+/// the one the Docs "File → Download" menu offers first.
 fn default_gdrive_doc_format() -> String {
     "pdf".to_owned()
 }
@@ -175,13 +175,25 @@ impl Config {
         }
     }
 
+    /// Writes the config file, readable only by its owner.
+    ///
+    /// Three of the fields here are credentials: the GoFile account token,
+    /// the pixeldrain API key and the billable Drive API key. A plain
+    /// `fs::write` asks for mode 0666 and leaves the rest to the umask, and
+    /// the usual 022 turns that into 0644 — every other account on the
+    /// machine could read all three.
+    ///
+    /// [`crate::secret_file`] pins the mode instead. It also sets it on a file
+    /// that already exists, which is what repairs a config.toml an earlier
+    /// version of rdm created world-readable.
     pub fn save(&self) -> Result<()> {
         let path = config_path();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).context("Failed to create config directory")?;
+            crate::secret_file::create_dir_all(parent)
+                .context("Failed to create config directory")?;
         }
         let toml = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        std::fs::write(&path, toml).context("Failed to write config file")?;
+        crate::secret_file::write(&path, toml.as_bytes()).context("Failed to write config file")?;
         Ok(())
     }
 
@@ -349,5 +361,33 @@ queue_parallel = 5
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.pixeldrain_workers, 6);
         assert_eq!(back.pixeldrain_api_key, "deadbeef");
+    }
+
+    /// The reason `save` goes through `secret_file`: the serialized form
+    /// really does carry all three credentials in the clear, so the mode on
+    /// the file is the only thing keeping them from the rest of the machine.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_config_carrying_credentials_is_owner_readable_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let cfg = Config {
+            gofile_token: "gofile-secret".to_owned(),
+            gdrive_api_key: "AIzaSySecret".to_owned(),
+            pixeldrain_api_key: "pixeldrain-secret".to_owned(),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        crate::secret_file::write(&path, text.as_bytes()).unwrap();
+
+        assert!(text.contains("gofile-secret"));
+        assert!(text.contains("AIzaSySecret"));
+        assert!(text.contains("pixeldrain-secret"));
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

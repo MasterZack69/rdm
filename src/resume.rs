@@ -105,13 +105,27 @@ pub fn create_new(url: String, file_size: u64, chunks: &[Chunk]) -> ResumeMetada
     }
 }
 
+/// Writes the resume metadata, owner-readable only, via a temp file.
+///
+/// The mode matters because `meta.url` is a credential for several of the
+/// hosts rdm supports: a MEGA link carries the file's decryption key in its
+/// fragment, a OneDrive direct link carries a `tempauth` signature, and a
+/// Drive or CDN link carries a signature of its own. A `.rdm` file sits next
+/// to the download in the user's Downloads directory for as long as the
+/// transfer is unfinished, so 0644 publishes those links to every other
+/// account on the machine.
+///
+/// Setting the mode on the temp file rather than on the finished file is what
+/// closes the window: after the rename there is never a moment where the
+/// `.rdm` is readable by anyone else. It also repairs a `.rdm` written by an
+/// earlier version, since the rename replaces the file outright.
 pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
     let json = serde_json::to_string_pretty(meta).context("Failed to serialize resume metadata")?;
 
     let tmp_path = format!("{}.tmp", path);
 
     let write_result = async {
-        let mut file = fs::File::create(&tmp_path)
+        let mut file = crate::secret_file::create_async(std::path::Path::new(&tmp_path))
             .await
             .with_context(|| format!("Failed to create temp file: {}", tmp_path))?;
 
@@ -157,12 +171,17 @@ pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
     Ok(())
 }
 
+/// The same write without the fsyncs, for the frequent progress saves.
+///
+/// Same owner-only mode as [`save_atomic`], and for the same reason: this is
+/// the path that runs every few seconds during a download, so it is the one
+/// that actually creates most `.rdm` files.
 pub async fn save_best_effort(path: &str, meta: &ResumeMetadata) -> Result<()> {
     let json = serde_json::to_string_pretty(meta).context("Failed to serialize resume metadata")?;
 
     let tmp_path = format!("{}.tmp", path);
 
-    let mut file = fs::File::create(&tmp_path)
+    let mut file = crate::secret_file::create_async(std::path::Path::new(&tmp_path))
         .await
         .with_context(|| format!("Failed to create temp file: {}", tmp_path))?;
 
@@ -631,5 +650,58 @@ mod tests {
             ResumeMetadata::meta_path("/home/user/file.zip"),
             "/home/user/file.zip.rdm"
         );
+    }
+
+    /// A .rdm file holds `meta.url`, which for MEGA contains the decryption
+    /// key and for OneDrive a tempauth signature. It sits beside the download
+    /// for the whole transfer, so its mode is what keeps those links private.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_metadata_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &str) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.mkv.rdm");
+        let path = path.to_str().unwrap();
+
+        let chunks = sample_chunks();
+        let meta = create_new(
+            "https://mega.nz/file/AbCdEfGh#TheDecryptionKeyLivesHere".into(),
+            2000,
+            &chunks,
+        );
+
+        save_atomic(path, &meta).await.expect("save failed");
+        assert_eq!(mode_of(path), 0o600, "atomic save must not be readable");
+
+        save_best_effort(path, &meta).await.expect("save failed");
+        assert_eq!(mode_of(path), 0o600, "the frequent save path must agree");
+    }
+
+    /// The rename replaces the inode, so metadata written by a version of rdm
+    /// that predates this is repaired on the next progress save rather than
+    /// keeping its permissions for the life of the download.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_world_readable_metadata_file_is_repaired_on_the_next_save() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.bin.rdm");
+        let path = path.to_str().unwrap();
+
+        std::fs::write(path, b"{}").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let chunks = sample_chunks();
+        let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
+        save_best_effort(path, &meta).await.expect("save failed");
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
