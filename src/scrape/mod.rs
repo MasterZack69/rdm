@@ -5,13 +5,13 @@
 //! anchor links. Hardened against:
 //! - Path traversal (decoded *and* encoded)
 //! - SSRF via private/loopback/link-local addresses, whether the URL names
-//! one outright or resolves to one
+//!   one outright or resolves to one
 //! - Redirects that escape the base scope, checked before the hop is made
 //! - Oversized response bodies
 //! - HTML parser false positives (script/style/comments, attribute boundaries)
 //! - Cross-directory duplicates
 //! - Windows-specific filename quirks (drive letters, reserved names, trailing
-//! dots)
+//!   dots)
 //!
 //! Progress is reported through a single `ui::ScanSpinner` line rather than
 //! one `Scanning ...` line per directory.
@@ -104,10 +104,10 @@ pub async fn discover_files(
     // connect. Every request this scan makes goes to the base host —
     // `is_under_base` refuses a redirect anywhere else before it is followed
     // — so pinning the one host covers the entire crawl.
-    if let Some(host) = base_url.host_str() {
-        if parse_host_as_ip(host).is_none() {
-            builder = builder.resolve_to_addrs(host, &base_addrs);
-        }
+    if let Some(host) = base_url.host_str()
+        && parse_host_as_ip(host).is_none()
+    {
+        builder = builder.resolve_to_addrs(host, &base_addrs);
     }
 
     let client = builder.build().context("Failed to build HTTP client")?;

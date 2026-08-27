@@ -27,12 +27,11 @@ pub(super) fn parse_and_validate_url(s: &str, allow_private: bool) -> Result<Url
 
     let skip_private_check = allow_private || std::env::var_os("RDM_ALLOW_PRIVATE").is_some();
 
-    if !skip_private_check {
-        if let Some(ip) = parse_host_as_ip(host_str) {
-            if is_disallowed_ip(ip) {
-                anyhow::bail!("Refusing to scan private/internal address: {}", ip);
-            }
-        }
+    if !skip_private_check
+        && let Some(ip) = parse_host_as_ip(host_str)
+        && is_disallowed_ip(ip)
+    {
+        anyhow::bail!("Refusing to scan private/internal address: {}", ip);
     }
 
     Ok(url)
