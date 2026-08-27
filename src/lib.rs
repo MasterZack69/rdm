@@ -10,6 +10,7 @@ pub mod range_download;
 pub mod resume;
 pub mod retry;
 pub mod scrape;
+pub mod secret_file;
 pub mod signal;
 pub mod sync;
 pub mod ui;

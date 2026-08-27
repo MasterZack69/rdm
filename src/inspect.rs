@@ -16,6 +16,18 @@ impl FileInfo {
     }
 }
 
+/// The filename the server would like us to use, reduced to something we are
+/// willing to write.
+///
+/// The header is entirely under the server's control and the result is both
+/// joined onto a directory and printed to a terminal, so every form goes
+/// through [`crate::engine::safe_filename`]. Sanitising happens *after*
+/// percent-decoding: `..%2Fauthorized_keys` is one component beforehand and a
+/// traversal afterwards.
+///
+/// A form whose name sanitises away to nothing falls through to the next one,
+/// and then to `None`, which leaves the caller with the name it derived from
+/// the URL rather than one this function invented.
 pub(crate) fn filename_from_content_disposition(
     headers: &reqwest::header::HeaderMap,
 ) -> Option<String> {
@@ -26,8 +38,8 @@ pub(crate) fn filename_from_content_disposition(
         let name = &val[pos + 17..];
         let name = name.split(';').next().unwrap_or(name).trim();
         let decoded = crate::engine::percent_decode(name);
-        if !decoded.is_empty() {
-            return Some(decoded);
+        if let Some(safe) = crate::engine::safe_filename(&decoded) {
+            return Some(safe);
         }
     }
 
@@ -36,8 +48,8 @@ pub(crate) fn filename_from_content_disposition(
         let name = &val[pos + 9..];
         let name = name.split(';').next().unwrap_or(name).trim();
         let name = name.trim_matches('"');
-        if !name.is_empty() {
-            return Some(name.to_owned());
+        if let Some(safe) = crate::engine::safe_filename(name) {
+            return Some(safe);
         }
     }
 
@@ -164,6 +176,12 @@ mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
 
+    fn disposition(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-disposition", HeaderValue::from_static(value));
+        headers
+    }
+
     #[test]
     fn test_extract_content_length_present() {
         let mut headers = HeaderMap::new();
@@ -242,5 +260,70 @@ mod tests {
             last_modified: None,
         };
         assert!(!info.can_chunk());
+    }
+
+    #[test]
+    fn an_ordinary_suggested_filename_is_passed_through() {
+        let headers = disposition("attachment; filename=\"holiday photos.tar.gz\"");
+        assert_eq!(
+            filename_from_content_disposition(&headers).as_deref(),
+            Some("holiday photos.tar.gz")
+        );
+    }
+
+    #[test]
+    fn a_suggested_filename_is_reduced_to_one_component() {
+        let headers = disposition("attachment; filename=\"../../../../etc/cron.d/rdm\"");
+        assert_eq!(
+            filename_from_content_disposition(&headers).as_deref(),
+            Some("rdm")
+        );
+    }
+
+    #[test]
+    fn an_absolute_suggested_filename_cannot_stay_absolute() {
+        let headers = disposition("attachment; filename=/home/user/.bashrc");
+        assert_eq!(
+            filename_from_content_disposition(&headers).as_deref(),
+            Some(".bashrc")
+        );
+    }
+
+    /// The traversal only exists once the value is percent-decoded, which is
+    /// why sanitising the raw header would miss it.
+    #[test]
+    fn encoded_separators_are_stripped_after_decoding_not_before() {
+        let headers = disposition("attachment; filename*=UTF-8''..%2F..%2Fauthorized_keys");
+        assert_eq!(
+            filename_from_content_disposition(&headers).as_deref(),
+            Some("authorized_keys")
+        );
+    }
+
+    /// ESC[2K erases the line rdm just drew, so a name carrying it could forge
+    /// arbitrary output over our own.
+    #[test]
+    fn a_suggested_filename_cannot_repaint_the_terminal() {
+        let headers = disposition("attachment; filename*=UTF-8''%1B%5B2Kinvoice.pdf");
+        assert_eq!(
+            filename_from_content_disposition(&headers).as_deref(),
+            Some("[2Kinvoice.pdf")
+        );
+    }
+
+    #[test]
+    fn a_name_with_nothing_usable_left_is_not_replaced_with_a_guess() {
+        let headers = disposition("attachment; filename=\"..\"");
+        assert_eq!(filename_from_content_disposition(&headers), None);
+    }
+
+    /// When the RFC 5987 form sanitises away, the plain form still gets a turn.
+    #[test]
+    fn an_unusable_encoded_form_falls_through_to_the_plain_one() {
+        let headers = disposition("attachment; filename*=UTF-8''%2E%2E; filename=\"real.zip\"");
+        assert_eq!(
+            filename_from_content_disposition(&headers).as_deref(),
+            Some("real.zip")
+        );
     }
 }

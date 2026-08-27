@@ -1,4 +1,17 @@
 //! What `--delete` may remove.
+//!
+//! Everything here walks with `DirEntry::file_type` rather than with
+//! `Path::is_dir`/`Path::is_file`. That pair follows symlinks, so a link
+//! planted inside the destination was walked as though it were part of the
+//! mirror, and every path found underneath was handed to the deletion phase to
+//! reconstruct and unlink. One `ln -s ~ dest/pics` aimed `--delete` at a home
+//! directory. `file_type` is metadata the readdir call already returned and
+//! follows nothing, so a link reports as a link.
+//!
+//! Symlinks are then skipped outright rather than followed: not recursed into,
+//! and not reported as orphans either. rdm only ever writes regular files, so
+//! a link inside the destination is something the user put there and removing
+//! it is not this sweep's business.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -29,13 +42,21 @@ pub(super) fn collect_listing_orphans(
     };
 
     for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        // Never followed, never deleted. See the module comment.
+        if kind.is_symlink() {
+            continue;
+        }
+
         let path = entry.path();
 
-        if path.is_dir() {
+        if kind.is_dir() {
             collect_listing_orphans(&path, base, keep, ext_filter, out);
             continue;
         }
-        if !path.is_file() {
+        if !kind.is_file() {
             continue;
         }
 
@@ -82,15 +103,22 @@ pub(super) fn collect_orphan_files(
         Err(_) => return,
     };
     for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+
         let path = entry.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str())
             && (name.ends_with(".part") || name.ends_with(".rdm"))
         {
             continue;
         }
-        if path.is_dir() {
+        if kind.is_dir() {
             collect_orphan_files(&path, base, remote_decoded, ext_filter, out);
-        } else if path.is_file() {
+        } else if kind.is_file() {
             if let Some(exts) = ext_filter.as_ref() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if !file_has_ext(name, exts) {
@@ -122,11 +150,16 @@ pub(super) fn remove_empty_dirs(dir: &Path) {
         Err(_) => return,
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            remove_empty_dirs(&path);
-            let _ = std::fs::remove_dir(&path);
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        // A linked directory is not ours to descend into or to remove.
+        if kind.is_symlink() || !kind.is_dir() {
+            continue;
         }
+        let path = entry.path();
+        remove_empty_dirs(&path);
+        let _ = std::fs::remove_dir(&path);
     }
 }
 
@@ -164,7 +197,7 @@ mod tests {
     }
 
     /// Part files and resume state belong to a file we are keeping, so they
-    /// must survive the sweep — deleting them silently throws away resumable
+    /// must survive the sweep \u{2014} deleting them silently throws away resumable
     /// progress. Matching on "kept path plus a dot-suffix" means this holds
     /// whatever the downloader names them.
     #[test]
@@ -224,6 +257,91 @@ mod tests {
             vec!["key-no-longer-opens-this.jpg"],
             "a perfectly good file looks like an orphan, which is why run_mega \
              refuses to delete when any node is undecryptable"
+        );
+    }
+
+    /// The escape this module's walking rule exists for. Before it, the link
+    /// was followed, the files behind it were reported as orphans, and the
+    /// deletion phase reconstructed and unlinked them.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_is_not_walked_as_part_of_the_mirror() {
+        let outside = tempfile::tempdir().unwrap();
+        touch(&outside.path().join("precious.jpg"));
+        touch(&outside.path().join("nested/also-precious.jpg"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        touch(&base.join("keep.jpg"));
+        std::os::unix::fs::symlink(outside.path(), base.join("elsewhere")).unwrap();
+
+        let keep = keep_set(&["keep.jpg"]);
+        let mut out = Vec::new();
+        collect_listing_orphans(base, base, &keep, &None, &mut out);
+
+        assert!(
+            out.is_empty(),
+            "nothing outside the mirror may be reported as an orphan, got {:?}",
+            out
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_is_not_walked_by_the_http_sweep_either() {
+        let outside = tempfile::tempdir().unwrap();
+        touch(&outside.path().join("precious.jpg"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("mirror");
+        std::fs::create_dir_all(&base).unwrap();
+        touch(&base.join("keep.jpg"));
+        std::os::unix::fs::symlink(outside.path(), base.join("elsewhere")).unwrap();
+
+        let remote = keep_set(&["mirror/keep.jpg"]);
+        let mut out = Vec::new();
+        collect_orphan_files(&base, &base, &remote, &None, &mut out);
+
+        assert!(
+            out.is_empty(),
+            "nothing outside the mirror may be reported as an orphan, got {:?}",
+            out
+        );
+    }
+
+    /// A link to a file is skipped rather than deleted. The sweep removes what
+    /// rdm downloaded, and rdm only ever writes regular files.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_is_left_alone() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious.jpg");
+        touch(&target);
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::os::unix::fs::symlink(&target, base.join("linked.jpg")).unwrap();
+
+        let mut out = Vec::new();
+        collect_listing_orphans(base, base, &HashSet::new(), &None, &mut out);
+
+        assert!(out.is_empty(), "got {:?}", out);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_empty_dirs_does_not_descend_through_a_link() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("empty-but-not-ours")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("elsewhere")).unwrap();
+
+        remove_empty_dirs(dir.path());
+
+        assert!(
+            outside.path().join("empty-but-not-ours").exists(),
+            "an empty directory outside the mirror was removed through a link"
         );
     }
 }

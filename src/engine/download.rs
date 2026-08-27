@@ -11,6 +11,7 @@ use crate::retry::RetryConfig;
 use crate::ui::{self, ProgressSink, SlotState};
 
 use super::client::{shared_client, shared_config};
+use super::name::safe_filename;
 use super::output::{resolve_existing_output, resolve_output_path};
 use super::request::{DownloadRequest, Outcome, OutputDecision};
 use super::streaming::download_streaming;
@@ -64,21 +65,35 @@ pub async fn download(
 
     // Use the server-suggested filename when the URL has no extension, but
     // only if the user didn't explicitly choose a name (via rename or -o).
-    let output_path = if user_explicitly_renamed {
-        output_path
-    } else if let Some(ref name) = info.suggested_filename {
-        let path = std::path::Path::new(&output_path);
-        if path.extension().is_none() {
-            let dir = path.parent().unwrap_or(std::path::Path::new("."));
-            dir.join(name).to_string_lossy().to_string()
-        } else {
-            output_path
-        }
-    } else {
-        output_path
+    //
+    // That suggestion is a *different* destination from the one cleared above,
+    // so the existence check has to run again against it. Without this the
+    // check had been answered for a path the download no longer used, and the
+    // rename at the end of the download replaced whatever happened to be at
+    // the new one.
+    let output_path = match suggested_output_path(&output_path, &info, user_explicitly_renamed) {
+        Some(candidate) => match resolve_existing_output(
+            &candidate,
+            &url,
+            req.resume_identity.as_deref(),
+            req.policy,
+        )
+        .await?
+        {
+            OutputDecision::Use(p) => p,
+            OutputDecision::AlreadyPresent => {
+                sink.finish();
+                return Ok(Outcome::AlreadyPresent { path: candidate });
+            }
+            OutputDecision::Cancelled => {
+                sink.finish();
+                return Ok(Outcome::Cancelled);
+            }
+        },
+        None => output_path,
     };
 
-    // Unknown file size → streaming fallback.
+    // Unknown file size \u{2192} streaming fallback.
     let file_size = match info.size {
         Some(0) => anyhow::bail!("Cannot download empty file (Content-Length: 0)"),
         Some(s) => s,
@@ -181,6 +196,42 @@ pub async fn download(
     }
 }
 
+/// Where a server-suggested filename would move the download to, or `None` if
+/// the suggestion should not be honoured at all.
+///
+/// Honoured only when the URL gave us no extension to work with and the user
+/// did not name the file themselves. The name is re-joined onto the parent of
+/// the path we already resolved, so an honoured suggestion can only ever land
+/// in the directory the download was already going to \u{2014} it can change the
+/// filename, never the directory.
+fn suggested_output_path(
+    output_path: &str,
+    info: &inspect::FileInfo,
+    user_explicitly_renamed: bool,
+) -> Option<String> {
+    if user_explicitly_renamed {
+        return None;
+    }
+    let name = info.suggested_filename.as_deref()?;
+    let path = std::path::Path::new(output_path);
+    if path.extension().is_some() {
+        return None;
+    }
+
+    // `inspect` already sanitises, but this is the line that turns a name into
+    // a path, so it does not take that on trust.
+    let name = safe_filename(name)?;
+    let candidate = path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(name)
+        .to_string_lossy()
+        .into_owned();
+
+    // Nothing moved, so there is nothing to re-check.
+    (candidate != output_path).then_some(candidate)
+}
+
 fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
     let count = count.max(1);
     let chunk_size = file_size / count as u64;
@@ -206,6 +257,16 @@ fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
 mod tests {
     use super::*;
 
+    fn suggesting(name: Option<&str>) -> inspect::FileInfo {
+        inspect::FileInfo {
+            size: Some(1024),
+            supports_range: true,
+            suggested_filename: name.map(str::to_owned),
+            etag: None,
+            last_modified: None,
+        }
+    }
+
     #[test]
     fn test_plan_chunks_even() {
         let chunks = plan_chunks_with_count(1000, 4);
@@ -222,5 +283,58 @@ mod tests {
         for i in 1..chunks.len() {
             assert_eq!(chunks[i].start, chunks[i - 1].end + 1);
         }
+    }
+
+    #[test]
+    fn a_suggested_name_lands_beside_the_path_we_already_resolved() {
+        assert_eq!(
+            suggested_output_path("/tmp/dl/download", &suggesting(Some("movie.mkv")), false)
+                .as_deref(),
+            Some("/tmp/dl/movie.mkv")
+        );
+    }
+
+    /// The directory is ours to choose, not the server's. `inspect` sanitises
+    /// too, but this is the line that turns a name into a path.
+    #[test]
+    fn a_suggested_name_cannot_move_the_download_to_another_directory() {
+        assert_eq!(
+            suggested_output_path(
+                "/tmp/dl/download",
+                &suggesting(Some("../../../etc/cron.d/rdm")),
+                false,
+            )
+            .as_deref(),
+            Some("/tmp/dl/rdm")
+        );
+        assert_eq!(
+            suggested_output_path("/tmp/dl/download", &suggesting(Some("/etc/shadow")), false)
+                .as_deref(),
+            Some("/tmp/dl/shadow")
+        );
+    }
+
+    #[test]
+    fn a_name_the_user_chose_is_never_second_guessed() {
+        assert_eq!(
+            suggested_output_path("/tmp/dl/mine", &suggesting(Some("theirs.mkv")), true),
+            None
+        );
+        // Nor is one the URL already gave an extension to.
+        assert_eq!(
+            suggested_output_path("/tmp/dl/file.zip", &suggesting(Some("theirs.mkv")), false),
+            None
+        );
+        // Nothing suggested, nothing to reconsider.
+        assert_eq!(
+            suggested_output_path("/tmp/dl/download", &suggesting(None), false),
+            None
+        );
+        // A suggestion with nothing usable in it is dropped rather than
+        // turned into a guess.
+        assert_eq!(
+            suggested_output_path("/tmp/dl/download", &suggesting(Some("..")), false),
+            None
+        );
     }
 }

@@ -17,10 +17,12 @@
 //! - `output`: reconciling the requested path with what is already on disk.
 //! - `streaming`: the fallback for servers that do not report a size.
 //! - `url`: download-URL normalisation and filename extraction.
+//! - `name`: reducing a server-supplied filename to one safe component.
 //! - `client`: the shared HTTP client and configuration.
 
 mod client;
 mod download;
+mod name;
 mod output;
 mod request;
 mod run;
@@ -28,6 +30,7 @@ mod streaming;
 mod url;
 
 pub use download::download;
+pub use name::safe_filename;
 pub use output::resolve_existing_output;
 pub use request::{DownloadRequest, ExistingPolicy, Outcome, OutputDecision};
 pub use run::{run_download, run_download_with_client, run_download_with_identity};
