@@ -13,11 +13,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::engine;
 use crate::hoster::{gdrive, onedrive, pixeldrain};
 use crate::mega;
 use crate::net;
 use crate::queue;
+use crate::safe_path;
 use crate::scrape;
 use crate::ui;
 
@@ -171,10 +171,12 @@ pub async fn run(
         return Ok(());
     }
 
-    let remote_decoded: HashSet<String> = files
-        .iter()
-        .map(|f| engine::percent_decode(&f.relative_path))
-        .collect();
+    // Already decoded exactly once, by the scraper. Decoding here as well is
+    // what let `%252F...` become an absolute path, and it also meant this set
+    // was built from differently-decoded strings than the ones actually
+    // written to disk, so `--delete` was comparing two different alphabets.
+    let remote_decoded: HashSet<String> =
+        files.iter().map(|f| f.relative_path.clone()).collect();
 
     let sync_root_result = derive_sync_root(cfg, &files);
 
@@ -195,7 +197,20 @@ pub async fn run(
     let mut to_download: Vec<(String, String)> = Vec::new();
 
     for f in &files {
-        let path = local_path(cfg, &f.relative_path);
+        // The guarded join. An entry that cannot be placed beneath the
+        // download directory is skipped rather than written anyway.
+        let path = match local_path(cfg, &f.relative_path) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "  \u{26a0} Skipping unsafe entry {}: {:#}",
+                    ui::terminal_safe(&f.relative_path),
+                    e
+                );
+                continue;
+            }
+        };
+
         match std::fs::metadata(&path) {
             Ok(m) if m.is_file() && m.len() > 0 => {
                 needs_head.push((f.url.clone(), f.relative_path.clone(), path, m.len()));
@@ -291,9 +306,12 @@ pub async fn run(
         eprintln!();
         print_sample(
             "+",
+            // Already decoded by the scraper, so this only has to be made
+            // safe to draw: a listing controls these strings, and an ESC in
+            // one of them would repaint the preview.
             to_download
                 .iter()
-                .map(|(_, relative)| engine::percent_decode(relative)),
+                .map(|(_, relative)| ui::terminal_safe(relative)),
             to_download.len(),
         );
     }
@@ -306,25 +324,49 @@ pub async fn run(
     eprintln!();
 
     if !to_download.is_empty() {
-        for (_, relative) in &to_download {
-            let path = local_path(cfg, relative);
-            let _ = std::fs::remove_file(&path);
+        // Resolve each destination once and reuse it for the delete, the
+        // mkdir and the queue hand-off. This used to be resolved separately in
+        // three places, which is how the local file that got deleted and the
+        // path that got written could disagree.
+        let mut resolved: Vec<(String, PathBuf)> = Vec::with_capacity(to_download.len());
+        for (file_url, relative) in &to_download {
+            match local_path(cfg, relative) {
+                Ok(path) => resolved.push((file_url.clone(), path)),
+                Err(e) => {
+                    eprintln!(
+                        "  \u{26a0} Skipping unsafe entry {}: {:#}",
+                        ui::terminal_safe(relative),
+                        e
+                    );
+                }
+            }
+        }
+
+        for (_, path) in &resolved {
+            let _ = std::fs::remove_file(path);
             let _ = std::fs::remove_file(format!("{}.part", path.display()));
             let meta = crate::resume::ResumeMetadata::meta_path(&path.to_string_lossy());
             let _ = std::fs::remove_file(&meta);
         }
 
-        for (_, relative) in &to_download {
-            let path = local_path(cfg, relative);
+        for (_, path) in &resolved {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
         }
 
         queue::Queue::locked(|q| {
-            for (file_url, relative) in &to_download {
-                let decoded = engine::percent_decode(relative);
-                q.add_with_scope(file_url.clone(), Some(decoded), Some(connections), allow_private);
+            for (file_url, path) in &resolved {
+                // The already-resolved absolute destination, so the queue has
+                // nothing left to decode or re-resolve. It is also exactly the
+                // path removed above, which matters because the removal
+                // happens before the replacement is queued.
+                q.add_with_scope(
+                    file_url.clone(),
+                    Some(path.to_string_lossy().into_owned()),
+                    Some(connections),
+                    allow_private,
+                );
             }
             Ok(())
         })?;
@@ -377,7 +419,11 @@ pub async fn run(
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
                         delete_failed += 1;
-                        progress.note(&format!("  \u{26a0} Failed to delete {}: {}", relative, e));
+                        progress.note(&format!(
+                            "  \u{26a0} Failed to delete {}: {}",
+                            ui::terminal_safe(relative),
+                            e
+                        ));
                     }
                 }
                 progress.tick();
@@ -431,6 +477,13 @@ async fn verify_remote_size(policy: &net::Policy, url: &str, local_size: u64) ->
     }
 }
 
+/// The local directory the mirror is rooted at: the download directory plus
+/// the listing's common first component.
+///
+/// The component is *not* decoded here. The scraper already decoded it exactly
+/// once, and decoding again is what let a listing name the root anywhere on the
+/// filesystem — which mattered more here than anywhere else, because
+/// `--delete` walks this directory and removes what it finds.
 fn derive_sync_root(cfg: &Config, files: &[scrape::DiscoveredFile]) -> SyncRoot {
     let first = match files.first() {
         Some(f) => f,
@@ -446,6 +499,8 @@ fn derive_sync_root(cfg: &Config, files: &[scrape::DiscoveredFile]) -> SyncRoot 
     {
         return SyncRoot::MixedRoots;
     }
-    let decoded_prefix = engine::percent_decode(prefix);
-    SyncRoot::Ok(cfg.resolve_output_path(&decoded_prefix))
+    match safe_path::resolve_under(Path::new(&cfg.download_dir), prefix) {
+        Ok(root) => SyncRoot::Ok(root.to_string_lossy().into_owned()),
+        Err(_) => SyncRoot::Empty,
+    }
 }
