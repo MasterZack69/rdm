@@ -149,9 +149,35 @@ mod tests {
 
     /// `%252F` decodes once to `%2F`, which is not a separator. It used to be
     /// decoded twice, and the second decode made it one.
+    ///
+    /// So the folder really is *named* `%2Fetc%2Fcron.d`. Ugly, and inert —
+    /// and that, not a rejection, is the property worth pinning: one decode
+    /// leaves a single component, and nothing downstream decodes it again.
+    /// `path.rs` asserts the same thing one layer lower down, in
+    /// `double_encoded_paths_decode_once_and_stay_relative`.
     #[test]
     fn a_double_encoded_separator_cannot_name_the_folder() {
-        assert_eq!(derive_folder_name(&u("http://x.com/%252Fetc%252Fcron.d/")), "download");
-        assert_eq!(derive_folder_name(&u("http://x.com/my%20files/")), "my files");
+        let name = derive_folder_name(&u("http://x.com/%252Fetc%252Fcron.d/"));
+        assert_eq!(name, "%2Fetc%2Fcron.d");
+        assert!(!name.contains('/'), "gained a separator: {name}");
+        assert_eq!(
+            std::path::Path::new(&name).components().count(),
+            1,
+            "must stay one component: {name}"
+        );
+        assert!(
+            crate::safe_path::resolve_under(std::path::Path::new("/dl"), &name).is_ok(),
+            "must resolve under the download root: {name}"
+        );
+
+        // One layer in, `%2F` *is* a separator once decoded, and the component
+        // check refuses it rather than handing back a name containing one.
+        assert_eq!(derive_folder_name(&u("http://x.com/%2Fetc/")), "download");
+
+        // An ordinary encoded name still decodes exactly once.
+        assert_eq!(
+            derive_folder_name(&u("http://x.com/my%20files/")),
+            "my files"
+        );
     }
 }
