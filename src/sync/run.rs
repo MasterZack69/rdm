@@ -3,6 +3,15 @@
 //! The share paths are checked first and return early, so everything after
 //! them is the HTTP case: the only one that has to scrape a listing, and ask
 //! per file whether the local copy is still current.
+//!
+//! It is also the only path where the *shape* of a path is chosen remotely.
+//! Everywhere else rdm writes a filename the user gave it; here a listing can
+//! name nested directories. So every mkdir and every unlink below is
+//! root-anchored: it goes through [`crate::safe_file`], which walks each
+//! component against the previous directory descriptor with `O_NOFOLLOW`
+//! rather than handing a full pathname to the kernel to resolve. A
+//! `download_dir/album` that someone has replaced with a symlink to `~/.ssh`
+//! then fails at `album` instead of being traversed.
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -17,6 +26,7 @@ use crate::hoster::{gdrive, onedrive, pixeldrain};
 use crate::mega;
 use crate::net;
 use crate::queue;
+use crate::safe_file;
 use crate::safe_path;
 use crate::scrape;
 use crate::ui;
@@ -211,6 +221,9 @@ pub async fn run(
             }
         };
 
+        // Read-only, and it only decides whether to send a HEAD. Left on the
+        // full pathname deliberately: nothing is written or removed through
+        // it, so the descriptor walk would be churn for no gain.
         match std::fs::metadata(&path) {
             Ok(m) if m.is_file() && m.len() > 0 => {
                 needs_head.push((f.url.clone(), f.relative_path.clone(), path, m.len()));
@@ -324,14 +337,21 @@ pub async fn run(
     eprintln!();
 
     if !to_download.is_empty() {
+        let root = Path::new(&cfg.download_dir);
+
         // Resolve each destination once and reuse it for the delete, the
         // mkdir and the queue hand-off. This used to be resolved separately in
         // three places, which is how the local file that got deleted and the
         // path that got written could disagree.
-        let mut resolved: Vec<(String, PathBuf)> = Vec::with_capacity(to_download.len());
+        //
+        // The root-relative form is kept alongside the absolute one because
+        // the removals and the mkdir below are performed relative to the
+        // download root by descriptor walk, not by pathname.
+        let mut resolved: Vec<(String, String, PathBuf)> =
+            Vec::with_capacity(to_download.len());
         for (file_url, relative) in &to_download {
             match local_path(cfg, relative) {
-                Ok(path) => resolved.push((file_url.clone(), path)),
+                Ok(path) => resolved.push((file_url.clone(), relative.clone(), path)),
                 Err(e) => {
                     eprintln!(
                         "  \u{26a0} Skipping unsafe entry {}: {:#}",
@@ -342,21 +362,55 @@ pub async fn run(
             }
         }
 
-        for (_, path) in &resolved {
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_file(format!("{}.part", path.display()));
-            let meta = crate::resume::ResumeMetadata::meta_path(&path.to_string_lossy());
-            let _ = std::fs::remove_file(&meta);
+        // These removals are why the walk matters here rather than only at the
+        // open: sync deletes the file selected for redownload *before* queueing
+        // its replacement, so a redirected unlink destroys someone else's file
+        // and a redirected create then writes over the hole. Missing files are
+        // the normal case, so failures stay ignored.
+        for (_, relative, _) in &resolved {
+            let relative = Path::new(relative);
+            let _ = safe_file::unlink_beneath(root, relative);
+            let _ = safe_file::unlink_beneath(root, &with_suffix(relative, ".part"));
+            let _ = safe_file::unlink_beneath(root, &with_suffix(relative, ".rdm"));
         }
 
-        for (_, path) in &resolved {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
+        // mkdir per component against a held descriptor. `openat2` has no
+        // directory-creating mode, so this is the only way the intermediate
+        // components can be created without a pathname resolution in the
+        // middle of it.
+        let mut resolved: Vec<(String, String, PathBuf)> = resolved
+            .into_iter()
+            .filter(|(_, relative, _)| {
+                let Some(parent) = Path::new(relative).parent() else {
+                    return true;
+                };
+
+                match safe_file::create_dirs_beneath(root, parent) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        // Previously `.ok()`, which meant a refusal here
+                        // surfaced later as a confusing open failure. A
+                        // refusal is the guard doing its job, so say so and
+                        // drop the entry.
+                        eprintln!(
+                            "  \u{26a0} Skipping {}: {:#}",
+                            ui::terminal_safe(relative),
+                            e
+                        );
+                        false
+                    }
+                }
+            })
+            .collect();
+        resolved.shrink_to_fit();
+
+        if resolved.is_empty() {
+            eprintln!("  \u{274c} No entries could be placed beneath the download directory");
+            return Ok(());
         }
 
         queue::Queue::locked(|q| {
-            for (file_url, path) in &resolved {
+            for (file_url, _, path) in &resolved {
                 // The already-resolved absolute destination, so the queue has
                 // nothing left to decode or re-resolve. It is also exactly the
                 // path removed above, which matters because the removal
@@ -404,33 +458,48 @@ pub async fn run(
         let mut delete_failed = 0u64;
 
         if let SyncRoot::Ok(ref root) = sync_root_result {
+            let root_path = Path::new(root);
             let progress = ui::CountProgress::new("Deleting orphans", to_delete.len());
 
             for relative in &to_delete {
-                let full_path = Path::new(root).join(relative);
-                match std::fs::remove_file(&full_path) {
-                    Ok(_) => {
+                // The most dangerous of the three: this walks a directory and
+                // removes what it finds. Joining onto the root and calling
+                // remove_file re-resolved every component, so one symlinked
+                // subdirectory turned a mirror cleanup into a deletion
+                // somewhere else entirely.
+                let relative = Path::new(relative);
+
+                match safe_file::unlink_beneath(root_path, relative) {
+                    Ok(()) => {
                         deleted += 1;
-                        let _ = std::fs::remove_file(format!("{}.part", full_path.display()));
-                        let meta =
-                            crate::resume::ResumeMetadata::meta_path(&full_path.to_string_lossy());
-                        let _ = std::fs::remove_file(&meta);
+                        let _ =
+                            safe_file::unlink_beneath(root_path, &with_suffix(relative, ".part"));
+                        let _ =
+                            safe_file::unlink_beneath(root_path, &with_suffix(relative, ".rdm"));
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
-                        delete_failed += 1;
-                        progress.note(&format!(
-                            "  \u{26a0} Failed to delete {}: {}",
-                            ui::terminal_safe(relative),
-                            e
-                        ));
+                        // An orphan that has already gone is not a failure.
+                        // The io::Error is still in the context chain, so the
+                        // kind survives being wrapped.
+                        let missing = e
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+
+                        if !missing {
+                            delete_failed += 1;
+                            progress.note(&format!(
+                                "  \u{26a0} Failed to delete {}: {:#}",
+                                ui::terminal_safe(&relative.to_string_lossy()),
+                                e
+                            ));
+                        }
                     }
                 }
                 progress.tick();
             }
 
             progress.finish(&format!("{} file(s) deleted", deleted));
-            remove_empty_dirs(Path::new(root));
+            remove_empty_dirs(root_path);
         }
 
         if delete_failed > 0 {
@@ -441,6 +510,24 @@ pub async fn run(
     eprintln!();
     eprintln!("  \u{2705} Sync complete!");
     Ok(())
+}
+
+/// Appends `suffix` to the final component of a relative path.
+///
+/// `.part` and `.rdm` are siblings of the destination, so they have to be
+/// named the same way it is: root-relative, so the descriptor walk applies to
+/// them too. Formatting `"{}.part"` onto a full pathname would put them back
+/// on the pathname-resolution route the rest of this module just left.
+fn with_suffix(relative: &Path, suffix: &str) -> PathBuf {
+    match relative.file_name() {
+        Some(name) => {
+            let mut name = name.to_os_string();
+            name.push(suffix);
+            relative.with_file_name(name)
+        }
+        // No final component means the walk will refuse it anyway.
+        None => relative.to_path_buf(),
+    }
 }
 
 enum HeadStatus {
