@@ -9,6 +9,7 @@ use crate::inspect;
 use crate::net;
 use crate::parallel;
 use crate::retry::RetryConfig;
+use crate::secret_url;
 use crate::ui::{self, ProgressSink, SlotState};
 
 use super::client::shared_config;
@@ -71,7 +72,11 @@ pub async fn download(
     };
 
     sink.state(SlotState::Inspecting);
-    sink.detail(&format!("Inspecting: {}", url));
+    // Redacted, and never `fetch_url`. When a hoster drives this path the URL
+    // it hands over is an API call carrying gdrive's `key=` parameter or
+    // OneDrive's `tempauth` signature, and `detail` goes to stderr, which ends
+    // up in scrollback, CI output and support captures.
+    sink.detail(&format!("Inspecting: {}", secret_url::redact(&url)));
 
     let info = inspect::inspect_url(client, &fetch_url).await?;
 
@@ -105,13 +110,15 @@ pub async fn download(
         None => output_path,
     };
 
-    // Unknown file size \u{2192} streaming fallback.
+    // Unknown file size → streaming fallback.
     let file_size = match info.size {
         Some(0) => anyhow::bail!("Cannot download empty file (Content-Length: 0)"),
         Some(s) => s,
         None => {
             sink.detail("File size : unknown (streaming)");
-            sink.detail(&format!("Output    : {}", output_path));
+            // The filename can have come from a listing or from a server's
+            // Content-Disposition, so it is made safe to draw.
+            sink.detail(&format!("Output    : {}", ui::terminal_safe(&output_path)));
             sink.total(None);
             sink.state(SlotState::Downloading);
 
@@ -146,7 +153,7 @@ pub async fn download(
             "not supported"
         }
     ));
-    sink.detail(&format!("Output    : {}", output_path));
+    sink.detail(&format!("Output    : {}", ui::terminal_safe(&output_path)));
 
     let chunks = if info.supports_range && connections > 1 {
         plan_chunks_with_count(file_size, connections as u32)
@@ -216,7 +223,7 @@ pub async fn download(
 /// Honoured only when the URL gave us no extension to work with and the user
 /// did not name the file themselves. The name is re-joined onto the parent of
 /// the path we already resolved, so an honoured suggestion can only ever land
-/// in the directory the download was already going to \u{2014} it can change the
+/// in the directory the download was already going to — it can change the
 /// filename, never the directory.
 fn suggested_output_path(
     output_path: &str,
