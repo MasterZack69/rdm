@@ -148,17 +148,12 @@ All optional, and mostly for when the config file is the wrong place — one run
 
 | Variable | Effect |
 |---|---|
-| `RDM_GDRIVE_API_KEY` | Overrides `gdrive_api_key` |
-| `RDM_PIXELDRAIN_API_KEY` | Overrides `pixeldrain_api_key` |
 | `RDM_MAX_FILE_BYTES` | Size ceiling for one streaming download. Default 64 GiB, `0` removes it |
 | `RDM_ALLOW_PRIVATE` | Same as `--allow-private` |
 | `RDM_ALLOW_PROXY` | Let `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` apply to RDM's requests |
 
-`RDM_ALLOW_PRIVATE` and `RDM_ALLOW_PROXY` are off unless set to `1`, `true`, `yes` or `on`. Setting either to nothing, or to `false`, leaves the protection on.
-
-`RDM_MAX_FILE_BYTES` only bites when a server refuses to say how big a file is, which is the one case where a download otherwise runs until the disk is full. A file that arrives with a size is checked against that size instead.
-
-`RDM_ALLOW_PROXY` is off because RDM connects to the address it resolved itself, and a proxy resolves the hostname on its own — so with one in front, where the bytes actually come from is the proxy's business rather than RDM's. It says so once, on stderr, when it is on.
+- `RDM_ALLOW_PRIVATE` and `RDM_ALLOW_PROXY` are off unless set to `1`, `true`, `yes` or `on`. Setting either to nothing, or to `false`, leaves the protection on.
+- `RDM_MAX_FILE_BYTES` only bites when a server refuses to say how big a file is.
 
 # Release
 Zack encourages you to build from source. As some random internet person once said, "Always build from source"
