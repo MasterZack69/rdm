@@ -28,15 +28,15 @@
 //!
 //! - A path the **user** gave us, via `-o` or `download_dir`. Every component
 //!   is trusted. `~/Downloads` may well be a symlink, and following it is the
-//!   whole point. [`open_guarded`] is for these.
+//!   whole point. [`open_guarded`] handles these.
 //! - A path the **network** gave us: a relative path from a directory
 //!   listing, joined onto the download root. No component is trusted, because
 //!   a listing can name a directory that a local attacker has replaced with a
-//!   symlink. [`open_beneath`] and friends are for these.
+//!   symlink. [`open_beneath`] and friends handle these.
 //!
-//! Conflating the two was a real hole. [`open_guarded`] splits a path into
-//! parent and final component, opens the parent by full pathname, and applies
-//! the symlink guard only to the last part. Given a download root containing
+//! Conflating the two was a real hole. Splitting a path into parent and final
+//! component, opening the parent by full pathname, and applying the symlink
+//! guard only to the last part means that given a download root containing
 //! `album -> ~/.ssh` and a listing offering `album/authorized_keys`, the
 //! directory descriptor is already inside `~/.ssh` before any guard runs. The
 //! final component is then guarded perfectly, in the wrong directory.
@@ -71,11 +71,27 @@
 //!
 //! Every descriptor is then validated with `fstat` — on the descriptor, never
 //! on the path, so there is nothing left to race.
+//!
+//! ## Why the root is registered rather than passed
+//!
+//! The download writers are handed a single absolute `output_path` and nothing
+//! else, by the queue. Threading a root argument down to them would mean
+//! storing it in `queue.json` as well, so that a resumed queue item still knew
+//! it — a persisted schema change, and four changed signatures, to express
+//! what is really one process-wide trust boundary that never varies within a
+//! run.
+//!
+//! So [`download_root`] is resolved once, and the pathname-taking entry points
+//! consult it: a path beneath the root is split and walked, a path outside it
+//! keeps the old behaviour. The effect is that protection is the default for
+//! every present and future call site, rather than something each one has to
+//! remember to opt into.
 
 use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[cfg(unix)]
 use std::ffi::{CString, OsStr};
@@ -92,6 +108,58 @@ pub const PRIVATE_FILE_MODE: u32 = 0o600;
 /// Permissions for directories created along an untrusted relative path.
 /// The process umask applies on top, as with `mkdir`.
 const DEFAULT_DIR_MODE: u32 = 0o755;
+
+static DOWNLOAD_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Pins the trusted download root explicitly.
+///
+/// Optional: [`download_root`] reads it from the config file on first use.
+/// This exists for a caller that already holds a [`crate::config::Config`] and
+/// would rather set it than have it re-read. Only the first call takes effect,
+/// because a trust boundary that can be moved mid-run is not one.
+pub fn set_download_root(root: Option<PathBuf>) {
+    let _ = DOWNLOAD_ROOT.set(root);
+}
+
+/// The directory beneath which paths are treated as untrusted in shape.
+///
+/// Read from `config.toml` directly rather than through
+/// [`crate::config::Config::load`], which writes a default config file when
+/// none exists. Deciding where the trust boundary is must not have side
+/// effects, and certainly must not be the thing that creates a file. The value
+/// is the same; only the write is skipped.
+fn download_root() -> Option<&'static Path> {
+    DOWNLOAD_ROOT
+        .get_or_init(|| {
+            let configured = std::fs::read_to_string(crate::config::config_path())
+                .ok()
+                .and_then(|text| toml::from_str::<crate::config::Config>(&text).ok())
+                .map(|cfg| cfg.download_dir);
+
+            let dir = PathBuf::from(
+                configured.unwrap_or_else(|| crate::config::Config::default().download_dir),
+            );
+
+            (!dir.as_os_str().is_empty()).then_some(dir)
+        })
+        .as_deref()
+}
+
+/// The part of `path` that lies inside `root`, if it does.
+///
+/// Lexical, and deliberately so: the paths compared here were built by joining
+/// onto the configured `download_dir` string, so they share it verbatim.
+/// Canonicalising first would resolve the very symlinks the caller is about to
+/// refuse to follow.
+///
+/// Split out as a plain function because the registered root is a set-once
+/// cell, which cannot be rebound per test when the suite shares a process.
+fn split_beneath<'a>(root: &Path, path: &'a Path) -> Option<&'a Path> {
+    let relative = path.strip_prefix(root).ok()?;
+
+    // The root itself is not a file within the root.
+    (!relative.as_os_str().is_empty()).then_some(relative)
+}
 
 /// How a [`open_guarded`] call should treat an existing file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,18 +187,18 @@ pub enum Access {
     Append,
 }
 
-/// Opens `path` without following a symlink at its **final** component.
+/// Opens `path` for writing, without following a symlink to get there.
 ///
-/// Only for paths the user chose in full — an explicit `-o`, or a temp file
-/// alongside one. The parent pathname is resolved normally, following
-/// symlinks, because `~/Downloads` being a symlink is legitimate.
+/// If `path` lies beneath the download root, every component below the root is
+/// walked with `O_NOFOLLOW` — the same treatment [`open_beneath`] gives, since
+/// a path under the root may have been shaped by a listing.
 ///
-/// That makes this the wrong function for anything a directory listing named.
-/// A remote entry `album/authorized_keys` would have its parent `album`
-/// followed wherever it points before the guard on `authorized_keys` applied.
-/// Use [`open_beneath`] for those, which trusts only the root.
+/// Otherwise only the final component is guarded and the parent pathname is
+/// resolved normally. That is correct for a path the user named in full, such
+/// as an explicit `-o`: they chose every directory in it, and `~/Downloads`
+/// being a symlink is legitimate.
 pub fn open_guarded(path: &Path, existing: Existing, access: Access, mode: u32) -> Result<File> {
-    let file = open_impl(path, existing, access, mode)
+    let file = open_anywhere(path, existing, access, mode)
         .with_context(|| format!("Failed to safely open {}", path.display()))?;
 
     validate_regular_owned(&file)
@@ -240,7 +308,7 @@ pub fn create_temp_in(dir: &Path, prefix: &str, mode: u32) -> Result<(File, Path
     for _ in 0..8 {
         let candidate = dir.join(format!("{}.{}.part", prefix, random_token()));
 
-        match open_impl(&candidate, Existing::Reject, Access::ReadWrite, mode) {
+        match open_anywhere(&candidate, Existing::Reject, Access::ReadWrite, mode) {
             Ok(file) => {
                 validate_regular_owned(&file).with_context(|| {
                     format!("Refusing to write to {}", candidate.display())
@@ -266,13 +334,20 @@ pub fn create_temp_in(dir: &Path, prefix: &str, mode: u32) -> Result<(File, Path
 /// rename, which replaces a file created in between. `RENAME_NOREPLACE` makes
 /// the check and the rename one operation.
 ///
-/// Both paths are resolved normally, so this shares [`open_guarded`]'s
-/// assumption that the directories are the user's. Use [`rename_beneath`] when
-/// either side came from a listing.
+/// When both sides are beneath the download root this goes through
+/// [`rename_beneath`], so the directories are reached by descriptor walk
+/// rather than re-resolved from a pathname.
 ///
 /// Use [`rename_replacing`] only where the user has actually approved an
 /// overwrite (`--force`, or an explicit redownload).
 pub fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
+    if let Some(root) = download_root()
+        && let Some(from_rel) = split_beneath(root, from)
+        && let Some(to_rel) = split_beneath(root, to)
+    {
+        return rename_beneath(root, from_rel, to_rel, false);
+    }
+
     #[cfg(target_os = "linux")]
     {
         match linux::renameat2_noreplace(from, to) {
@@ -308,6 +383,13 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
 
 /// Renames `from` over `to`, replacing it. Only for an approved overwrite.
 pub fn rename_replacing(from: &Path, to: &Path) -> Result<()> {
+    if let Some(root) = download_root()
+        && let Some(from_rel) = split_beneath(root, from)
+        && let Some(to_rel) = split_beneath(root, to)
+    {
+        return rename_beneath(root, from_rel, to_rel, true);
+    }
+
     std::fs::rename(from, to)
         .with_context(|| format!("Failed to move {} into place", from.display()))
 }
@@ -439,6 +521,25 @@ fn random_bytes() -> [u8; 16] {
     buf[..8].copy_from_slice(&a);
     buf[8..].copy_from_slice(&b);
     buf
+}
+
+/// Opens a path, using the descriptor walk when it is beneath the root.
+///
+/// The single place the two path kinds are told apart. Returns `io::Result` so
+/// that [`create_temp_in`] can still recognise `AlreadyExists` and retry.
+fn open_anywhere(
+    path: &Path,
+    existing: Existing,
+    access: Access,
+    mode: u32,
+) -> io::Result<File> {
+    if let Some(root) = download_root()
+        && let Some(relative) = split_beneath(root, path)
+    {
+        return open_beneath_impl(root, relative, existing, access, mode);
+    }
+
+    open_impl(path, existing, access, mode)
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +841,9 @@ impl OwnedFd {
 
         if create {
             // SAFETY: self.fd is open and c_name is NUL-terminated.
-            let rc = unsafe { libc::mkdirat(self.fd, c_name.as_ptr(), DEFAULT_DIR_MODE as libc::mode_t) };
+            let rc = unsafe {
+                libc::mkdirat(self.fd, c_name.as_ptr(), DEFAULT_DIR_MODE as libc::mode_t)
+            };
             if rc != 0 {
                 let e = io::Error::last_os_error();
                 if e.raw_os_error() != Some(libc::EEXIST) {
@@ -1456,5 +1559,45 @@ mod tests {
             .is_err()
         );
         assert!(victim.exists(), "a file outside the root was renamed");
+    }
+
+    // ---------- Which paths count as being inside the root ----------
+
+    /// The containment test the pathname-taking entry points use to decide
+    /// whether a path needs the walk. Tested directly because the registered
+    /// root is set once per process and cannot be rebound per test.
+    #[test]
+    fn paths_inside_the_root_are_split_and_others_are_left_alone() {
+        let root = Path::new("/home/user/Downloads");
+
+        assert_eq!(
+            split_beneath(root, Path::new("/home/user/Downloads/file.mkv")),
+            Some(Path::new("file.mkv"))
+        );
+        assert_eq!(
+            split_beneath(root, Path::new("/home/user/Downloads/show/s01/e01.mkv")),
+            Some(Path::new("show/s01/e01.mkv"))
+        );
+        // The `.part` and `.rdm` siblings have to be recognised too, or the
+        // temp files would keep the old treatment.
+        assert_eq!(
+            split_beneath(root, Path::new("/home/user/Downloads/show/e01.mkv.part")),
+            Some(Path::new("show/e01.mkv.part"))
+        );
+
+        // An explicit -o elsewhere: the user named every component, so it
+        // keeps the trusted-parent treatment rather than being refused.
+        assert_eq!(split_beneath(root, Path::new("/tmp/out.zip")), None);
+
+        // The root itself is not a file in the root.
+        assert_eq!(split_beneath(root, Path::new("/home/user/Downloads")), None);
+
+        // A sibling directory that merely starts with the same characters is
+        // not inside it. This is why the check is component-wise rather than
+        // a string prefix.
+        assert_eq!(
+            split_beneath(root, Path::new("/home/user/Downloads-old/file.mkv")),
+            None
+        );
     }
 }
