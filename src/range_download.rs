@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, header};
 use std::io::SeekFrom;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio_util::sync::CancellationToken;
 
 use crate::retry::{TransientError, is_transient_status};
+use crate::safe_file::{self, Access, Existing};
 
 #[derive(Debug)]
 pub enum DownloadStatus {
@@ -88,14 +89,21 @@ pub async fn download_range(
         validate_content_range(response.headers(), effective_start, end)?;
     }
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(file_path)
-        .await
-        .with_context(|| format!("Failed to open file: {}", file_path))?;
+    // `<output>.part` is a predictable name in a directory the user may share,
+    // and every chunk worker opens it. An ordinary open follows a symlink at
+    // the final component, so a planted link turned these offset writes into
+    // writes through to another file. `open_guarded` resolves once relative to
+    // the directory, refuses to traverse a symlink, and fstats the descriptor
+    // to confirm a regular file this process owns.
+    let file = safe_file::open_guarded(
+        Path::new(file_path),
+        Existing::Open,
+        Access::ReadWrite,
+        safe_file::DEFAULT_FILE_MODE,
+    )
+    .with_context(|| format!("Failed to open file: {}", file_path))?;
 
-    let mut file = BufWriter::with_capacity(2 * 512 * 1024, file);
+    let mut file = BufWriter::with_capacity(2 * 512 * 1024, tokio::fs::File::from_std(file));
 
     file.seek(SeekFrom::Start(effective_start))
         .await
