@@ -290,8 +290,10 @@ pub(super) async fn download_streaming(
     let ceiling: Option<u64> = declared_total.or_else(max_stream_bytes);
 
     // Room for what is known to be coming, before anything is opened.
+    // `available_bytes` answers `None` when it cannot tell, which is why the
+    // ceiling above is the real protection and this is the courtesy.
     if let Some(total) = declared_total
-        && let Ok(free) = safe_file::available_bytes(&dir)
+        && let Some(free) = safe_file::available_bytes(&dir)
     {
         let needed = total.saturating_sub(resume_offset);
         if free < needed.saturating_add(MIN_FREE_BYTES) {
@@ -326,16 +328,22 @@ pub(super) async fn download_streaming(
         safe_file::open_guarded(temp, Existing::Open, Access::Append, safe_file::DEFAULT_FILE_MODE)
             .context("Failed to open .part for append")?
     } else {
-        safe_file::open_guarded(
+        // Created if absent, which is the ordinary case. The truncate happens
+        // through the descriptor rather than by reopening the path, so there
+        // is no second resolution for anything to slip into.
+        let file = safe_file::open_guarded(
             temp,
-            Existing::Truncate,
+            Existing::Open,
             Access::ReadWrite,
             safe_file::DEFAULT_FILE_MODE,
         )
-        .context("Failed to create .part file")?
+        .context("Failed to create .part file")?;
+        file.set_len(0).context("Failed to truncate .part file")?;
+        file
     };
 
-    let mut writer = tokio::io::BufWriter::with_capacity(512 * 1024, tokio::fs::File::from_std(file));
+    let mut writer =
+        tokio::io::BufWriter::with_capacity(512 * 1024, tokio::fs::File::from_std(file));
     let mut stream = resp.bytes_stream();
     let mut downloaded: u64 = resume_offset;
     let mut bytes_since_flush: u64 = 0;
@@ -384,7 +392,7 @@ pub(super) async fn download_streaming(
                 // estimate, so free space is a question worth asking again.
                 if bytes_since_space_check >= SPACE_CHECK_INTERVAL {
                     bytes_since_space_check = 0;
-                    if let Ok(free) = safe_file::available_bytes(&dir)
+                    if let Some(free) = safe_file::available_bytes(&dir)
                         && free < MIN_FREE_BYTES
                     {
                         writer.flush().await.ok();
@@ -576,15 +584,20 @@ mod tests {
         for value in [
             "",
             "bytes",
-            "octets 0-99/100",     // wrong unit
-            "bytes 0-99",          // no total
-            "bytes 099/100",       // no dash
-            "bytes a-99/100",      // start is not a number
-            "bytes 0-b/100",       // end is not a number
-            "bytes 100-99/1000",   // inverted
-            "bytes 0-100/100",     // the part is bigger than the whole
+            "octets 0-99/100",   // wrong unit
+            "bytes 0-99",        // no total
+            "bytes 099/100",     // no dash
+            "bytes a-99/100",    // start is not a number
+            "bytes 0-b/100",     // end is not a number
+            "bytes 100-99/1000", // inverted
+            "bytes 0-100/100",   // the part is bigger than the whole
         ] {
-            assert_eq!(parse_content_range(value), None, "{:?} should not parse", value);
+            assert_eq!(
+                parse_content_range(value),
+                None,
+                "{:?} should not parse",
+                value
+            );
         }
     }
 
@@ -592,9 +605,8 @@ mod tests {
     /// are the answers it would have accepted.
     #[test]
     fn a_resume_needs_the_whole_range_to_agree() {
-        let resume = |cr: &str| {
-            resolve_resume_action(reqwest::StatusCode::PARTIAL_CONTENT, 4096, Some(cr))
-        };
+        let resume =
+            |cr: &str| resolve_resume_action(reqwest::StatusCode::PARTIAL_CONTENT, 4096, Some(cr));
 
         // Off by one byte at the start: the bytes would land at the wrong
         // offset and the file would be quietly corrupt.
