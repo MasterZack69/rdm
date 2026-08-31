@@ -144,7 +144,7 @@ Everything in the config is optional as they have their own defaults.
 
 # Environment
 
-All optional, and mostly for when the config file is the wrong place — one run, a CI job, or a machine you would rather not leave a key on.
+All optional, there are other hoster specific env variables which can find in the relevant hoster sections.
 
 | Variable | Effect |
 |---|---|
