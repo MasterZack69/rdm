@@ -605,7 +605,7 @@ fn walk_dirs(root: &Path, components: &[&OsStr], create: bool) -> io::Result<Own
 
 /// Splits a relative path into (directory components, final name).
 #[cfg(unix)]
-fn split_untrusted<'a>(relative: &'a Path) -> io::Result<(Vec<&'a OsStr>, &'a OsStr)> {
+fn split_untrusted(relative: &Path) -> io::Result<(Vec<&OsStr>, &OsStr)> {
     let mut components = untrusted_components(relative)?;
 
     let name = components.pop().ok_or_else(|| {
