@@ -19,6 +19,7 @@
 //! - `solo`, `board`, `count`, `spinner`: the four widgets above.
 //! - `compose`: the shared per-file line builder.
 //! - `format`: sizes, speeds, durations and bars.
+//! - `sanitize`: strips terminal control sequences from network-derived text.
 //!
 //! ## Rules this module must never break
 //!
@@ -36,6 +37,10 @@
 //!    second acquisition on the same thread deadlocks the whole download.
 //!    Beware of guards created inside a larger expression: they live until the
 //!    end of the *statement*, not the end of the sub-expression.
+//! 5. **Anything derived from the network goes through [`terminal_safe`]
+//!    before it is drawn.** A directory name, a hoster filename or an error
+//!    body can carry ESC or OSC sequences, and rules 1-3 only hold for text
+//!    the terminal draws rather than acts on. See `sanitize`.
 //!
 //! Everything writes to stderr and degrades to plain, scroll-safe output when
 //! stderr is not a TTY.
@@ -45,6 +50,7 @@ mod compose;
 mod count;
 mod format;
 mod rate;
+mod sanitize;
 mod sink;
 mod solo;
 mod spinner;
@@ -58,6 +64,7 @@ pub use format::{
     short_size, short_speed,
 };
 pub use rate::Rate;
+pub use sanitize::{terminal_safe, terminal_safe_or};
 pub use sink::{ProgressSink, Silent, SlotState, silent};
 pub use solo::SoloBar;
 pub use spinner::ScanSpinner;
