@@ -13,7 +13,7 @@ use rdm::args::{
 };
 use rdm::hoster::{dropbox, gdrive, gofile, onedrive, pixeldrain};
 use rdm::ui::{self, ProgressSink};
-use rdm::{config, engine, mega, queue, scrape, signal, sync};
+use rdm::{config, engine, mega, queue, scrape, secret_url, signal, sync};
 
 fn main() -> Result<()> {
     let args = Cli::parse();
@@ -792,7 +792,14 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
                     dropbox::Share::Folder => "Dropbox folder (zip)".to_owned(),
                 }
             } else {
-                engine::percent_decode(&url)
+                // The MEGA and Dropbox arms above already refuse to echo their
+                // links back, because the fragment and the `rlkey` are secrets.
+                // A generic URL is no different: a gdrive `key=`, a OneDrive
+                // tempauth or a signed CDN parameter all live in the query.
+                // Redact those, and sanitise rather than decode -- the decode
+                // that used to be here turned an encoded ESC in the URL into a
+                // real one on its way to the terminal.
+                ui::terminal_safe(&secret_url::redact(&url))
             };
             eprintln!("  \u{2705} Added #{}: {}", id, label);
         }
@@ -1176,7 +1183,13 @@ fn print_discovered(files: &[scrape::DiscoveredFile]) {
     eprintln!("  \u{1f4c1} Found {} file(s):", files.len());
     eprintln!();
     for file in files.iter().take(SAMPLE) {
-        eprintln!("     + {}", engine::percent_decode(&file.relative_path));
+        // `relative_path` was already percent-decoded once by the scraper, at
+        // the network trust boundary, and validated there as a single relative
+        // path. Decoding it a second time here was the bug: `%251B%255B2J`
+        // survives the scraper's decode as the inert text `%1B%5B2J`, and the
+        // decode that used to be on this line turned it into a real ESC[2J
+        // that erases the screen. Print what the scraper stored, sanitised.
+        eprintln!("     + {}", ui::terminal_safe(&file.relative_path));
     }
     if files.len() > SAMPLE {
         eprintln!("     \u{2026} and {} more", files.len() - SAMPLE);
@@ -1732,5 +1745,51 @@ mod tests {
                 .api_key
                 .is_none()
         );
+    }
+
+    // -- Network-derived text reaching the terminal --
+
+    /// The scraper decodes a listing path exactly once, at the trust boundary.
+    /// `print_discovered` used to decode it a second time, which is what turned
+    /// an encoded escape sequence into a live one.
+    #[test]
+    fn a_double_encoded_escape_never_reaches_the_terminal() {
+        // What the scraper stores after its single decode: still inert text.
+        let stored = engine::percent_decode("%251B%255B2J");
+        assert_eq!(stored, "%1B%5B2J");
+
+        // What `print_discovered` prints now.
+        let shown = ui::terminal_safe(&stored);
+        assert_eq!(shown, "%1B%5B2J");
+        assert!(!shown.contains('\u{1b}'), "escaped to the terminal: {shown:?}");
+
+        // What it printed before: the second decode is the whole bug.
+        let twice_decoded = engine::percent_decode(&stored);
+        assert!(
+            twice_decoded.contains('\u{1b}'),
+            "if this stops being true the comment above is stale, not wrong"
+        );
+
+        // And even if something does reach the sanitiser already decoded, it
+        // does not get through.
+        assert!(!ui::terminal_safe(&twice_decoded).contains('\u{1b}'));
+    }
+
+    /// The queue label is both printed and derived from a URL, so it has to
+    /// survive two different findings at once.
+    #[test]
+    fn a_queued_url_label_carries_no_secrets_and_no_escapes() {
+        let label = ui::terminal_safe(&secret_url::redact(
+            "https://cdn.example.com/f.zip?key=SUPERSECRETKEY&sig=abc123",
+        ));
+        assert!(!label.contains("SUPERSECRETKEY"), "leaked: {label}");
+        assert!(!label.contains("abc123"), "leaked: {label}");
+        // The label is still worth reading.
+        assert!(label.contains("cdn.example.com"), "unusable: {label}");
+
+        // An escape encoded in the URL stays encoded, and a live one is
+        // stripped either way.
+        assert!(!ui::terminal_safe(&secret_url::redact("http://x.com/%1B%5B2Jfake")).contains('\u{1b}'));
+        assert!(!ui::terminal_safe("\u{1b}[2Jspoofed").contains('\u{1b}'));
     }
 }
