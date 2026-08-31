@@ -66,9 +66,10 @@ mod tests {
     }
 
     fn cfg_with_dir(dir: &str) -> Config {
-        let mut cfg = Config::default();
-        cfg.download_dir = dir.to_owned();
-        cfg
+        Config {
+            download_dir: dir.to_owned(),
+            ..Default::default()
+        }
     }
 
     #[test]

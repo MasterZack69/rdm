@@ -167,10 +167,10 @@ impl Item {
             return cfg.resolve_output_path(&name);
         };
 
-        if is_plain_relative(output) {
-            if let Ok(path) = safe_path::resolve_under(Path::new(&cfg.download_dir), output) {
-                return path.to_string_lossy().into_owned();
-            }
+        if is_plain_relative(output)
+            && let Ok(path) = safe_path::resolve_under(Path::new(&cfg.download_dir), output)
+        {
+            return path.to_string_lossy().into_owned();
         }
 
         cfg.resolve_output_path(output)

@@ -391,6 +391,7 @@ mod tests {
     /// request can be made to say `PROXIED`, it went somewhere this crate did
     /// not choose.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_guarded_request_ignores_a_system_proxy() {
         let _lock = env_lock();
 

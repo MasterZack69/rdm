@@ -284,10 +284,10 @@ fn random_bytes() -> [u8; 16] {
     {
         use std::io::Read;
 
-        if let Ok(mut urandom) = File::open("/dev/urandom") {
-            if urandom.read_exact(&mut buf).is_ok() {
-                return buf;
-            }
+        if let Ok(mut urandom) = File::open("/dev/urandom")
+            && urandom.read_exact(&mut buf).is_ok()
+        {
+            return buf;
         }
     }
 
@@ -304,9 +304,7 @@ fn random_bytes() -> [u8; 16] {
     std::process::id().hash(&mut hasher);
     let a = hasher.finish().to_le_bytes();
 
-    let mut hasher2 = std::collections::hash_map::RandomState::new().build_hasher();
-    a.hash(&mut hasher2);
-    let b = hasher2.finish().to_le_bytes();
+    let b = std::collections::hash_map::RandomState::new().hash_one(a).to_le_bytes();
 
     buf[..8].copy_from_slice(&a);
     buf[8..].copy_from_slice(&b);
