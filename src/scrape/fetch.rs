@@ -5,11 +5,16 @@
 //! the caller to notice from `response.url()` that the answer came from
 //! somewhere else — by which point the internal service had been contacted
 //! and had replied, which is the entire SSRF.
+//!
+//! Every URL quoted in an error here is redacted first. A listing URL can
+//! carry a token in its query, these messages travel up an anyhow chain into
+//! a spinner note, and that note goes to stderr.
 
 use anyhow::{Context, Result};
 use reqwest::Url;
 
 use crate::net::redirect_location;
+use crate::secret_url;
 
 use super::limits::{MAX_HTML_BYTES, MAX_REDIRECTS};
 use super::parse::parse_links;
@@ -50,15 +55,18 @@ async fn fetch_following_redirects(
             .get(current.clone())
             .send()
             .await
-            .with_context(|| format!("Failed to fetch {}", current))?;
+            .with_context(|| format!("Failed to fetch {}", secret_url::redact(current.as_str())))?;
 
         let Some(location) = redirect_location(&response) else {
             return Ok((response, current));
         };
 
-        let mut next = current
-            .join(&location)
-            .with_context(|| format!("Unparseable redirect from {}", current))?;
+        let mut next = current.join(&location).with_context(|| {
+            format!(
+                "Unparseable redirect from {}",
+                secret_url::redact(current.as_str())
+            )
+        })?;
 
         next.set_fragment(None);
 
@@ -67,13 +75,19 @@ async fn fetch_following_redirects(
         }
 
         if !is_under_base(&next, base) {
-            anyhow::bail!("redirect escaped base scope: {}", next);
+            anyhow::bail!(
+                "redirect escaped base scope: {}",
+                secret_url::redact(next.as_str())
+            );
         }
 
         current = next;
     }
 
-    anyhow::bail!("too many redirects starting at {}", url)
+    anyhow::bail!(
+        "too many redirects starting at {}",
+        secret_url::redact(url.as_str())
+    )
 }
 
 pub(super) async fn fetch_and_parse(
@@ -152,6 +166,22 @@ mod tests {
             "application/xhtml+xml"
         );
         assert_eq!(extract_mime_essence(""), "");
+    }
+
+    /// The shape every error in this module quotes a URL through. A listing
+    /// behind a signed URL puts the signature in the query, and these
+    /// messages end up on stderr.
+    #[test]
+    fn a_url_quoted_in_an_error_carries_no_credentials() {
+        let quoted = secret_url::redact(
+            u("https://files.example.com/pub/?key=AIzaSyReal&tempauth=sig#frag").as_str(),
+        );
+        assert!(!quoted.contains("AIzaSyReal"), "got: {}", quoted);
+        assert!(!quoted.contains("sig"), "got: {}", quoted);
+        assert!(!quoted.contains("frag"), "got: {}", quoted);
+        // Still identifies which listing failed.
+        assert!(quoted.contains("files.example.com"), "got: {}", quoted);
+        assert!(quoted.contains("/pub/"), "got: {}", quoted);
     }
 
     // ---------- Redirects ----------
