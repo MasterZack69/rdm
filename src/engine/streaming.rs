@@ -6,10 +6,10 @@
 //!
 //! Two things this path cannot do, because there is no size to check against:
 //! trust a resume without proof, and write until the server stops. A resume is
-//! only accepted when the server states a range that agrees with what was
-//! asked for, and the body is only renamed into place when every stated byte
-//! arrived. Everything else restarts or fails, and the `.part` file is left
-//! alone so the next run can try again.
+//! only accepted when the server states a numeric total and a range that
+//! agrees with what was asked for, and the body is only renamed into place
+//! when every stated byte arrived. Everything else restarts or fails, and the
+//! `.part` file is left alone so the next run can try again.
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -64,6 +64,9 @@ pub struct ContentRange {
 /// `starts_with("bytes {offset}-")`, which read the start and nothing else: a
 /// server could state any end and any total, or state a total the range did not
 /// fit inside, and the bytes were appended regardless.
+///
+/// A `*` total parses to `total: None`, which is legal in the header and not
+/// good enough to resume on — see [`resolve_resume_action`].
 pub fn parse_content_range(value: &str) -> Option<ContentRange> {
     let rest = value.trim().strip_prefix("bytes ")?;
     let (range_part, total_part) = rest.split_once('/')?;
@@ -119,14 +122,22 @@ pub fn resolve_resume_action(
                     if range.start != existing_bytes {
                         return ResumeAction::Restart;
                     }
+                    // `*` is the absence of a total, not a small one. Without
+                    // a number here there is nothing to check the finished
+                    // file against, and the end of the range is not a
+                    // substitute: `bytes 4096-5000/*` followed by exactly 905
+                    // bytes satisfies every count that can be derived from
+                    // the response itself, and the result is a file 3 KiB
+                    // short of the real one wearing the final name.
+                    let Some(total) = range.total else {
+                        return ResumeAction::Restart;
+                    };
                     // The request was open-ended (`bytes=N-`), so an honest
                     // answer runs to the end of the file. A server offering a
                     // shorter slice is offering something that would be
                     // appended and then renamed as though it were the whole
                     // file.
-                    if let Some(total) = range.total
-                        && total != range.end + 1
-                    {
+                    if total != range.end + 1 {
                         return ResumeAction::Restart;
                     }
                     ResumeAction::Resume(existing_bytes)
@@ -209,9 +220,15 @@ pub(super) async fn download_streaming(
     };
 
     // Phase 1: Build and send (possibly ranged) request
+    //
+    // `without_url` on every one of these: reqwest puts the URL it was given
+    // into its own error Display, `context` keeps that error in the chain, and
+    // `{:#}` prints the chain. The URL is the fetch URL, which is where the
+    // gdrive `key=` and every signed parameter live.
     let resp = build_streaming_request(client, url, existing_bytes)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("GET request failed")?;
 
     let status = resp.status();
@@ -240,6 +257,7 @@ pub(super) async fn download_streaming(
                     .get(url)
                     .send()
                     .await
+                    .map_err(reqwest::Error::without_url)
                     .context("Fresh GET request failed")?;
                 if !fresh_resp.status().is_success() {
                     anyhow::bail!(
@@ -261,11 +279,14 @@ pub(super) async fn download_streaming(
         };
 
     // How big the finished file should be, when the server has said. On a
-    // resume that is the end of the range it agreed to; otherwise it is the
-    // length of the body it is about to send. It is checked again at the end,
-    // and the rename does not happen unless it matches.
+    // resume that is the total it stated — `resolve_resume_action` only
+    // returns `Resume` for a numeric total that equals `end + 1`, so this is
+    // a figure the server committed to rather than one inferred from the end
+    // of the range. Otherwise it is the length of the body it is about to
+    // send. It is checked again at the end, and the rename does not happen
+    // unless it matches.
     let declared_total: Option<u64> = if append {
-        declared_range.map(|range| range.end + 1)
+        declared_range.and_then(|range| range.total)
     } else {
         resp.content_length()
     };
@@ -408,7 +429,9 @@ pub(super) async fn download_streaming(
             }
             Some(Err(e)) => {
                 writer.flush().await.ok();
-                return Err(e).context(format!("Stream error at byte {}", downloaded));
+                // The stream error names the URL too.
+                return Err(e.without_url())
+                    .context(format!("Stream error at byte {}", downloaded));
             }
             None => break,
         }
@@ -568,7 +591,9 @@ mod tests {
                 total: Some(8192),
             })
         );
-        // An unknown total is legal and says nothing either way.
+        // An unknown total is legal in the header and says nothing either way.
+        // Whether it is good enough to resume on is a separate question, and
+        // the answer is no.
         assert_eq!(
             parse_content_range("bytes 0-99/*"),
             Some(ContentRange {
@@ -622,10 +647,31 @@ mod tests {
 
         // Right offset, and the range runs to the end of the file.
         assert_eq!(resume("bytes 4096-8191/8192"), ResumeAction::Resume(4096));
+    }
 
-        // Right offset, total unstated. Nothing contradicts the request, so
-        // this is allowed — the byte count is checked again after the body.
-        assert_eq!(resume("bytes 4096-8191/*"), ResumeAction::Resume(4096));
+    /// A `*` total is the absence of a size, and it used to be resumed on: the
+    /// expected size was then inferred as `end + 1`, so a server could pick
+    /// any end, send exactly that many bytes, and have the short file renamed
+    /// as finished. There is no number in the response to catch that with, so
+    /// the resume is refused instead. Restarting costs bandwidth; the
+    /// alternative costs the file.
+    #[test]
+    fn an_unknown_total_is_never_good_enough_to_resume_on() {
+        let resume =
+            |cr: &str| resolve_resume_action(reqwest::StatusCode::PARTIAL_CONTENT, 4096, Some(cr));
+
+        // The response from the finding. 905 bytes would have arrived and
+        // satisfied a 5001-byte expectation derived from the header itself.
+        assert_eq!(resume("bytes 4096-5000/*"), ResumeAction::Restart);
+
+        // Even a range that looks generous proves nothing without a total.
+        assert_eq!(resume("bytes 4096-8191/*"), ResumeAction::Restart);
+
+        // The header still parses; it is the resume decision that refuses it.
+        assert_eq!(
+            parse_content_range("bytes 4096-5000/*").map(|r| r.total),
+            Some(None)
+        );
     }
 
     // ---------- Limits ----------

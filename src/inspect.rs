@@ -71,11 +71,16 @@ fn extract_last_modified(headers: &header::HeaderMap) -> Option<String> {
 }
 
 pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
+    // `without_url` before `context`: a reqwest error prints the URL it was
+    // for, `context` keeps it in the chain, and `{:#}` walks the chain. The
+    // URL here is the fetch URL, which is where the gdrive `key=` and every
+    // signed parameter live.
     let resp = client
         .get(url)
         .header(header::RANGE, "bytes=0-0")
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("Request failed \u{2014} check the URL and your network connection")?;
 
     let status = resp.status();
@@ -122,6 +127,7 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         .head(url)
         .send()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("HEAD request failed \u{2014} check the URL and your network connection")?;
 
     let head_status = head_resp.status();
@@ -325,5 +331,23 @@ mod tests {
             filename_from_content_disposition(&headers).as_deref(),
             Some("real.zip")
         );
+    }
+
+    /// The whole error chain, not just the message this crate wrote.
+    ///
+    /// Port 1 needs root to bind, so nothing is listening on it and the
+    /// connection fails locally without any traffic leaving the machine. The
+    /// query string is what a gdrive fetch URL looks like, and reqwest's own
+    /// error Display is what used to repeat it.
+    #[tokio::test]
+    async fn a_failed_request_does_not_name_the_url_it_failed_on() {
+        let client = Client::new();
+        let error = inspect_url(&client, "http://127.0.0.1:1/f?key=SUPERSECRETKEY")
+            .await
+            .expect_err("nothing listens on port 1");
+
+        let chain = format!("{error:#}");
+        assert!(!chain.contains("SUPERSECRETKEY"), "leaked: {chain}");
+        assert!(!chain.contains("127.0.0.1"), "leaked: {chain}");
     }
 }
