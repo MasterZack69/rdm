@@ -56,7 +56,15 @@ pub async fn download_range(
             .header(header::RANGE, &range_value)
             .send() =>
         {
-            result.with_context(|| format!("Range GET failed for {}", range_value))?
+            // `without_url` before `context`: reqwest puts the URL into its
+            // own error Display, `context` keeps that error in the chain, and
+            // `{:#}` prints the chain. This is the retrying path -- the caller
+            // formats the error once per attempt -- so a gdrive fetch URL
+            // would have repeated its `key=` on every retry line. The byte
+            // range stays; it is not a secret.
+            result
+                .map_err(reqwest::Error::without_url)
+                .with_context(|| format!("Range GET failed for {}", range_value))?
         }
     };
 
@@ -167,7 +175,8 @@ pub async fn download_range(
             Some(Err(e)) => {
                 file.flush().await.ok();
                 chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
-                return Err(e).context(format!(
+                // The stream error names the URL as well.
+                return Err(e.without_url()).context(format!(
                     "Stream error at byte {} of range {}",
                     bytes_written, range_value,
                 ));
@@ -294,5 +303,29 @@ mod tests {
             HeaderValue::from_static("octets 0-99/100"),
         );
         assert!(validate_content_range(&h, 0, 99).is_err());
+    }
+
+    /// The chunk path retries, so this error text is printed once per attempt.
+    /// Port 1 needs root to bind, so nothing is listening and the connection
+    /// fails locally without traffic leaving the machine.
+    #[tokio::test]
+    async fn a_failed_range_request_does_not_name_the_url_it_failed_on() {
+        let progress = Arc::new(AtomicU64::new(0));
+        let error = download_range(
+            &Client::new(),
+            "http://127.0.0.1:1/f?key=SUPERSECRETKEY",
+            "/nonexistent-directory-for-rdm-test/x.part",
+            0,
+            1023,
+            0,
+            progress,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("nothing listens on port 1");
+
+        let chain = format!("{error:#}");
+        assert!(!chain.contains("SUPERSECRETKEY"), "leaked: {chain}");
+        assert!(!chain.contains("127.0.0.1"), "leaked: {chain}");
     }
 }
