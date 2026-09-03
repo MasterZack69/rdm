@@ -15,13 +15,19 @@
 //! judging each hop *before* the request that would follow it, and hands back a
 //! client pinned to the addresses it just cleared. A transfer running on that
 //! client cannot leave the authority it was built for.
+//!
+//! Two things are needed to make that pinning mean anything. The client must
+//! not hand the connection to a system proxy, which would resolve the name
+//! again on the other side; and nothing here may print a URL, because by this
+//! point it can carry an API key or a signed token.
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Url, header};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use super::scope::{ScopeGuard, parse_and_validate_url, parse_host_as_ip};
+use super::scope::{ScopeGuard, env_flag, parse_and_validate_url, parse_host_as_ip};
+use crate::secret_url;
 
 /// How many hops a chain may take before we stop believing it. The scraper's
 /// own budget, for the same reason.
@@ -39,15 +45,28 @@ pub struct Target {
     /// Never name the file on disk from this, and never store it as resume
     /// identity: a signed CDN URL differs every run, and the name the user
     /// asked for is the one they typed.
+    ///
+    /// Never print it either. This is the fetch URL, so it is the one carrying
+    /// `key=` or a `tempauth` signature; [`Target::display_url`] is the form
+    /// that is safe to show.
     pub url: Url,
     /// Pinned to the addresses cleared for `url`'s host, and unwilling to
     /// follow a redirect off it.
     pub client: reqwest::Client,
 }
 
+impl Target {
+    /// The destination in a form that can be shown to a person.
+    pub fn display_url(&self) -> String {
+        secret_url::redact(self.url.as_str())
+    }
+}
+
 impl std::fmt::Debug for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Target").field("url", &self.url).finish_non_exhaustive()
+        // Redacted, because `{:?}` on a struct holding this ends up in error
+        // reports and log lines like anything else.
+        f.debug_struct("Target").field("url", &self.display_url()).finish_non_exhaustive()
     }
 }
 
@@ -95,7 +114,9 @@ impl Policy {
                 .timeout(PROBE_TIMEOUT)
                 .send()
                 .await
-                .with_context(|| format!("Failed to reach {}", current))?;
+                // Redacted: a failure to reach a signed CDN URL would
+                // otherwise print the signature, and this error is displayed.
+                .with_context(|| format!("Failed to reach {}", secret_url::redact(current.as_str())))?;
 
             let Some(location) = redirect_location(&response) else {
                 return Ok((
@@ -112,7 +133,7 @@ impl Policy {
 
             hops += 1;
             if hops > MAX_REDIRECTS {
-                bail!("Too many redirects starting at {}", url);
+                bail!("Too many redirects starting at {}", secret_url::redact(url));
             }
 
             // The policy below answers a hop off the authority with `stop`, so
@@ -121,7 +142,12 @@ impl Policy {
             let mut next = response
                 .url()
                 .join(&location)
-                .with_context(|| format!("Unparseable redirect from {}", response.url()))?;
+                .with_context(|| {
+                    format!(
+                        "Unparseable redirect from {}",
+                        secret_url::redact(response.url().as_str())
+                    )
+                })?;
             next.set_fragment(None);
 
             match next.scheme() {
@@ -167,6 +193,19 @@ impl Policy {
                 }
             }));
 
+        // Everything below this line pins the host to addresses that were
+        // judged — and a proxy would make that decide nothing at all, because
+        // the connection goes to the proxy and the *proxy* resolves the name.
+        // Its answer can differ from ours through split DNS, through a rebind
+        // on its side, or simply because it sits inside a network we cannot
+        // see. reqwest reads HTTP_PROXY, HTTPS_PROXY and ALL_PROXY unless it
+        // is told not to, so it is told not to.
+        if proxies_allowed() {
+            warn_about_proxies();
+        } else {
+            builder = builder.no_proxy();
+        }
+
         // Pin the name to the addresses just cleared. Without this the
         // connection performs its own lookup, and a record with a one-second
         // TTL can answer publicly for the check and privately for the connect.
@@ -180,6 +219,26 @@ impl Policy {
 
         builder.build().context("Failed to build HTTP client")
     }
+}
+
+/// Whether the operator has asked, by name, for system proxies to be honoured.
+///
+/// Off by default, and it cannot be turned on by accident: this gives up the
+/// guarantee that the address checks above are worth anything, so the variable
+/// has to say `true` rather than merely exist.
+fn proxies_allowed() -> bool {
+    env_flag("RDM_ALLOW_PROXY")
+}
+
+/// Says once, out loud, what has been given up.
+fn warn_about_proxies() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "  \u{26a0} RDM_ALLOW_PROXY is set: requests go through the system proxy, which \
+             resolves hostnames itself \u{2014} rdm cannot enforce where they finally land."
+        );
+    });
 }
 
 /// The `Location` of a redirect response, if that is what this is.
@@ -237,6 +296,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         format!("http://{}", addr)
+    }
+
+    /// Serialises the tests that touch process-wide environment variables.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[tokio::test]
@@ -317,5 +382,85 @@ mod tests {
 
         let response = target.client.get(target.url.clone()).send().await.unwrap();
         assert_eq!(response.status().as_u16(), 307, "the hop must not be followed");
+    }
+
+    /// Pinning a name to judged addresses decides nothing if the connection is
+    /// handed to a proxy, because the proxy resolves the name itself and can
+    /// reach a different machine than the one that was cleared. A proxy that
+    /// answers everything with `PROXIED` stands in for that: if a guarded
+    /// request can be made to say `PROXIED`, it went somewhere this crate did
+    /// not choose.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_guarded_request_ignores_a_system_proxy() {
+        let _lock = env_lock();
+
+        let proxy = serve(Router::new().fallback(|| async { "PROXIED" })).await;
+        let origin = serve(Router::new().route("/file.bin", get(|| async { "payload" }))).await;
+        let file = format!("{}/file.bin", origin);
+
+        unsafe {
+            std::env::set_var("HTTP_PROXY", &proxy);
+            std::env::set_var("ALL_PROXY", &proxy);
+            std::env::remove_var("RDM_ALLOW_PROXY");
+        }
+
+        // reqwest reads the system proxy list once per process and caches it,
+        // so if an earlier client here already read it the variables set above
+        // are not live and there is nothing to prove. Establish that they *are*
+        // live with an unguarded client before asserting anything about a
+        // guarded one; otherwise this test would pass by doing nothing.
+        let unguarded = reqwest::Client::builder()
+            .build()
+            .unwrap()
+            .get(&file)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        if unguarded == "PROXIED" {
+            let target = Policy::new(true)
+                .resolve_target(&file)
+                .await
+                .expect("the origin answers");
+
+            let body = target
+                .client
+                .get(target.url.clone())
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                body, "payload",
+                "a guarded client must reach the pinned address, not the proxy"
+            );
+        }
+
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("ALL_PROXY");
+        }
+    }
+
+    /// The fetch URL is the one carrying `key=` and `tempauth`, and `{:?}` on
+    /// anything holding a Target ends up in logs.
+    #[test]
+    fn a_target_never_debug_prints_its_query() {
+        let target = Target {
+            url: Url::parse("https://www.googleapis.com/drive/v3/files/ID?alt=media&key=SECRET")
+                .unwrap(),
+            client: reqwest::Client::new(),
+        };
+
+        let shown = format!("{:?}", target);
+        assert!(!shown.contains("SECRET"), "got: {}", shown);
+        assert!(shown.contains("googleapis.com"), "got: {}", shown);
     }
 }

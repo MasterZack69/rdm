@@ -4,6 +4,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::chunk::Chunk;
+use crate::safe_file;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResumeMetadata {
@@ -105,6 +106,26 @@ pub fn create_new(url: String, file_size: u64, chunks: &[Chunk]) -> ResumeMetada
     }
 }
 
+/// Where a `.rdm` file's temporary twin should be created.
+///
+/// The directory the metadata itself lives in, so the rename that follows
+/// stays within one filesystem.
+fn temp_home(path: &str) -> (std::path::PathBuf, String) {
+    let target = std::path::Path::new(path);
+
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+
+    let prefix = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "rdm".to_owned());
+
+    (dir, prefix)
+}
+
 /// Writes the resume metadata, owner-readable only, via a temp file.
 ///
 /// The mode matters because `meta.url` is a credential for several of the
@@ -119,15 +140,22 @@ pub fn create_new(url: String, file_size: u64, chunks: &[Chunk]) -> ResumeMetada
 /// closes the window: after the rename there is never a moment where the
 /// `.rdm` is readable by anyone else. It also repairs a `.rdm` written by an
 /// earlier version, since the rename replaces the file outright.
+///
+/// The temp file's *name* used to be `<path>.tmp`, which anyone sharing the
+/// directory could predict and pre-empt with a symlink; the open followed it,
+/// so the write landed wherever the symlink pointed. It is now randomly named
+/// and created with `O_EXCL`, so a guessed name fails rather than being
+/// adopted, and nothing needs to find it again afterwards.
 pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
     let json = serde_json::to_string_pretty(meta).context("Failed to serialize resume metadata")?;
 
-    let tmp_path = format!("{}.tmp", path);
+    let (dir, prefix) = temp_home(path);
+
+    let (temp_file, tmp_path) = safe_file::create_temp_in(&dir, &prefix, safe_file::PRIVATE_FILE_MODE)
+        .with_context(|| format!("Failed to create temp file beside: {}", path))?;
 
     let write_result = async {
-        let mut file = crate::secret_file::create_async(std::path::Path::new(&tmp_path))
-            .await
-            .with_context(|| format!("Failed to create temp file: {}", tmp_path))?;
+        let mut file = fs::File::from_std(temp_file);
 
         file.write_all(json.as_bytes())
             .await
@@ -143,9 +171,9 @@ pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
 
         drop(file);
 
-        fs::rename(&tmp_path, path)
-            .await
-            .with_context(|| format!("Failed to rename '{}' to '{}'", tmp_path, path))?;
+        fs::rename(&tmp_path, path).await.with_context(|| {
+            format!("Failed to rename '{}' to '{}'", tmp_path.display(), path)
+        })?;
 
         let parent = std::path::Path::new(path)
             .parent()
@@ -175,15 +203,17 @@ pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
 ///
 /// Same owner-only mode as [`save_atomic`], and for the same reason: this is
 /// the path that runs every few seconds during a download, so it is the one
-/// that actually creates most `.rdm` files.
+/// that actually creates most `.rdm` files — and the one an attacker has the
+/// most chances to catch, which is why its temp file is randomly named too.
 pub async fn save_best_effort(path: &str, meta: &ResumeMetadata) -> Result<()> {
     let json = serde_json::to_string_pretty(meta).context("Failed to serialize resume metadata")?;
 
-    let tmp_path = format!("{}.tmp", path);
+    let (dir, prefix) = temp_home(path);
 
-    let mut file = crate::secret_file::create_async(std::path::Path::new(&tmp_path))
-        .await
-        .with_context(|| format!("Failed to create temp file: {}", tmp_path))?;
+    let (temp_file, tmp_path) = safe_file::create_temp_in(&dir, &prefix, safe_file::PRIVATE_FILE_MODE)
+        .with_context(|| format!("Failed to create temp file beside: {}", path))?;
+
+    let mut file = fs::File::from_std(temp_file);
 
     file.write_all(json.as_bytes())
         .await
@@ -195,7 +225,7 @@ pub async fn save_best_effort(path: &str, meta: &ResumeMetadata) -> Result<()> {
 
     fs::rename(&tmp_path, path)
         .await
-        .with_context(|| format!("Failed to rename '{}' to '{}'", tmp_path, path))?;
+        .with_context(|| format!("Failed to rename '{}' to '{}'", tmp_path.display(), path))?;
 
     Ok(())
 }
@@ -703,5 +733,33 @@ mod tests {
 
         let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// The temp file used to be `<path>.tmp`, which is guessable and was
+    /// opened through whatever it happened to point at. Nothing needs to find
+    /// it, so it is random now.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_at_the_old_temp_name_no_longer_catches_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("precious.txt");
+        std::fs::write(&victim, b"do not clobber").unwrap();
+
+        let meta_path = dir.path().join("movie.mkv.rdm");
+        let meta_path = meta_path.to_str().unwrap();
+
+        // Exactly the name the old code would have written through.
+        std::os::unix::fs::symlink(&victim, format!("{}.tmp", meta_path)).unwrap();
+
+        let chunks = sample_chunks();
+        let meta = create_new("https://example.com/file.bin".into(), 2000, &chunks);
+        save_atomic(meta_path, &meta).await.expect("save failed");
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"do not clobber",
+            "the planted symlink was followed"
+        );
+        assert_eq!(load(meta_path).await.unwrap(), meta);
     }
 }

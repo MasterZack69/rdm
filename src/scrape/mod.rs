@@ -7,6 +7,7 @@
 //! - SSRF via private/loopback/link-local addresses, whether the URL names
 //!   one outright or resolves to one
 //! - Redirects that escape the base scope, checked before the hop is made
+//! - System proxies, which would decide the destination themselves
 //! - Oversized response bodies
 //! - HTML parser false positives (script/style/comments, attribute boundaries)
 //! - Cross-directory duplicates
@@ -27,7 +28,8 @@
 //!
 //! ## Where a request is allowed to go
 //!
-//! Two rules, and the order of both matters more than their content.
+//! Three rules, and the order of the first two matters more than their
+//! content.
 //!
 //! Checking the host used to mean checking it only when it was already a
 //! literal IP, which is the one case an attacker never needs. A name is not a
@@ -40,6 +42,11 @@
 //! the internal service has been contacted and has answered, and refusing to
 //! parse the body does not un-send the request. Redirects are now followed by
 //! hand and every hop is checked before it is issued.
+//!
+//! And the client does not use a system proxy. Both rules above end in
+//! `resolve_to_addrs`, which pins the name to addresses this process checked;
+//! a proxy resolves the name again at the far end, where nothing has been
+//! checked, so the pinning would decide nothing at all.
 //!
 //! Public API preserved:
 //! - `pub struct DiscoveredFile { pub url: String, pub relative_path: String }`
@@ -59,11 +66,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+use crate::secret_url;
 use crate::ui;
 use fetch::fetch_and_parse;
 use limits::{CONCURRENCY, MAX_DEPTH, MAX_DIRS, MAX_FILES, REQUEST_TIMEOUT};
 use path::sanitize_relative_path;
-use scope::{parse_and_validate_url, parse_host_as_ip, ScopeGuard};
+use scope::{env_flag, parse_and_validate_url, parse_host_as_ip, ScopeGuard};
 use url_util::{derive_folder_name, directory_label, ensure_trailing_slash};
 
 // ---------- Public types ----------
@@ -71,6 +79,28 @@ use url_util::{derive_folder_name, directory_label, ensure_trailing_slash};
 pub struct DiscoveredFile {
     pub url: String,
     pub relative_path: String,
+}
+
+// ---------- Proxies ----------
+
+/// Whether the operator has explicitly asked for system proxies to be used.
+///
+/// Off unless someone says so, because a proxy silently takes over the part of
+/// this module that decides where a request may go.
+fn proxies_allowed() -> bool {
+    env_flag("RDM_ALLOW_PROXY")
+}
+
+/// Said once per process, not once per scan.
+fn warn_about_proxies() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "  ⚠ RDM_ALLOW_PROXY is set: scans go through the system proxy, which resolves \
+             hostnames itself. Local address checks cannot decide where a proxied request \
+             actually lands."
+        );
+    });
 }
 
 // ---------- Entry point ----------
@@ -97,6 +127,17 @@ pub async fn discover_files(
         // Followed by hand in `fetch_following_redirects` so that a hop is
         // checked before it is taken rather than after it has been answered.
         .redirect(reqwest::redirect::Policy::none());
+
+    // reqwest reads HTTP_PROXY, HTTPS_PROXY and ALL_PROXY from the environment
+    // by default. A proxy resolves the hostname at its end, so the address
+    // checks above and the pinning below would describe one destination while
+    // the request went to another — split DNS, a rebinding proxy, or simply a
+    // proxy that can reach the internal network.
+    if proxies_allowed() {
+        warn_about_proxies();
+    } else {
+        builder = builder.no_proxy();
+    }
 
     // Pin the name to the addresses that were just checked. Without this the
     // connection performs its own lookup, and a record with a short TTL can
@@ -185,7 +226,15 @@ pub async fn discover_files(
                 Ok(Some(r)) => r,
                 Ok(None) => continue,
                 Err(e) => {
-                    spinner.note(&format!(" ⚠ failed to scan {}: {:#}", dir_url, e));
+                    // Both halves of this line come off the network: the URL
+                    // can carry a token in its query, and the error chain
+                    // quotes URLs of its own. `note` sanitises what it is
+                    // given; redaction is this line's job.
+                    spinner.note(&format!(
+                        " ⚠ failed to scan {}: {:#}",
+                        secret_url::redact(dir_url.as_str()),
+                        e
+                    ));
                     continue;
                 }
             };

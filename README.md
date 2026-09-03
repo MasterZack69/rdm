@@ -142,6 +142,19 @@ pixeldrain_api_key = ""
 
 Everything in the config is optional as they have their own defaults.
 
+# Environment
+
+All optional, there are other hoster specific env variables which can find in the relevant hoster sections.
+
+| Variable | Effect |
+|---|---|
+| `RDM_MAX_FILE_BYTES` | Size ceiling for one streaming download. Default 64 GiB, `0` removes it |
+| `RDM_ALLOW_PRIVATE` | Same as `--allow-private` |
+| `RDM_ALLOW_PROXY` | Let `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` apply to RDM's requests |
+
+- `RDM_ALLOW_PRIVATE` and `RDM_ALLOW_PROXY` are off unless set to `1`, `true`, `yes` or `on`. Setting either to nothing, or to `false`, leaves the protection on.
+- `RDM_MAX_FILE_BYTES` only bites when a server refuses to say how big a file is.
+
 # Release
 Zack encourages you to build from source. As some random internet person once said, "Always build from source"
 NixOS users get a flake for easy installation :)

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::compose::compose;
 use super::rate::Rate;
+use super::sanitize::terminal_safe;
 use super::sink::{ProgressSink, SlotState};
 use super::term::{SOLO_TICK, draw_width, emit, is_tty, lock};
 use super::width::clip;
@@ -99,7 +100,14 @@ impl ProgressSink for SoloBar {
 
     fn detail(&self, msg: &str) {
         self.wipe();
-        eprintln!("{}", clip(&format!("  {}", msg), draw_width()));
+        // This is the line the finding follows to stderr: details quote
+        // server-supplied filenames, response snippets and error text, and
+        // stderr is redirected into logs. Sanitised here so that every caller
+        // of `detail` and `note` is covered by one place.
+        eprintln!(
+            "{}",
+            clip(&format!("  {}", terminal_safe(msg)), draw_width())
+        );
     }
 
     fn note(&self, msg: &str) {

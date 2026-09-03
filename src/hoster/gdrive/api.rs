@@ -12,6 +12,8 @@ use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::ui;
+
 use super::{
     API_FILES, APPS_PREFIX, DOCS_BASE, DirectLink, DocKind, FOLDER_MIME, GdriveOptions, Link,
     Listing, RemoteFile, Session, UC_ENDPOINT, WORKERS_MAX, fallback_name, parse_link,
@@ -46,6 +48,13 @@ struct FileList {
 /// request can have.
 const EMBEDDED_VIEW: &str = "https://drive.google.com/embeddedfolderview";
 
+/// Google's header for an API key, and the reason most of these URLs no longer
+/// carry a `key=` parameter.
+///
+/// A URL ends up in error messages, in whatever is logging the process, and in
+/// terminal scrollback. A header does not.
+const API_KEY_HEADER: &str = "X-goog-api-key";
+
 /// The point at which a folder page's listing stops being trustworthy.
 ///
 /// Not a documented number. The page renders a first batch and leaves the rest
@@ -57,12 +66,16 @@ const PAGE_LISTING_CAP: usize = 50;
 
 // ── URLs ─────────────────────────────────────────────────
 
-/// `files/<id>[/<action>]?key=…`, which every API URL here starts as.
+/// `files/<id>[/<action>]`, which every API URL here starts as.
 ///
 /// The id goes in through `path_segments_mut` rather than into a formatted
 /// string, so an id that is not what it claimed to be cannot walk out of the
 /// path it was given.
-fn files_url(api_key: &str, id: &str, action: Option<&str>) -> Result<Url> {
+///
+/// No longer appends the key. Requests this module sends itself carry it as an
+/// [`API_KEY_HEADER`] instead; the two URLs that leave for the download engine
+/// add it back themselves, and say why.
+fn files_url(id: &str, action: Option<&str>) -> Result<Url> {
     let mut url = Url::parse(API_FILES)?;
     {
         let mut path = url
@@ -73,13 +86,12 @@ fn files_url(api_key: &str, id: &str, action: Option<&str>) -> Result<Url> {
             path.push(action);
         }
     }
-    url.query_pairs_mut().append_pair("key", api_key);
     Ok(url)
 }
 
 /// What one item is, without fetching it.
-fn metadata_url(api_key: &str, id: &str) -> Result<Url> {
-    let mut url = files_url(api_key, id, None)?;
+fn metadata_url(id: &str) -> Result<Url> {
+    let mut url = files_url(id, None)?;
     url.query_pairs_mut()
         .append_pair("fields", "id,name,mimeType,size")
         .append_pair("supportsAllDrives", "true");
@@ -87,18 +99,30 @@ fn metadata_url(api_key: &str, id: &str) -> Result<Url> {
 }
 
 /// The bytes of an uploaded file.
+///
+/// The key stays in the query here. This URL is not fetched by this module: it
+/// is stored on a [`RemoteFile`] and handed to the download engine, which
+/// takes a URL and has no way to carry a header alongside it. What keeps the
+/// key out of the terminal is the redaction the engine applies before it
+/// displays or quotes a URL.
 fn media_url(api_key: &str, id: &str) -> Result<Url> {
-    let mut url = files_url(api_key, id, None)?;
+    let mut url = files_url(id, None)?;
     url.query_pairs_mut()
         .append_pair("alt", "media")
-        .append_pair("supportsAllDrives", "true");
+        .append_pair("supportsAllDrives", "true")
+        .append_pair("key", api_key);
     Ok(url)
 }
 
 /// A Google-native document, rendered into a real format.
+///
+/// Goes to the download engine like [`media_url`], and keeps its key for the
+/// same reason.
 fn api_export_url(api_key: &str, id: &str, mime: &str) -> Result<Url> {
-    let mut url = files_url(api_key, id, Some("export"))?;
-    url.query_pairs_mut().append_pair("mimeType", mime);
+    let mut url = files_url(id, Some("export"))?;
+    url.query_pairs_mut()
+        .append_pair("mimeType", mime)
+        .append_pair("key", api_key);
     Ok(url)
 }
 
@@ -133,10 +157,11 @@ pub(super) async fn metadata(
     id: &str,
     options: &GdriveOptions,
 ) -> Result<FileMeta> {
-    let url = metadata_url(&session.api_key, id)?;
+    let url = metadata_url(id)?;
     fetch_json(
         &session.client,
         url.as_str(),
+        &session.api_key,
         options.max_retries,
         "could not read the Drive item",
     )
@@ -222,8 +247,7 @@ pub(super) async fn walk(
                     .append_pair("fields", "nextPageToken,files(id,name,mimeType,size)")
                     .append_pair("pageSize", "1000")
                     .append_pair("supportsAllDrives", "true")
-                    .append_pair("includeItemsFromAllDrives", "true")
-                    .append_pair("key", &session.api_key);
+                    .append_pair("includeItemsFromAllDrives", "true");
                 if let Some(token) = &page_token {
                     query.append_pair("pageToken", token);
                 }
@@ -232,6 +256,7 @@ pub(super) async fn walk(
             let page: FileList = fetch_json(
                 &session.client,
                 url.as_str(),
+                &session.api_key,
                 options.max_retries,
                 "could not list a Drive folder",
             )
@@ -864,18 +889,32 @@ pub(super) async fn fetch(client: &Client, url: &str, retries: u32) -> Result<Re
 
 /// Sends a GET until it answers with JSON that parses.
 ///
+/// The key travels as [`API_KEY_HEADER`] rather than in the URL, so nothing
+/// this function quotes into an error can carry it.
+///
 /// The error handling earns its space: a key whose project has the Drive API
 /// switched off, a file nobody shared and a link that never existed all arrive
 /// as a bare status code, and the body is usually the only thing that says
 /// which.
-async fn fetch_json<T>(client: &Client, url: &str, retries: u32, what: &'static str) -> Result<T>
+async fn fetch_json<T>(
+    client: &Client,
+    url: &str,
+    api_key: &str,
+    retries: u32,
+    what: &'static str,
+) -> Result<T>
 where
     T: DeserializeOwned,
 {
     let mut last: Option<anyhow::Error> = None;
 
     for attempt in 0..retries.max(1) {
-        match client.get(url).send().await {
+        match client
+            .get(url)
+            .header(API_KEY_HEADER, api_key)
+            .send()
+            .await
+        {
             Ok(response) => {
                 let status = response.status();
                 match response.bytes().await {
@@ -949,6 +988,12 @@ fn explain(status: StatusCode, body: &[u8]) -> String {
 }
 
 /// As much of a body as belongs in an error message.
+///
+/// Every path that quotes a Google response body reaches a terminal through
+/// this function, so the control characters come out here: a body is network
+/// input like any other, and an error message is not a safe place to repeat it
+/// verbatim. Sanitising before the cut also means a removed escape cannot
+/// shift where the truncation lands.
 fn snippet(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -956,6 +1001,7 @@ fn snippet(body: &[u8]) -> String {
     if flat.is_empty() {
         return "<empty response>".to_owned();
     }
+    let flat = ui::terminal_safe(&flat);
     match flat.char_indices().nth(200) {
         Some((cut, _)) => format!("{}\u{2026}", &flat[..cut]),
         None => flat,

@@ -8,6 +8,23 @@ use anyhow::{Context, Result};
 use reqwest::Url;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+/// Reads a boolean environment variable, requiring an explicit affirmative.
+///
+/// The old test was `var_os(..).is_some()`, so the *presence* of the variable
+/// was the whole answer: `RDM_ALLOW_PRIVATE=` turned the private-address
+/// protection off, and so did `RDM_ALLOW_PRIVATE=false`, which reads in a
+/// shell profile or a CI file as though it were doing the opposite. A value
+/// has to say yes now, and an empty one does not.
+pub fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// Scheme and literal-address checks, which need no network.
 ///
 /// This is only half the check. A host that is a *name* cannot be judged here
@@ -25,7 +42,7 @@ pub fn parse_and_validate_url(s: &str, allow_private: bool) -> Result<Url> {
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
 
-    let skip_private_check = allow_private || std::env::var_os("RDM_ALLOW_PRIVATE").is_some();
+    let skip_private_check = allow_private || env_flag("RDM_ALLOW_PRIVATE");
 
     if !skip_private_check
         && let Some(ip) = parse_host_as_ip(host_str)
@@ -47,7 +64,7 @@ pub struct ScopeGuard {
 impl ScopeGuard {
     pub fn new(allow_private: bool) -> Self {
         Self {
-            allow_private: allow_private || std::env::var_os("RDM_ALLOW_PRIVATE").is_some(),
+            allow_private: allow_private || env_flag("RDM_ALLOW_PRIVATE"),
         }
     }
 
@@ -171,6 +188,40 @@ mod tests {
     /// whether RDM_ALLOW_PRIVATE happens to be set in the environment.
     fn guard(allow_private: bool) -> ScopeGuard {
         ScopeGuard { allow_private }
+    }
+
+    // ---------- Environment opt-in ----------
+
+    /// Uses a variable of its own rather than RDM_ALLOW_PRIVATE, because the
+    /// tests below remove that one and the two would race.
+    #[test]
+    fn an_env_flag_needs_an_explicit_yes() {
+        const NAME: &str = "RDM_TEST_SCOPE_FLAG";
+
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+        assert!(!env_flag(NAME), "unset is not an opt-in");
+
+        // The bug: presence alone used to be the whole test, so both of these
+        // turned the protection off.
+        for value in ["", " ", "false", "0", "no", "off"] {
+            unsafe {
+                std::env::set_var(NAME, value);
+            }
+            assert!(!env_flag(NAME), "{:?} must not be an opt-in", value);
+        }
+
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            unsafe {
+                std::env::set_var(NAME, value);
+            }
+            assert!(env_flag(NAME), "{:?} should be an opt-in", value);
+        }
+
+        unsafe {
+            std::env::remove_var(NAME);
+        }
     }
 
     // ---------- URL validation ----------

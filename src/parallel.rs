@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -12,6 +13,7 @@ use crate::chunk::Chunk;
 use crate::range_download::{self, DownloadStatus};
 use crate::resume::{self, ResumeMetadata};
 use crate::retry::{self, RetryConfig};
+use crate::safe_file::{self, Access, Existing};
 
 /// Groups all parameters needed for a parallel download session.
 pub struct ParallelDownloadCtx<'a> {
@@ -42,14 +44,25 @@ where
     let temp_path = format!("{}.part", ctx.output_path);
     let meta_path = ResumeMetadata::meta_path(ctx.output_path);
 
+    // Whether anything was at the destination before the transfer began.
+    // Whether to overwrite was settled further up, at the moment that question
+    // was asked; a file that appears while the download runs was never part of
+    // that decision, and the rename below will not take it.
+    let destination_existed = fs::symlink_metadata(ctx.output_path).await.is_ok();
+
     match parallel_inner(ctx, &temp_path, &meta_path, progress_callback).await {
         Ok(total) => {
             resume::delete(&meta_path).await?;
-            fs::rename(&temp_path, ctx.output_path)
-                .await
-                .with_context(|| {
-                    format!("Failed to rename '{}' to '{}'", temp_path, ctx.output_path)
-                })?;
+            let temp = Path::new(&temp_path);
+            let final_path = Path::new(ctx.output_path);
+            if destination_existed {
+                safe_file::rename_replacing(temp, final_path)
+            } else {
+                safe_file::rename_no_replace(temp, final_path)
+            }
+            .with_context(|| {
+                format!("Failed to rename '{}' to '{}'", temp_path, ctx.output_path)
+            })?;
             Ok(total)
         }
         Err(e) => Err(e),
@@ -261,36 +274,48 @@ async fn load_or_create_metadata(
     Ok(meta)
 }
 
+/// Brings the `.part` file to the right length, in a single open.
+///
+/// This used to stat the path, decide from the answer, and then open the path
+/// again to act on it: two resolutions of a name anyone sharing the directory
+/// can predict, with a gap in between, and both of them followed symlinks.
+/// Pointing `<output>.part` at another file meant the `set_len` truncated that
+/// file instead. `open_guarded` resolves once, relative to the directory,
+/// refuses to traverse a symlink at the final component, and fstats the
+/// descriptor to confirm a regular file this process owns. The size is then
+/// read and set through that same descriptor, so there is no second lookup for
+/// anything to get in front of.
 async fn ensure_file_allocated(path: &str, size: u64, chunk_count: usize) -> Result<()> {
-    match fs::metadata(path).await {
-        Ok(m) if m.len() == size => Ok(()),
-        Ok(_) => {
-            // Always resize existing files to correct size
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .await
-                .with_context(|| format!("Failed to open existing file: {}", path))?;
-            file.set_len(size)
-                .await
-                .with_context(|| format!("Failed to resize '{}' to {} bytes", path, size))?;
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let file = fs::File::create(path)
-                .await
-                .with_context(|| format!("Failed to create file: {}", path))?;
-            if chunk_count > 1 {
-                // Multi-chunk needs pre-allocation for random-access writes
-                file.set_len(size).await.with_context(|| {
-                    format!("Failed to pre-allocate {} bytes for '{}'", size, path)
-                })?;
-            }
-            // Single chunk: file starts at 0 bytes, sequential write extends naturally
-            Ok(())
-        }
-        Err(e) => Err(e).with_context(|| format!("Failed to stat file: {}", path)),
+    let file = safe_file::open_guarded(
+        Path::new(path),
+        Existing::Open,
+        Access::ReadWrite,
+        safe_file::DEFAULT_FILE_MODE,
+    )
+    .with_context(|| format!("Failed to open file: {}", path))?;
+
+    let current = file
+        .metadata()
+        .with_context(|| format!("Failed to stat file: {}", path))?
+        .len();
+
+    // Already the right length.
+    if current == size {
+        return Ok(());
     }
+
+    // Single chunk starting from nothing: the file starts at 0 bytes and the
+    // sequential write extends it naturally, exactly as before.
+    if current == 0 && chunk_count <= 1 {
+        return Ok(());
+    }
+
+    // Multi-chunk needs pre-allocation for random-access writes, and a file of
+    // the wrong length is resized either way.
+    file.set_len(size)
+        .with_context(|| format!("Failed to resize '{}' to {} bytes", path, size))?;
+
+    Ok(())
 }
 
 fn spawn_autosave(

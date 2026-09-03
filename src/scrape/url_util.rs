@@ -7,6 +7,8 @@
 use reqwest::Url;
 
 use crate::engine;
+use crate::secret_url;
+use crate::ui;
 use super::path::sanitize_path_component;
 
 pub(super) fn ensure_trailing_slash(mut url: Url) -> Url {
@@ -35,14 +37,24 @@ pub(super) fn is_under_base(url: &Url, base: &Url) -> bool {
 pub(super) fn derive_folder_name(base: &Url) -> String {
     let path = base.path().trim_end_matches('/');
     let last = path.rsplit('/').next().unwrap_or("");
+    // Handed over still encoded. `sanitize_path_component` decodes, and it is
+    // the only thing that should: decoding here as well made this a
+    // double-decode, and the result of it names a directory on disk. A segment
+    // of `%252Fetc` would have arrived there as `%2Fetc` and left as `/etc`.
     let candidate = if last.is_empty() {
         base.host_str().unwrap_or("download").to_owned()
     } else {
-        engine::percent_decode(last)
+        last.to_owned()
     };
     sanitize_path_component(&candidate).unwrap_or_else(|| "download".to_owned())
 }
 
+/// The name of `dir` as it should appear on screen.
+///
+/// Display only — nothing here reaches the filesystem. A listing chose every
+/// byte of this string, so it is decoded exactly once and then made safe to
+/// draw: an ESC in a directory name would otherwise be handed to the terminal
+/// by the scan spinner.
 pub(super) fn directory_label(base: &Url, dir: &Url) -> String {
     let rel = dir
         .as_str()
@@ -52,9 +64,12 @@ pub(super) fn directory_label(base: &Url, dir: &Url) -> String {
     let trimmed = decoded.trim_end_matches('/');
     let last = trimmed.rsplit('/').next().unwrap_or("");
     if last.is_empty() {
-        dir.as_str().to_owned()
+        // A URL rather than a name, and a directory URL can carry a token.
+        ui::terminal_safe(&secret_url::redact(dir.as_str()))
     } else {
-        last.to_owned()
+        // A name made entirely of control characters would sanitise down to
+        // nothing, and a blank label reads as a bug rather than as a refusal.
+        ui::terminal_safe_or(last, "(unnamed)")
     }
 }
 
@@ -98,5 +113,71 @@ mod tests {
         assert!(!is_under_base(&u("http://x.com/other/a.zip"), &base));
         assert!(!is_under_base(&u("https://x.com/files/a.zip"), &base)); // scheme differs
         assert!(!is_under_base(&u("http://y.com/files/a.zip"), &base)); // host differs
+    }
+
+    #[test]
+    fn a_directory_label_is_the_last_component_decoded_once() {
+        let base = ensure_trailing_slash(u("http://x.com/files/"));
+        assert_eq!(
+            directory_label(&base, &u("http://x.com/files/my%20photos/")),
+            "my photos"
+        );
+    }
+
+    /// The injection this label was the way in for. Encoded, because that is
+    /// how it arrives in an HTML listing.
+    #[test]
+    fn an_escape_sequence_in_a_directory_name_never_reaches_the_terminal() {
+        let base = ensure_trailing_slash(u("http://x.com/files/"));
+
+        // CSI: clears the screen and moves the cursor.
+        let label = directory_label(&base, &u("http://x.com/files/%1b%5b2J%1b%5bH-owned/"));
+        assert!(!label.contains('\u{1b}'), "got: {:?}", label);
+        assert_eq!(label, "[2J[H-owned");
+
+        // OSC 0: retitles the window. OSC 52 would reach the clipboard.
+        let label = directory_label(&base, &u("http://x.com/files/%1b%5d0;pwned%07/"));
+        assert!(!label.contains('\u{1b}'), "got: {:?}", label);
+        assert!(!label.contains('\u{7}'), "got: {:?}", label);
+
+        // A name with nothing drawable left in it says so.
+        assert_eq!(
+            directory_label(&base, &u("http://x.com/files/%1b%07%08/")),
+            "(unnamed)"
+        );
+    }
+
+    /// `%252F` decodes once to `%2F`, which is not a separator. It used to be
+    /// decoded twice, and the second decode made it one.
+    ///
+    /// So the folder really is *named* `%2Fetc%2Fcron.d`. Ugly, and inert —
+    /// and that, not a rejection, is the property worth pinning: one decode
+    /// leaves a single component, and nothing downstream decodes it again.
+    /// `path.rs` asserts the same thing one layer lower down, in
+    /// `double_encoded_paths_decode_once_and_stay_relative`.
+    #[test]
+    fn a_double_encoded_separator_cannot_name_the_folder() {
+        let name = derive_folder_name(&u("http://x.com/%252Fetc%252Fcron.d/"));
+        assert_eq!(name, "%2Fetc%2Fcron.d");
+        assert!(!name.contains('/'), "gained a separator: {name}");
+        assert_eq!(
+            std::path::Path::new(&name).components().count(),
+            1,
+            "must stay one component: {name}"
+        );
+        assert!(
+            crate::safe_path::resolve_under(std::path::Path::new("/dl"), &name).is_ok(),
+            "must resolve under the download root: {name}"
+        );
+
+        // One layer in, `%2F` *is* a separator once decoded, and the component
+        // check refuses it rather than handing back a name containing one.
+        assert_eq!(derive_folder_name(&u("http://x.com/%2Fetc/")), "download");
+
+        // An ordinary encoded name still decodes exactly once.
+        assert_eq!(
+            derive_folder_name(&u("http://x.com/my%20files/")),
+            "my files"
+        );
     }
 }

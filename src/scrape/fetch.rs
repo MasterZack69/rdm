@@ -5,11 +5,16 @@
 //! the caller to notice from `response.url()` that the answer came from
 //! somewhere else — by which point the internal service had been contacted
 //! and had replied, which is the entire SSRF.
+//!
+//! Every URL quoted in an error here is redacted first. A listing URL can
+//! carry a token in its query, these messages travel up an anyhow chain into
+//! a spinner note, and that note goes to stderr.
 
 use anyhow::{Context, Result};
 use reqwest::Url;
 
 use crate::net::redirect_location;
+use crate::secret_url;
 
 use super::limits::{MAX_HTML_BYTES, MAX_REDIRECTS};
 use super::parse::parse_links;
@@ -50,15 +55,19 @@ async fn fetch_following_redirects(
             .get(current.clone())
             .send()
             .await
-            .with_context(|| format!("Failed to fetch {}", current))?;
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("Failed to fetch {}", secret_url::redact(current.as_str())))?;
 
         let Some(location) = redirect_location(&response) else {
             return Ok((response, current));
         };
 
-        let mut next = current
-            .join(&location)
-            .with_context(|| format!("Unparseable redirect from {}", current))?;
+        let mut next = current.join(&location).with_context(|| {
+            format!(
+                "Unparseable redirect from {}",
+                secret_url::redact(current.as_str())
+            )
+        })?;
 
         next.set_fragment(None);
 
@@ -67,13 +76,19 @@ async fn fetch_following_redirects(
         }
 
         if !is_under_base(&next, base) {
-            anyhow::bail!("redirect escaped base scope: {}", next);
+            anyhow::bail!(
+                "redirect escaped base scope: {}",
+                secret_url::redact(next.as_str())
+            );
         }
 
         current = next;
     }
 
-    anyhow::bail!("too many redirects starting at {}", url)
+    anyhow::bail!(
+        "too many redirects starting at {}",
+        secret_url::redact(url.as_str())
+    )
 }
 
 pub(super) async fn fetch_and_parse(
@@ -122,7 +137,14 @@ fn extract_mime_essence(ct: &str) -> String {
 
 async fn read_capped_body(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    while let Some(chunk) = response.chunk().await.context("reading response body")? {
+    // Same reason as the send above: a mid-body transport error names the URL
+    // it was reading, and this one is the fetch URL.
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("reading response body")?
+    {
         if buf.len().saturating_add(chunk.len()) > max {
             anyhow::bail!("response body exceeds {} bytes", max);
         }
@@ -154,12 +176,28 @@ mod tests {
         assert_eq!(extract_mime_essence(""), "");
     }
 
+    /// The shape every error in this module quotes a URL through. A listing
+    /// behind a signed URL puts the signature in the query, and these
+    /// messages end up on stderr.
+    #[test]
+    fn a_url_quoted_in_an_error_carries_no_credentials() {
+        let quoted = secret_url::redact(
+            u("https://files.example.com/pub/?key=AIzaSyReal&tempauth=sig#frag").as_str(),
+        );
+        assert!(!quoted.contains("AIzaSyReal"), "got: {}", quoted);
+        assert!(!quoted.contains("sig"), "got: {}", quoted);
+        assert!(!quoted.contains("frag"), "got: {}", quoted);
+        // Still identifies which listing failed.
+        assert!(quoted.contains("files.example.com"), "got: {}", quoted);
+        assert!(quoted.contains("/pub/"), "got: {}", quoted);
+    }
+
     // ---------- Redirects ----------
 
     #[test]
     fn every_redirect_status_is_recognised_as_one() {
-        use reqwest::StatusCode;
         use axum::http;
+        use reqwest::StatusCode;
 
         fn response(status: StatusCode, location: Option<&str>) -> reqwest::Response {
             let mut builder = http::Response::builder().status(status);
@@ -219,5 +257,41 @@ mod tests {
             &u("http://files.example.com/pub/sub/"),
             &base
         ));
+    }
+
+    /// Pins the `without_url` idiom both send sites use.
+    ///
+    /// Two things this test has to control for. The client is built with
+    /// `.no_proxy()`, because a system `HTTP_PROXY` answers on behalf of an
+    /// unreachable address — the send then succeeds and the test proves
+    /// nothing, which is exactly how it failed the first time. And the port
+    /// is one the OS has just confirmed free rather than a hardcoded low
+    /// port, so the connection is refused rather than answered by whatever
+    /// happens to be listening.
+    #[tokio::test]
+    async fn a_failed_fetch_does_not_name_the_url_it_failed_on() {
+        // Bind to learn a free port, then drop it: connect() is then refused
+        // immediately instead of hanging or being intercepted.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url =
+            format!("http://127.0.0.1:{port}/pub/?key=SUPERSECRETKEY&tempauth=TEMPAUTHSIGNATURE");
+
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("Failed to fetch {}", secret_url::redact(&url)))
+            .expect_err("a closed loopback port must not answer");
+
+        let chain = format!("{err:#}");
+        assert!(!chain.contains("SUPERSECRETKEY"), "got: {chain}");
+        assert!(!chain.contains("TEMPAUTHSIGNATURE"), "got: {chain}");
+        // Still says which listing failed.
+        assert!(chain.contains("127.0.0.1"), "got: {chain}");
     }
 }
