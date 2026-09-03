@@ -305,27 +305,36 @@ mod tests {
         assert!(validate_content_range(&h, 0, 99).is_err());
     }
 
-    /// The chunk path retries, so this error text is printed once per attempt.
-    /// Port 1 needs root to bind, so nothing is listening and the connection
-    /// fails locally without traffic leaving the machine.
-    #[tokio::test]
-    async fn a_failed_range_request_does_not_name_the_url_it_failed_on() {
-        let progress = Arc::new(AtomicU64::new(0));
-        let error = download_range(
-            &Client::new(),
-            "http://127.0.0.1:1/f?key=SUPERSECRETKEY",
-            "/nonexistent-directory-for-rdm-test/x.part",
-            0,
-            1023,
-            0,
-            progress,
-            CancellationToken::new(),
-        )
-        .await
-        .expect_err("nothing listens on port 1");
+    /// See the note in `inspect.rs`: a free-then-closed port rather than a
+/// hardcoded low one, and `.no_proxy()`, so that a system proxy cannot
+/// answer for the unreachable address and let the send succeed.
+fn refused_url(query: &str) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}/f?{query}")
+}
 
-        let chain = format!("{error:#}");
-        assert!(!chain.contains("SUPERSECRETKEY"), "leaked: {chain}");
-        assert!(!chain.contains("127.0.0.1"), "leaked: {chain}");
-    }
+/// The chunk path retries, so this error text is printed once per attempt.
+#[tokio::test]
+async fn a_failed_range_request_does_not_name_the_url_it_failed_on() {
+    let progress = Arc::new(AtomicU64::new(0));
+    let error = download_range(
+        &Client::builder().no_proxy().build().unwrap(),
+        &refused_url("key=SUPERSECRETKEY"),
+        "/nonexistent-directory-for-rdm-test/x.part",
+        0,
+        1023,
+        0,
+        progress,
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("a closed loopback port must not answer");
+
+    let chain = format!("{error:#}");
+    assert!(!chain.contains("SUPERSECRETKEY"), "leaked: {chain}");
+    assert!(!chain.contains("127.0.0.1"), "leaked: {chain}");
+}
+
 }

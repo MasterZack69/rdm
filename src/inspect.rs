@@ -333,18 +333,32 @@ mod tests {
         );
     }
 
+    /// A port the OS has just confirmed free, then closed, so `connect` is
+    /// refused immediately and no traffic leaves the machine.
+    ///
+    /// A hardcoded low port is not enough: a system `HTTP_PROXY` answers on
+    /// behalf of an unreachable address, the request then succeeds, and the
+    /// test proves nothing. `.no_proxy()` on the client removes that variable
+    /// too — which is exactly what the guarded clients do in earnest.
+    fn refused_url(query: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}/f?{query}")
+    }
+
     /// The whole error chain, not just the message this crate wrote.
     ///
-    /// Port 1 needs root to bind, so nothing is listening on it and the
-    /// connection fails locally without any traffic leaving the machine. The
-    /// query string is what a gdrive fetch URL looks like, and reqwest's own
-    /// error Display is what used to repeat it.
+    /// The query string is what a gdrive fetch URL looks like, and reqwest's
+    /// own error Display is what used to repeat it.
     #[tokio::test]
     async fn a_failed_request_does_not_name_the_url_it_failed_on() {
-        let client = Client::new();
-        let error = inspect_url(&client, "http://127.0.0.1:1/f?key=SUPERSECRETKEY")
+        let client = Client::builder().no_proxy().build().unwrap();
+        let url = refused_url("key=SUPERSECRETKEY");
+
+        let error = inspect_url(&client, &url)
             .await
-            .expect_err("nothing listens on port 1");
+            .expect_err("a closed loopback port must not answer");
 
         let chain = format!("{error:#}");
         assert!(!chain.contains("SUPERSECRETKEY"), "leaked: {chain}");

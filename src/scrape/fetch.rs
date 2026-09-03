@@ -259,26 +259,38 @@ mod tests {
         ));
     }
 
-    /// Pins the `without_url` idiom both send sites use. It exercises the
-    /// shape rather than calling `fetch_following_redirects`, which would
-    /// need a live listing server and a constructed `ScopeGuard`; what it
-    /// actually guards is that the raw error never reaches the chain.
+    /// Pins the `without_url` idiom both send sites use.
+    ///
+    /// Two things this test has to control for. The client is built with
+    /// `.no_proxy()`, because a system `HTTP_PROXY` answers on behalf of an
+    /// unreachable address — the send then succeeds and the test proves
+    /// nothing, which is exactly how it failed the first time. And the port
+    /// is one the OS has just confirmed free rather than a hardcoded low
+    /// port, so the connection is refused rather than answered by whatever
+    /// happens to be listening.
     #[tokio::test]
     async fn a_failed_fetch_does_not_name_the_url_it_failed_on() {
-        let client = reqwest::Client::new();
-        let url = "http://127.0.0.1:1/pub/?key=SUPERSECRETKEY&tempauth=sig";
+        // Bind to learn a free port, then drop it: connect() is then refused
+        // immediately instead of hanging or being intercepted.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url =
+            format!("http://127.0.0.1:{port}/pub/?key=SUPERSECRETKEY&tempauth=TEMPAUTHSIGNATURE");
 
         let err = client
-            .get(url)
+            .get(&url)
             .send()
             .await
             .map_err(reqwest::Error::without_url)
-            .with_context(|| format!("Failed to fetch {}", secret_url::redact(url)))
-            .unwrap_err();
+            .with_context(|| format!("Failed to fetch {}", secret_url::redact(&url)))
+            .expect_err("a closed loopback port must not answer");
 
         let chain = format!("{err:#}");
         assert!(!chain.contains("SUPERSECRETKEY"), "got: {chain}");
-        assert!(!chain.contains("sig"), "got: {chain}");
+        assert!(!chain.contains("TEMPAUTHSIGNATURE"), "got: {chain}");
         // Still says which listing failed.
         assert!(chain.contains("127.0.0.1"), "got: {chain}");
     }
