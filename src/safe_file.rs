@@ -264,6 +264,45 @@ pub fn create_dirs_beneath(root: &Path, relative: &Path) -> Result<()> {
     })
 }
 
+/// Checks that `relative` names a real directory beneath `root`, without
+/// following a symlink to reach it.
+///
+/// For the caller that wants to *walk* a directory rather than write to it:
+/// the walk itself is ordinary `read_dir`, so the guard has to be the question
+/// of whether the directory is genuinely where it claims to be. Unlike
+/// `symlink_metadata` this resolves every component by descriptor, so there is
+/// no component below the root that a link can be planted at.
+pub fn verify_dir_beneath(root: &Path, relative: &Path) -> Result<()> {
+    verify_dir_beneath_impl(root, relative).with_context(|| {
+        format!(
+            "Refusing to use '{}' beneath {}",
+            relative.display(),
+            root.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn verify_dir_beneath_impl(root: &Path, relative: &Path) -> io::Result<()> {
+    let components = untrusted_components(relative)?;
+    // `create: false`, so a missing component is an error rather than a mkdir.
+    walk_dirs(root, &components, false)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_dir_beneath_impl(root: &Path, relative: &Path) -> io::Result<()> {
+    let joined = joined_beneath(root, relative)?;
+    let meta = std::fs::symlink_metadata(&joined)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a directory",
+        ));
+    }
+    Ok(())
+}
+
 /// Removes `relative` beneath `root`, resolving the parent by descriptor walk.
 ///
 /// Deletion through a full pathname has the same parent-swap exposure as
@@ -310,9 +349,8 @@ pub fn create_temp_in(dir: &Path, prefix: &str, mode: u32) -> Result<(File, Path
 
         match open_anywhere(&candidate, Existing::Reject, Access::ReadWrite, mode) {
             Ok(file) => {
-                validate_regular_owned(&file).with_context(|| {
-                    format!("Refusing to write to {}", candidate.display())
-                })?;
+                validate_regular_owned(&file)
+                    .with_context(|| format!("Refusing to write to {}", candidate.display()))?;
                 return Ok((file, candidate));
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last_err = Some(e),
@@ -357,9 +395,8 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> Result<()> {
                 // link/unlink emulation below.
             }
             Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("Failed to move {} into place", from.display())
-                });
+                return Err(e)
+                    .with_context(|| format!("Failed to move {} into place", from.display()));
             }
         }
     }
@@ -516,7 +553,9 @@ fn random_bytes() -> [u8; 16] {
     std::process::id().hash(&mut hasher);
     let a = hasher.finish().to_le_bytes();
 
-    let b = std::collections::hash_map::RandomState::new().hash_one(a).to_le_bytes();
+    let b = std::collections::hash_map::RandomState::new()
+        .hash_one(a)
+        .to_le_bytes();
 
     buf[..8].copy_from_slice(&a);
     buf[8..].copy_from_slice(&b);
@@ -527,12 +566,7 @@ fn random_bytes() -> [u8; 16] {
 ///
 /// The single place the two path kinds are told apart. Returns `io::Result` so
 /// that [`create_temp_in`] can still recognise `AlreadyExists` and retry.
-fn open_anywhere(
-    path: &Path,
-    existing: Existing,
-    access: Access,
-    mode: u32,
-) -> io::Result<File> {
+fn open_anywhere(path: &Path, existing: Existing, access: Access, mode: u32) -> io::Result<File> {
     if let Some(root) = download_root()
         && let Some(relative) = split_beneath(root, path)
     {
@@ -609,10 +643,7 @@ fn split_untrusted(relative: &Path) -> io::Result<(Vec<&OsStr>, &OsStr)> {
     let mut components = untrusted_components(relative)?;
 
     let name = components.pop().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path has no final component",
-        )
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no final component")
     })?;
 
     Ok((components, name))
@@ -660,12 +691,7 @@ fn unlink_beneath_impl(root: &Path, relative: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn rename_beneath_impl(
-    root: &Path,
-    from: &Path,
-    to: &Path,
-    replace: bool,
-) -> io::Result<()> {
+fn rename_beneath_impl(root: &Path, from: &Path, to: &Path, replace: bool) -> io::Result<()> {
     let (from_dirs, from_name) = split_untrusted(from)?;
     let (to_dirs, to_name) = split_untrusted(to)?;
 
@@ -690,9 +716,7 @@ fn rename_beneath_impl(
 
         // `linkat` fails with EEXIST when the destination exists, atomically.
         // SAFETY: both descriptors are open and both names are NUL-terminated.
-        let rc = unsafe {
-            libc::linkat(from_fd.fd, c_from.as_ptr(), to_fd.fd, c_to.as_ptr(), 0)
-        };
+        let rc = unsafe { libc::linkat(from_fd.fd, c_from.as_ptr(), to_fd.fd, c_to.as_ptr(), 0) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -783,10 +807,7 @@ fn open_impl(path: &Path, existing: Existing, access: Access, mode: u32) -> io::
 #[cfg(unix)]
 fn split_parent(path: &Path) -> io::Result<(PathBuf, PathBuf)> {
     let name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path has no final component",
-        )
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no final component")
     })?;
 
     let parent = match path.parent() {
@@ -1101,12 +1122,7 @@ fn unlink_beneath_impl(root: &Path, relative: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn rename_beneath_impl(
-    root: &Path,
-    from: &Path,
-    to: &Path,
-    replace: bool,
-) -> io::Result<()> {
+fn rename_beneath_impl(root: &Path, from: &Path, to: &Path, replace: bool) -> io::Result<()> {
     let from = joined_beneath(root, from)?;
     let to = joined_beneath(root, to)?;
 
@@ -1134,8 +1150,13 @@ mod tests {
         let dir = tmpdir();
         let path = dir.path().join("out.bin");
 
-        let mut file =
-            open_guarded(&path, Existing::Reject, Access::ReadWrite, DEFAULT_FILE_MODE).unwrap();
+        let mut file = open_guarded(
+            &path,
+            Existing::Reject,
+            Access::ReadWrite,
+            DEFAULT_FILE_MODE,
+        )
+        .unwrap();
         file.write_all(b"hello").unwrap();
         drop(file);
 
@@ -1148,8 +1169,13 @@ mod tests {
         let path = dir.path().join("out.bin");
         std::fs::write(&path, b"existing").unwrap();
 
-        let err =
-            open_guarded(&path, Existing::Reject, Access::ReadWrite, DEFAULT_FILE_MODE).unwrap_err();
+        let err = open_guarded(
+            &path,
+            Existing::Reject,
+            Access::ReadWrite,
+            DEFAULT_FILE_MODE,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("Failed to safely open"),
             "{err:#}"
@@ -1215,7 +1241,15 @@ mod tests {
         let planted = dir.path().join("download.bin.part");
         std::os::unix::fs::symlink(&target, &planted).unwrap();
 
-        assert!(open_guarded(&planted, Existing::Open, Access::ReadWrite, DEFAULT_FILE_MODE).is_err());
+        assert!(
+            open_guarded(
+                &planted,
+                Existing::Open,
+                Access::ReadWrite,
+                DEFAULT_FILE_MODE
+            )
+            .is_err()
+        );
         assert!(!target.exists(), "the symlink target was created");
     }
 
@@ -1238,7 +1272,10 @@ mod tests {
         let err = open_guarded(&fifo, Existing::Open, Access::ReadWrite, DEFAULT_FILE_MODE)
             .expect_err("a FIFO must be refused");
         let msg = format!("{err:#}");
-        assert!(msg.contains("Refusing") || msg.contains("Failed to safely open"), "{msg}");
+        assert!(
+            msg.contains("Refusing") || msg.contains("Failed to safely open"),
+            "{msg}"
+        );
     }
 
     #[cfg(unix)]
@@ -1599,5 +1636,24 @@ mod tests {
             split_beneath(root, Path::new("/home/user/Downloads-old/file.mkv")),
             None
         );
+    }
+
+    /// The `--delete` case: the sweep's own root is a listing-chosen folder
+    /// name, so it is a component to be verified rather than a root to be
+    /// trusted.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_sweep_root_is_refused_before_anything_is_enumerated() {
+        let root = tmpdir();
+        let outside = tmpdir();
+        std::fs::write(outside.path().join("precious.jpg"), b"x").unwrap();
+
+        std::fs::create_dir(root.path().join("real-album")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("album")).unwrap();
+
+        assert!(verify_dir_beneath(root.path(), Path::new("real-album")).is_ok());
+        assert!(verify_dir_beneath(root.path(), Path::new("album")).is_err());
+        assert!(verify_dir_beneath(root.path(), Path::new("missing")).is_err());
+        assert!(verify_dir_beneath(root.path(), Path::new("../elsewhere")).is_err());
     }
 }

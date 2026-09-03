@@ -55,6 +55,7 @@ async fn fetch_following_redirects(
             .get(current.clone())
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("Failed to fetch {}", secret_url::redact(current.as_str())))?;
 
         let Some(location) = redirect_location(&response) else {
@@ -136,7 +137,14 @@ fn extract_mime_essence(ct: &str) -> String {
 
 async fn read_capped_body(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    while let Some(chunk) = response.chunk().await.context("reading response body")? {
+    // Same reason as the send above: a mid-body transport error names the URL
+    // it was reading, and this one is the fetch URL.
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("reading response body")?
+    {
         if buf.len().saturating_add(chunk.len()) > max {
             anyhow::bail!("response body exceeds {} bytes", max);
         }
@@ -188,8 +196,8 @@ mod tests {
 
     #[test]
     fn every_redirect_status_is_recognised_as_one() {
-        use reqwest::StatusCode;
         use axum::http;
+        use reqwest::StatusCode;
 
         fn response(status: StatusCode, location: Option<&str>) -> reqwest::Response {
             let mut builder = http::Response::builder().status(status);
@@ -249,5 +257,29 @@ mod tests {
             &u("http://files.example.com/pub/sub/"),
             &base
         ));
+    }
+
+    /// Pins the `without_url` idiom both send sites use. It exercises the
+    /// shape rather than calling `fetch_following_redirects`, which would
+    /// need a live listing server and a constructed `ScopeGuard`; what it
+    /// actually guards is that the raw error never reaches the chain.
+    #[tokio::test]
+    async fn a_failed_fetch_does_not_name_the_url_it_failed_on() {
+        let client = reqwest::Client::new();
+        let url = "http://127.0.0.1:1/pub/?key=SUPERSECRETKEY&tempauth=sig";
+
+        let err = client
+            .get(url)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("Failed to fetch {}", secret_url::redact(url)))
+            .unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(!chain.contains("SUPERSECRETKEY"), "got: {chain}");
+        assert!(!chain.contains("sig"), "got: {chain}");
+        // Still says which listing failed.
+        assert!(chain.contains("127.0.0.1"), "got: {chain}");
     }
 }

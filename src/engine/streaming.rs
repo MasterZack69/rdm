@@ -158,6 +158,47 @@ pub fn resolve_resume_action(
     }
 }
 
+/// A response whose body will be consumed from byte zero has to actually be
+/// the whole file.
+///
+/// `resolve_resume_action` guards the *ranged* request, but both paths that
+/// bypass it consume a body from zero and then take `content_length()` as the
+/// expected total. A server answering a whole-file request with `206 bytes
+/// 0-5000/8192` satisfies `is_success()`, sets the expectation to 5001, sends
+/// exactly that, and the 3 KiB-short file is renamed as complete. A 200 says
+/// nothing about ranges and needs no check.
+fn validate_whole_body(resp: &reqwest::Response) -> Result<()> {
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(());
+    }
+
+    let value = resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok());
+
+    let Some(range) = value.and_then(parse_content_range) else {
+        anyhow::bail!("Server sent a 206 with no usable Content-Range for a whole-file request");
+    };
+
+    // Same reasoning as the resume path: `*` is the absence of a total, and
+    // the end of the range cannot stand in for one.
+    let Some(total) = range.total else {
+        anyhow::bail!("Server sent a 206 with an unknown total for a whole-file request");
+    };
+
+    if range.start != 0 || range.end + 1 != total {
+        anyhow::bail!(
+            "Server sent bytes {}-{} of {} when the whole file was requested",
+            range.start,
+            range.end,
+            total
+        );
+    }
+
+    Ok(())
+}
+
 pub fn build_streaming_request(
     client: &reqwest::Client,
     url: &str,
@@ -259,6 +300,7 @@ pub(super) async fn download_streaming(
                     .await
                     .map_err(reqwest::Error::without_url)
                     .context("Fresh GET request failed")?;
+
                 if !fresh_resp.status().is_success() {
                     anyhow::bail!(
                         "Restart request failed with status {} {}",
@@ -266,9 +308,19 @@ pub(super) async fn download_streaming(
                         fresh_resp.status().canonical_reason().unwrap_or("Unknown"),
                     );
                 }
+                // The restart was triggered by a server that answered the
+                // ranged request badly. Accepting whatever it sends next
+                // without looking hands the same trick a second chance.
+                validate_whole_body(&fresh_resp)?;
                 (0u64, false, fresh_resp)
             }
-            ResumeAction::Fresh => (0u64, false, resp),
+            ResumeAction::Fresh => {
+                // No `.part`, so no Range header was sent -- which makes a 206
+                // here unsolicited, and its range still decides how many bytes
+                // count as the whole file.
+                validate_whole_body(&resp)?;
+                (0u64, false, resp)
+            }
             ResumeAction::Fail(code) => {
                 anyhow::bail!(
                     "Server returned {} {}",
@@ -346,8 +398,13 @@ pub(super) async fn download_streaming(
     // between runs, which a randomised name could not do. Randomised temporary
     // files are used where nothing needs to find them again.
     let file = if append {
-        safe_file::open_guarded(temp, Existing::Open, Access::Append, safe_file::DEFAULT_FILE_MODE)
-            .context("Failed to open .part for append")?
+        safe_file::open_guarded(
+            temp,
+            Existing::Open,
+            Access::Append,
+            safe_file::DEFAULT_FILE_MODE,
+        )
+        .context("Failed to open .part for append")?
     } else {
         // Created if absent, which is the ordinary case. The truncate happens
         // through the descriptor rather than by reopening the path, so there
@@ -715,5 +772,54 @@ mod tests {
     fn a_bare_filename_looks_for_space_in_the_current_directory() {
         assert_eq!(dir_of("file.bin.part"), PathBuf::from("."));
         assert_eq!(dir_of("/tmp/dl/file.bin.part"), PathBuf::from("/tmp/dl"));
+    }
+
+    fn response_with(
+        status: reqwest::StatusCode,
+        content_range: Option<&str>,
+    ) -> reqwest::Response {
+        use axum::http;
+
+        let mut builder = http::Response::builder().status(status);
+        if let Some(cr) = content_range {
+            builder = builder.header("content-range", cr);
+        }
+        reqwest::Response::from(builder.body(String::new()).unwrap())
+    }
+
+    /// The gap the ranged check left open: after a bad resume is correctly
+    /// refused, the restart consumed whatever came back from byte zero and
+    /// took its length as the total.
+    #[test]
+    fn a_whole_file_request_answered_with_a_slice_is_refused() {
+        use reqwest::StatusCode;
+
+        // A plain 200 makes no range claim.
+        assert!(validate_whole_body(&response_with(StatusCode::OK, None)).is_ok());
+
+        // A 206 that really is the whole file is fine.
+        assert!(
+            validate_whole_body(&response_with(
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 0-8191/8192")
+            ))
+            .is_ok()
+        );
+
+        for bad in [
+            // The finding: 5001 bytes would become the expected total.
+            Some("bytes 0-5000/8192"),
+            // Starts somewhere else entirely.
+            Some("bytes 4096-8191/8192"),
+            // No total to check the tail against.
+            Some("bytes 0-5000/*"),
+            // A 206 claiming nothing at all.
+            None,
+        ] {
+            assert!(
+                validate_whole_body(&response_with(StatusCode::PARTIAL_CONTENT, bad)).is_err(),
+                "{bad:?} was accepted for a whole-file request"
+            );
+        }
     }
 }

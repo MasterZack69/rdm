@@ -29,6 +29,7 @@ use crate::queue;
 use crate::safe_file;
 use crate::safe_path;
 use crate::scrape;
+use crate::secret_url;
 use crate::ui;
 
 use super::orphans::{collect_orphan_files, remove_empty_dirs};
@@ -47,6 +48,24 @@ pub async fn run(
     output_dir: Option<String>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    // The registered trust boundary has to be the directory this run actually
+    // writes to. `-o` moves it for the folder hosts; the generic HTTP path
+    // below ignores `output_dir` and always resolves against `download_dir`,
+    // so the two cases are distinguished rather than guessed. Set-once, so
+    // the first sync in a process fixes it.
+    let effective_root = if mega::is_mega_url(url)
+        || onedrive::is_onedrive_url(url)
+        || gdrive::is_gdrive_url(url)
+        || pixeldrain::is_pixeldrain_url(url)
+    {
+        output_dir
+            .clone()
+            .unwrap_or_else(|| cfg.download_dir.clone())
+    } else {
+        cfg.download_dir.clone()
+    };
+    safe_file::set_download_root(Some(PathBuf::from(effective_root)));
+
     // MEGA first, before the queue guard: the MEGA path does not use the queue
     // at all, so a queue full of unrelated pending items is no reason to
     // refuse.
@@ -142,7 +161,10 @@ pub async fn run(
     let files = match files {
         Some(f) if !f.is_empty() => f,
         _ => {
-            eprintln!("  \u{274c} No files found at {}", url);
+            eprintln!(
+                "  \u{274c} No files found at {}",
+                ui::terminal_safe(&secret_url::redact(url))
+            );
             return Ok(());
         }
     };
@@ -185,8 +207,7 @@ pub async fn run(
     // what let `%252F...` become an absolute path, and it also meant this set
     // was built from differently-decoded strings than the ones actually
     // written to disk, so `--delete` was comparing two different alphabets.
-    let remote_decoded: HashSet<String> =
-        files.iter().map(|f| f.relative_path.clone()).collect();
+    let remote_decoded: HashSet<String> = files.iter().map(|f| f.relative_path.clone()).collect();
 
     let sync_root_result = derive_sync_root(cfg, &files);
 
@@ -199,7 +220,7 @@ pub async fn run(
             SyncRoot::Empty => {
                 eprintln!("  \u{26a0} Cannot use --delete: unable to determine sync root.");
             }
-            SyncRoot::Ok(_) => {}
+            SyncRoot::Ok { .. } => {}
         }
     }
 
@@ -287,17 +308,36 @@ pub async fn run(
     to_download.sort_by(|a, b| a.1.cmp(&b.1));
 
     let mut to_delete: Vec<String> = Vec::new();
-    if delete && let SyncRoot::Ok(ref root) = sync_root_result {
-        let root_path = Path::new(root);
-        if root_path.is_dir() {
-            collect_orphan_files(
-                root_path,
-                root_path,
-                &remote_decoded,
-                &ext_filter,
-                &mut to_delete,
-            );
-            to_delete.sort();
+    if delete
+        && let SyncRoot::Ok {
+            ref prefix,
+            ref path,
+        } = sync_root_result
+    {
+        let download_root = Path::new(&cfg.download_dir);
+        let root_path = Path::new(path);
+
+        // The mirror's folder name comes from the listing, so the root of the
+        // sweep is itself an untrusted component. Opening it by pathname
+        // followed a symlinked `download_dir/<folder>` before any protection
+        // began, and the sweep then enumerated whatever it pointed at.
+        // Walking it from the download directory refuses that first.
+        match safe_file::verify_dir_beneath(download_root, Path::new(prefix)) {
+            Ok(()) => {
+                if root_path.is_dir() {
+                    collect_orphan_files(
+                        root_path,
+                        root_path,
+                        &remote_decoded,
+                        &ext_filter,
+                        &mut to_delete,
+                    );
+                    to_delete.sort();
+                }
+            }
+            Err(e) => {
+                eprintln!("  \u{26a0} Skipping delete phase: {:#}", e);
+            }
         }
     }
 
@@ -347,8 +387,7 @@ pub async fn run(
         // The root-relative form is kept alongside the absolute one because
         // the removals and the mkdir below are performed relative to the
         // download root by descriptor walk, not by pathname.
-        let mut resolved: Vec<(String, String, PathBuf)> =
-            Vec::with_capacity(to_download.len());
+        let mut resolved: Vec<(String, String, PathBuf)> = Vec::with_capacity(to_download.len());
         for (file_url, relative) in &to_download {
             match local_path(cfg, relative) {
                 Ok(path) => resolved.push((file_url.clone(), relative.clone(), path)),
@@ -457,25 +496,35 @@ pub async fn run(
         let mut deleted = 0u64;
         let mut delete_failed = 0u64;
 
-        if let SyncRoot::Ok(ref root) = sync_root_result {
-            let root_path = Path::new(root);
+        if let SyncRoot::Ok {
+            ref prefix,
+            ref path,
+        } = sync_root_result
+        {
+            let download_root = Path::new(&cfg.download_dir);
+            let root_path = Path::new(path);
             let progress = ui::CountProgress::new("Deleting orphans", to_delete.len());
 
             for relative in &to_delete {
-                // The most dangerous of the three: this walks a directory and
-                // removes what it finds. Joining onto the root and calling
-                // remove_file re-resolved every component, so one symlinked
-                // subdirectory turned a mirror cleanup into a deletion
-                // somewhere else entirely.
-                let relative = Path::new(relative);
+                // Anchored at the download directory rather than at the sync
+                // root, with the listing-chosen folder name put back on the
+                // front as just another untrusted component. A symlink at that
+                // component now fails the walk instead of being the root the
+                // walk trusts.
+                let relative = Path::new(prefix).join(relative);
+                let relative = relative.as_path();
 
-                match safe_file::unlink_beneath(root_path, relative) {
+                match safe_file::unlink_beneath(download_root, relative) {
                     Ok(()) => {
                         deleted += 1;
-                        let _ =
-                            safe_file::unlink_beneath(root_path, &with_suffix(relative, ".part"));
-                        let _ =
-                            safe_file::unlink_beneath(root_path, &with_suffix(relative, ".rdm"));
+                        let _ = safe_file::unlink_beneath(
+                            download_root,
+                            &with_suffix(relative, ".part"),
+                        );
+                        let _ = safe_file::unlink_beneath(
+                            download_root,
+                            &with_suffix(relative, ".rdm"),
+                        );
                     }
                     Err(e) => {
                         // An orphan that has already gone is not a failure.
@@ -538,7 +587,7 @@ enum HeadStatus {
 }
 
 enum SyncRoot {
-    Ok(String),
+    Ok { prefix: String, path: String },
     Empty,
     MixedRoots,
 }
@@ -587,7 +636,10 @@ fn derive_sync_root(cfg: &Config, files: &[scrape::DiscoveredFile]) -> SyncRoot 
         return SyncRoot::MixedRoots;
     }
     match safe_path::resolve_under(Path::new(&cfg.download_dir), prefix) {
-        Ok(root) => SyncRoot::Ok(root.to_string_lossy().into_owned()),
+        Ok(root) => SyncRoot::Ok {
+            prefix: prefix.to_owned(),
+            path: root.to_string_lossy().into_owned(),
+        },
         Err(_) => SyncRoot::Empty,
     }
 }
