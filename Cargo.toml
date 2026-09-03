@@ -41,7 +41,7 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
-opt-level = 3
+opt-level = "z"
 
 [dev-dependencies]
 axum = "0.8"
