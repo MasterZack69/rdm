@@ -72,6 +72,11 @@ pub(super) async fn run_item(
     mega_client: reqwest::Client,
     mega_gate: Arc<tokio::sync::Semaphore>,
 ) -> Result<ItemOutcome> {
+    // Protocol takes precedence over HTTP hoster-name heuristics.
+    if crate::sftp::is_sftp_url(&item.url) {
+        return run_engine_item(cfg, item, cancel, sink).await;
+    }
+
     if item.is_mega() {
         let _permit = mega_gate.acquire_owned().await;
 
@@ -122,6 +127,15 @@ pub(super) async fn run_item(
         return run_pixeldrain_item(cfg, item, cancel, sink).await;
     }
 
+    run_engine_item(cfg, item, cancel, sink).await
+}
+
+async fn run_engine_item(
+    cfg: &Config,
+    item: &Item,
+    cancel: CancellationToken,
+    sink: Arc<dyn ui::ProgressSink>,
+) -> Result<ItemOutcome> {
     let request = DownloadRequest::new(
         item.url.clone(),
         Some(item.resolve_output(cfg)),

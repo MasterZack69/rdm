@@ -31,9 +31,9 @@
 //!
 //! ## Hoster links are not special here
 //!
-//! `parse_url` accepts any http(s) URL and rejects everything else. Which
-//! hoster a link belongs to is `main`'s problem: a `1drv.ms` share and a
-//! `mega.nz` link are ordinary URLs at this layer, and there are tests
+//! `parse_url` accepts http(s) URLs and validates SFTP URLs without storing
+//! passwords. Which HTTP hoster a link belongs to is `main`'s problem: a
+//! `1drv.ms` share and a `mega.nz` link are ordinary URLs at this layer, and there are tests
 //! pinning that, because a parser that got clever about hostnames would
 //! start rejecting the links it had not been taught yet.
 //!

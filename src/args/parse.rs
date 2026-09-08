@@ -11,7 +11,7 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// Upper bound for how many queue items may download concurrently.
 pub const MAX_PARALLEL: usize = 32;
 
-/// Accepts only http(s) URLs.
+/// Accepts http(s) URLs and validates credential-free SFTP URLs.
 ///
 /// Validating here, rather than letting an unrecognised first argument fall
 /// through to "print usage and exit 1", is what lets clap report the actual
@@ -19,6 +19,12 @@ pub const MAX_PARALLEL: usize = 32;
 /// the full help text.
 pub fn parse_url(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
+
+    if crate::sftp::is_sftp_url(trimmed) {
+        return crate::sftp::SftpUrl::parse(trimmed)
+            .map(|url| url.as_str().to_owned())
+            .map_err(|error| format!("{error:#}"));
+    }
 
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         return Ok(trimmed.to_owned());
@@ -33,7 +39,7 @@ pub fn parse_url(value: &str) -> Result<String, String> {
     // in literal braces instead.
     let suggestion = String::from("https://") + trimmed;
     Err(format!(
-        "`{trimmed}` is not an http(s) URL \u{2014} did you mean `{suggestion}`?"
+        "`{trimmed}` is not an http(s) or SFTP URL \u{2014} did you mean `{suggestion}`?"
     ))
 }
 

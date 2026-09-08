@@ -13,12 +13,15 @@
 //!
 //! The module is laid out as:
 //!
-//! - `run`: the entry point, and the generic HTTP mirror.
+//! - `dispatch`: protocol selection.
+//! - `run`: the generic HTTP mirror.
+//! - `sftp`, `sftp_orphans`: SFTP metadata-based mirroring and guarded deletion.
 //! - `mega`, `onedrive`, `gdrive`, `pixeldrain`: one share path each.
 //! - `orphans`: what `--delete` may remove, and the empty-directory sweep.
 //! - `report`: the plan sample, and the bulk-delete prompt.
 //! - `paths`: turning listing entries into local paths.
 
+mod dispatch;
 mod gdrive;
 mod mega;
 mod onedrive;
@@ -27,5 +30,7 @@ mod paths;
 mod pixeldrain;
 mod report;
 mod run;
+mod sftp;
+mod sftp_orphans;
 
-pub use run::run;
+pub use dispatch::run;

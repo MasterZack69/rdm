@@ -15,6 +15,7 @@ pub mod safe_path;
 pub mod scrape;
 pub mod secret_file;
 pub mod secret_url;
+pub mod sftp;
 pub mod signal;
 pub mod sync;
 pub mod ui;

@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ui::{self, ProgressSink};
 
-use super::download::download;
+use super::dispatch::download;
 use super::request::{DownloadRequest, Outcome};
 use super::url::extract_filename_from_url;
 

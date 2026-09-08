@@ -24,6 +24,8 @@
             version = "0.2.11";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = with pkgs; [ openssl zlib libssh2 ];
             doCheck = false;
             meta = {
               description = "Rust Download Manager - CLI";
@@ -57,7 +59,10 @@
           pkgs = import nixpkgs { inherit system; };
         in
         {
-          default = pkgs.mkShell { buildInputs = with pkgs; [ rustup ]; };
+          default = pkgs.mkShell {
+            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = with pkgs; [ rustup openssl zlib libssh2 ];
+          };
         }
       );
     };

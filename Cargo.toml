@@ -36,6 +36,10 @@ dirs = "6"
 aes = "0.9"
 base64 = "0.22"
 
+# Native SFTP over SSH; SHA-256 gives transfer state collision-resistant names.
+ssh2 = "0.9.5"
+sha2 = "0.10"
+
 [profile.release]
 lto = true
 codegen-units = 1

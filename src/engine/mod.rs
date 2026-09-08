@@ -12,7 +12,8 @@
 //! The module is laid out as:
 //!
 //! - `request`: what a caller asks for, and how the download ended.
-//! - `download`: the entry point that turns a request into a file.
+//! - `dispatch`: protocol selection before HTTP URL normalisation.
+//! - `download`: the HTTP implementation that turns a request into a file.
 //! - `run`: wrappers that own a progress bar and print the summary line.
 //! - `output`: reconciling the requested path with what is already on disk.
 //! - `streaming`: the fallback for servers that do not report a size.
@@ -21,6 +22,7 @@
 //! - `client`: the shared HTTP client and configuration.
 
 mod client;
+mod dispatch;
 mod download;
 mod name;
 mod output;
@@ -29,7 +31,7 @@ mod run;
 mod streaming;
 mod url;
 
-pub use download::download;
+pub use dispatch::download;
 pub use name::safe_filename;
 pub use output::resolve_existing_output;
 pub use request::{DownloadRequest, ExistingPolicy, Outcome, OutputDecision};
