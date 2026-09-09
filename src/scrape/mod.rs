@@ -110,6 +110,9 @@ pub async fn discover_files(
     wrap_in_folder: bool,
     allow_private: bool,
 ) -> Result<Option<Vec<DiscoveredFile>>> {
+    if crate::sftp::is_sftp_url(url) {
+        return crate::sftp::discover_files(url, wrap_in_folder, allow_private).await;
+    }
     let base_url = parse_and_validate_url(url, allow_private).context("Invalid base URL")?;
     let base_url = ensure_trailing_slash(base_url);
     let guard = ScopeGuard::new(allow_private);

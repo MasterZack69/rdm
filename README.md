@@ -1,5 +1,6 @@
 # Rust Download Manager
 - A "usable" download manager. Emphasis on usable.
+- HTTP/HTTPS/SFTP
 - Resume support on most connections like other download managers.
 - Efficient as Fuck.
 - Written in rust so it must be cool. Emphasis on must.
@@ -160,6 +161,8 @@ Zack encourages you to build from source. As some random internet person once sa
 NixOS users get a flake for easy installation :)
 
 # Build From Source
+Make sure you have openssl, zlib, libssh and cargo installed (optional: pkg-config)
+
 ```
 git clone https://github.com/MasterZack69/rdm
 cd rdm
@@ -173,6 +176,7 @@ cargo build --release
 - Claude Opus 4.7 - Here to do everything better
 - Claude Opus 5 - Clap Migration, Queue System and Hosters
 - DeepSeek V4 Flash - Clippy error fixer
+- GPT 6 Astra - SFTP
 
 # Prior art
 - [MegaBasterd](https://github.com/tonikelope/megabasterd)

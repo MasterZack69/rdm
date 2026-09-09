@@ -89,9 +89,8 @@ pub(crate) async fn download_files(
     // Drain, don't try_collect: dropping active blocking workers on the first
     // failure would let a sync enter its next phase while writes still run.
     while let Some(result) = tasks.next().await {
-        if let Err(error) = result {
-            if first_error.is_none() { first_error = Some(error); }
-        }
+        if let Err(error) = result
+         && first_error.is_none() { first_error = Some(error); }
     }
     match first_error {
         Some(error) => Err(error),

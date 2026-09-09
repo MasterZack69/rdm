@@ -30,6 +30,18 @@ fn main() -> Result<()> {
         }
 
         Some(Command::Download { url, opts }) => {
+            if rdm::sftp::is_sftp_url(&url) {
+                return run_async(|cancel| {
+                    rdm::sftp::run(
+                        &cfg,
+                        &url,
+                        &opts,
+                        None,
+                        rdm::sftp::CommandMode::Download,
+                        cancel,
+                    )
+                });
+            }
             // Before `normalize_download_url`: a MEGA link's `#key` fragment is
             // load-bearing and must reach the parser untouched.
             if mega::is_mega_url(&url) {
@@ -178,6 +190,18 @@ fn quick_download(
     opts: &DownloadOpts,
     parallel: Option<usize>,
 ) -> Result<()> {
+    if rdm::sftp::is_sftp_url(url) {
+        return run_async(|cancel| {
+            rdm::sftp::run(
+                cfg,
+                url,
+                opts,
+                parallel,
+                rdm::sftp::CommandMode::Download,
+                cancel,
+            )
+        });
+    }
     // MEGA first: `looks_like_directory` sees `/file/AbCdEfGh#key` as an
     // extensionless segment and would hand the link to the scraper, which
     // finds nothing there.
@@ -678,6 +702,18 @@ fn run_queue(cfg: &config::Config, command: QueueCommand) -> Result<()> {
 
 /// `rdm queue add` \u{2014} enqueue a single file, or every file behind a listing.
 fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
+    if rdm::sftp::is_sftp_url(url) {
+        return run_async(|cancel| {
+            rdm::sftp::run(
+                cfg,
+                url,
+                opts,
+                None,
+                rdm::sftp::CommandMode::Enqueue,
+                cancel,
+            )
+        });
+    }
     // A folder share is N files with no individual URLs to store, so it cannot
     // be represented as one queue item. Say so instead of accepting it and
     // failing later, in the runner, where the message would be less useful.
