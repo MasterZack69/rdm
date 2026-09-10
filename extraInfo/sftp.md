@@ -2,8 +2,6 @@
 
 Native, read-only SFTP over SSH, using `ssh2`/libssh2. RDM does not invoke a shell, parse `ls`, or require a remote command-execution permission.
 
-**Branch integration:** the CLI and generic scrape hooks in the existing large files are supplied in `SFTP-INTEGRATION.md` for the maintainer to apply. Refresh `Cargo.lock` after adding the dependencies. Until those steps and the Rust checks are complete, this branch is not merge-ready.
-
 ## Usage
 
 ```sh
@@ -59,9 +57,24 @@ Resume requires the same canonical URL, verified host key, size and modification
 
 Queue and directory batches preserve existing regular files. A direct single-file download refuses an existing output instead of opening an interactive overwrite prompt; choose another `-o`, or use `sync` to refresh a mirror. Sync retains the old file until the replacement is complete, checks metadata again, preserves the remote mtime, and publishes atomically. Empty files are supported.
 
+### What sync considers up to date
+
+Sync compares **sizes**, as the HTTP mirror does. A local library is normally older than this backend: files fetched with another tool, an earlier rdm, or restored from a backup carry the timestamp of the moment they were written locally, not the one the server reports. Requiring both to match treated such a library as stale in its entirety and downloaded all of it again.
+
+| Variable | Meaning |
+|---|---|
+| `RDM_SFTP_SYNC_COMPARE` | `size` (default), or `size+mtime` to also require matching timestamps |
+| `RDM_SFTP_MODIFY_WINDOW` | Timestamp slack in whole seconds; default `2`, `0` for exact equality |
+
+When the size matches but the timestamp does not, sync adopts the server's timestamp on the local file and reports it as `Retimed`. That is a metadata-only repair under the same lock a transfer takes — no payload bytes move — and it lets every later run, in either mode, decide by plain equality. A file that changed between being inspected and being repaired is downloaded instead.
+
+The default two-second window exists because FAT and exFAT store mtimes in two-second units, and SMB and some NFS mounts round as well; exact equality would make those mirrors re-download their whole tree on every run.
+
+Downloads are counted by reason — missing, resized, restamped — and the first few are printed with the local and remote figures, so a surprising run can be checked against `ls -l` and `stat`.
+
 `RDM_MAX_FILE_BYTES` applies to advertised SFTP sizes as well: 64 GiB by default, `0` for no ceiling. Recognised transient failures use `max_retries` and capped exponential backoff. Authentication, permissions, invalid paths and host-key failures are not retried. Unclassified read errors fail conservatively; retrying the queue item or command can resume its saved checkpoint.
 
-**Integrity limit:** SFTP v3 size/mtime is not a content hash or immutable version ID. A same-size rewrite that preserves the same second-resolution mtime cannot be detected by resume or sync. Use a stable source or independently verify published checksums where content integrity needs stronger guarantees. SSH still authenticates and protects the transport.
+**Integrity limit:** SFTP v3 size/mtime is not a content hash or immutable version ID. With the default size comparison, a same-size rewrite is not detected; with `size+mtime` it is detected only when the server's timestamp changed too. Resume keeps the stricter rule — same URL, host key, size and exact mtime — because those partial bytes have to belong to the file still on the server. Use a stable source or independently verify published checksums where content integrity needs stronger guarantees. SSH still authenticates and protects the transport.
 
 ## Discovery and sync safety
 
@@ -76,8 +89,6 @@ Queue and directory batches preserve existing regular files. A direct single-fil
 ## Building and checks
 
 Linux build prerequisites include a Rust toolchain, a C toolchain, pkg-config, OpenSSL and zlib development headers. The Nix package and dev shell include the native dependencies.
-
-After applying the manual hooks:
 
 ```sh
 cargo check --all-targets       # also reconciles Cargo.lock; review that diff
@@ -100,4 +111,4 @@ export RDM_SFTP_IDENTITY_FILE='/absolute/path/to/test-key'
 cargo test --lib sftp::tests::live -- --ignored --nocapture
 ```
 
-Verification status for this implementation is recorded separately in `SFTP-INTEGRATION.md`; the commands above are not a claim that they have already passed.
+The commands above are not a claim that they have already passed; run them locally before relying on this backend.
