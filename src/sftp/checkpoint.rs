@@ -8,7 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use crate::safe_file::{self, Access, Existing, DEFAULT_FILE_MODE, PRIVATE_FILE_MODE};
-use super::local::{Destination, lock_output, state_paths};
+use super::local::{Destination, lock_output, state_paths, try_lock_output};
 use super::stamp::Identity;
 
 const MAX_METADATA: u64 = 32 * 1024;
@@ -108,4 +108,39 @@ impl Partial {
         let _ = safe_file::unlink_beneath(&self.destination.root, &self.metadata);
         Ok(())
     }
+}
+
+/// Removes the transfer state of a destination that already matches the
+/// server, and reports the bytes reclaimed.
+///
+/// A cancelled or failed transfer keeps its partial payload deliberately, and
+/// the published file is never replaced until that payload is complete. Once
+/// the published file matches the listing again, those bytes are unreachable:
+/// nothing schedules the file, so `Partial::open` is never reached to resume
+/// them, and they would be discarded anyway as soon as the remote size or
+/// timestamp changed. State for a file that is *still* stale is left alone,
+/// which is the case resume exists for.
+pub(crate) fn discard_state(destination: &Destination) -> Result<u64> {
+    let (directory, key) = state_paths(&destination.relative)?;
+    let part = directory.join(format!("{key}.part"));
+    // A file that was simply already current has no state at all, so the
+    // common case takes no lock and creates no state directory for it.
+    if std::fs::symlink_metadata(destination.root.join(&part)).is_err() {
+        return Ok(0);
+    }
+    let Some(_lock) = try_lock_output(&destination.root, &destination.relative)? else {
+        // Another transfer owns this destination, so its state is in use.
+        return Ok(0);
+    };
+    let reclaimed = match std::fs::symlink_metadata(destination.root.join(&part)) {
+        Ok(meta) if meta.is_file() => meta.len(),
+        // Anything else is not ours to account for. The unlink below still
+        // refuses to follow it.
+        _ => 0,
+    };
+    if safe_file::unlink_beneath(&destination.root, &part).is_err() {
+        return Ok(0);
+    }
+    let _ = safe_file::unlink_beneath(&destination.root, &directory.join(format!("{key}.json")));
+    Ok(reclaimed)
 }

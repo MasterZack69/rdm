@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::safe_file::{self, Access, Existing, DEFAULT_FILE_MODE, PRIVATE_FILE_MODE};
+use super::stamp::{Difference, Verdict};
 
 pub(crate) const STATE_DIR: &str = ".rdm-sftp";
 
@@ -83,13 +84,17 @@ impl Destination {
     /// Adopts the server's modification time for a file that already has the
     /// right size, transferring nothing.
     ///
-    /// Returns `false` when the file is no longer the one that was inspected,
-    /// so the caller downloads it instead. The lock is the one a transfer
-    /// takes, so a queue item writing this path cannot be retimed underneath.
-    pub fn align_modified(&self, observed: &Metadata, seconds: u64) -> Result<bool> {
+    /// Reports `Stale(Replaced)` when the file is no longer the one that was
+    /// inspected, so the caller downloads it instead, and `Busy` when another
+    /// transfer owns the destination, which is left entirely alone rather than
+    /// failing the run. The lock is the one a transfer takes, so a queued
+    /// download cannot be retimed underneath.
+    pub fn align_modified(&self, observed: &Metadata, seconds: u64) -> Result<Verdict> {
         let time = UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
             .context("Remote modification time is out of range")?;
-        let _lock = lock_output(&self.root, &self.relative)?;
+        let Some(_lock) = try_lock_output(&self.root, &self.relative)? else {
+            return Ok(Verdict::Busy);
+        };
         // `Existing::Open` creates a missing file rather than failing, which
         // is why the identity check below is the one that decides: a file
         // replaced or removed since it was inspected is reported rather than
@@ -103,11 +108,11 @@ impl Destination {
             || current.ino() != observed.ino()
             || current.len() != observed.len()
         {
-            return Ok(false);
+            return Ok(Verdict::Stale(Difference::Replaced));
         }
         file.set_times(FileTimes::new().set_modified(time))
             .context("Cannot set the local modification time")?;
-        Ok(true)
+        Ok(Verdict::Retime { seconds })
     }
 
     pub fn display_path(&self) -> Result<String> {
@@ -128,14 +133,26 @@ pub(crate) fn state_paths(relative: &Path) -> Result<(PathBuf, String)> {
 }
 
 pub(crate) fn lock_output(root: &Path, relative: &Path) -> Result<File> {
+    try_lock_output(root, relative)?
+        .context("Another SFTP transfer or sync owns this destination")
+}
+
+/// `None` when another process holds the lock, for callers that have an
+/// alternative to failing the whole run.
+pub(crate) fn try_lock_output(root: &Path, relative: &Path) -> Result<Option<File>> {
     let (directory, key) = state_paths(relative)?;
     safe_file::create_dirs_beneath(root, &directory)?;
-    lock_file(root, &directory.join(format!("{key}.lock")))
+    try_lock_file(root, &directory.join(format!("{key}.lock")))
+}
+
+pub(crate) fn lock_file(root: &Path, relative: &Path) -> Result<File> {
+    try_lock_file(root, relative)?
+        .context("Another SFTP transfer or sync owns this destination")
 }
 
 /// Keep the lock file's inode alive. Removing it would allow a second process
 /// to lock a replacement inode while the first process still owns this one.
-pub(crate) fn lock_file(root: &Path, relative: &Path) -> Result<File> {
+pub(crate) fn try_lock_file(root: &Path, relative: &Path) -> Result<Option<File>> {
     let file = safe_file::open_beneath(
         root, relative, Existing::Open, Access::ReadWrite, PRIVATE_FILE_MODE,
     )?;
@@ -143,8 +160,12 @@ pub(crate) fn lock_file(root: &Path, relative: &Path) -> Result<File> {
     // returned File holds the lock until it is dropped. No raw pointer is used.
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("Another SFTP transfer or sync owns this destination");
+        let error = std::io::Error::last_os_error();
+        // Contention is an answer, not a failure. Anything else is a failure.
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error).context("Cannot lock the SFTP destination");
     }
-    Ok(file)
+    Ok(Some(file))
 }

@@ -76,6 +76,9 @@ pub(crate) enum Verdict {
     /// The same bytes as far as this protocol can tell. Adopting the server's
     /// timestamp costs no transfer and lets later runs decide by equality.
     Retime { seconds: u64 },
+    /// Another transfer owns the destination. Only the repair path reports
+    /// this; a comparison alone cannot observe it.
+    Busy,
     Stale(Difference),
 }
 

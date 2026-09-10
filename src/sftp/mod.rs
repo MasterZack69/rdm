@@ -17,6 +17,7 @@ pub(crate) mod stamp;
 mod transfer;
 mod url;
 
+pub(crate) use checkpoint::discard_state;
 pub use commands::{CommandMode, run};
 pub use download::download;
 pub use options::SftpOptions;

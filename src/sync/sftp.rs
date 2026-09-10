@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Config;
 use crate::engine::ExistingPolicy;
 use crate::safe_file;
-use crate::sftp::{self, SftpOptions, SftpUrl};
+use crate::sftp::{self, SftpOptions, SftpUrl, discard_state};
 use crate::sftp::batch::{Batch, download_files};
 use crate::sftp::local::{Destination, STATE_DIR, lock_file};
 use crate::sftp::stamp::{Compare, Difference, FileStamp, Verdict, modify_window};
@@ -26,9 +26,11 @@ const SAMPLE: usize = 5;
 struct Plan {
     current: usize,
     retimed: usize,
+    busy: usize,
     missing: usize,
     resized: usize,
     restamped: usize,
+    reclaimed: u64,
     sample: Vec<String>,
 }
 
@@ -118,21 +120,26 @@ pub(super) async fn run(
         let verdict = match destination.metadata()? {
             None => Verdict::Stale(Difference::Missing),
             Some(local) => match stamp.compare_local(&local, compare, window) {
-                // A repair writes no payload bytes, so it happens here rather
+                // A repair moves no payload bytes, so it happens here rather
                 // than being queued as a transfer.
-                Verdict::Retime { seconds } => {
-                    if destination.align_modified(&local, seconds)? {
-                        Verdict::Retime { seconds }
-                    } else {
-                        Verdict::Stale(Difference::Replaced)
-                    }
-                }
+                Verdict::Retime { seconds } => destination.align_modified(&local, seconds)?,
                 verdict => verdict,
             },
         };
         match verdict {
-            Verdict::Current => plan.current += 1,
-            Verdict::Retime { .. } => plan.retimed += 1,
+            // An interrupted run keeps its partial payload, and this file's
+            // published copy already matches the server, so those bytes can
+            // never be resumed. Reclaim them instead of leaving them to rot.
+            Verdict::Current => {
+                plan.current += 1;
+                plan.reclaimed += discard_state(&destination)?;
+            }
+            Verdict::Retime { .. } => {
+                plan.retimed += 1;
+                plan.reclaimed += discard_state(&destination)?;
+            }
+            // Downloading or sweeping would only fight whoever owns it.
+            Verdict::Busy => plan.busy += 1,
             Verdict::Stale(reason) => {
                 plan.stale(reason, &file.relative_path, &stamp);
                 to_download.push(file);
@@ -149,6 +156,12 @@ pub(super) async fn run(
     eprintln!("  Up to date : {}", plan.current);
     if plan.retimed > 0 {
         eprintln!("  Retimed    : {} (same size; timestamp taken from the server)", plan.retimed);
+    }
+    if plan.busy > 0 {
+        eprintln!("  In use     : {} (another transfer owns them; left untouched)", plan.busy);
+    }
+    if plan.reclaimed > 0 {
+        eprintln!("  Reclaimed  : {} of abandoned partial data", ui::format_size(plan.reclaimed));
     }
     eprintln!(
         "  To download: {download_count} ({} missing, {} resized, {} restamped)",
@@ -175,7 +188,8 @@ pub(super) async fn run(
         let refreshed = sftp::list(url, &options, allow_private, cancel.clone()).await?
             .context("SFTP source stopped being a directory; refusing deletion")?;
         ensure!(refreshed == listing, "SFTP tree changed during sync; no orphan deletion performed");
-        let local_total = plan.current + plan.retimed + download_count + orphans.len();
+        let local_total =
+            plan.current + plan.retimed + plan.busy + download_count + orphans.len();
         if !confirm_bulk_delete(orphans.len(), local_total) {
             return Ok(());
         }
