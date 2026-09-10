@@ -72,6 +72,14 @@ The default two-second window exists because FAT and exFAT store mtimes in two-s
 
 Downloads are counted by reason — missing, resized, restamped — and the first few are printed with the local and remote figures, so a surprising run can be checked against `ls -l` and `stat`.
 
+### What an interrupted run leaves behind
+
+A cancelled transfer keeps its partial payload deliberately, and the published file is never replaced until that payload is complete — so an interrupted run leaves the copy you already had exactly as it was, never truncated. Once sync decides that copy matches the server again, the partial bytes are unreachable: nothing schedules the file, so nothing reaches the code that would resume them. Sync removes them and reports `Reclaimed`. Partial data for a file that is *still* stale is kept, because that is precisely what resume uses.
+
+The empty `.lock` files under `.rdm-sftp` are deliberate and stay behind: keeping the inode alive is what makes the lock reliable across processes.
+
+A destination whose lock another transfer holds is reported as `In use` and left entirely alone — not retimed, not downloaded, not swept.
+
 `RDM_MAX_FILE_BYTES` applies to advertised SFTP sizes as well: 64 GiB by default, `0` for no ceiling. Recognised transient failures use `max_retries` and capped exponential backoff. Authentication, permissions, invalid paths and host-key failures are not retried. Unclassified read errors fail conservatively; retrying the queue item or command can resume its saved checkpoint.
 
 **Integrity limit:** SFTP v3 size/mtime is not a content hash or immutable version ID. With the default size comparison, a same-size rewrite is not detected; with `size+mtime` it is detected only when the server's timestamp changed too. Resume keeps the stricter rule — same URL, host key, size and exact mtime — because those partial bytes have to belong to the file still on the server. Use a stable source or independently verify published checksums where content integrity needs stronger guarantees. SSH still authenticates and protects the transport.
