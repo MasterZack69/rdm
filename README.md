@@ -1,6 +1,6 @@
 # Rust Download Manager
 - A "usable" download manager. Emphasis on usable.
-- HTTP/HTTPS/SFTP
+- HTTP/HTTPS/[SFTP](/extraInfo/sftp.md)
 - Resume support on most connections like other download managers.
 - Efficient as Fuck.
 - Written in rust so it must be cool. Emphasis on must.
