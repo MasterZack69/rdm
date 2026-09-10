@@ -1,11 +1,13 @@
 //! Every network-derived component is walked beneath an explicit trust root.
 
 use anyhow::{Context, Result, ensure};
-use std::fs::{File, Metadata};
+use std::fs::{File, FileTimes, Metadata};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 
-use crate::safe_file::{self, Access, Existing, PRIVATE_FILE_MODE};
+use crate::safe_file::{self, Access, Existing, DEFAULT_FILE_MODE, PRIVATE_FILE_MODE};
 
 pub(crate) const STATE_DIR: &str = ".rdm-sftp";
 
@@ -76,6 +78,36 @@ impl Destination {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error).context("Cannot inspect SFTP destination"),
         }
+    }
+
+    /// Adopts the server's modification time for a file that already has the
+    /// right size, transferring nothing.
+    ///
+    /// Returns `false` when the file is no longer the one that was inspected,
+    /// so the caller downloads it instead. The lock is the one a transfer
+    /// takes, so a queue item writing this path cannot be retimed underneath.
+    pub fn align_modified(&self, observed: &Metadata, seconds: u64) -> Result<bool> {
+        let time = UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
+            .context("Remote modification time is out of range")?;
+        let _lock = lock_output(&self.root, &self.relative)?;
+        // `Existing::Open` creates a missing file rather than failing, which
+        // is why the identity check below is the one that decides: a file
+        // replaced or removed since it was inspected is reported rather than
+        // retimed, and the empty placeholder is then overwritten by the
+        // transfer the caller performs instead.
+        let file = safe_file::open_beneath(
+            &self.root, &self.relative, Existing::Open, Access::ReadWrite, DEFAULT_FILE_MODE,
+        )?;
+        let current = file.metadata()?;
+        if current.dev() != observed.dev()
+            || current.ino() != observed.ino()
+            || current.len() != observed.len()
+        {
+            return Ok(false);
+        }
+        file.set_times(FileTimes::new().set_modified(time))
+            .context("Cannot set the local modification time")?;
+        Ok(true)
     }
 
     pub fn display_path(&self) -> Result<String> {

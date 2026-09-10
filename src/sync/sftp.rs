@@ -1,4 +1,5 @@
-//! SFTP mirrors compare size and mtime and replace stale files atomically.
+//! SFTP mirrors compare sizes, repair timestamps, and replace stale files
+//! atomically. Nothing is transferred to correct metadata alone.
 
 use anyhow::{Context, Result, ensure};
 use std::collections::HashSet;
@@ -11,11 +12,56 @@ use crate::safe_file;
 use crate::sftp::{self, SftpOptions, SftpUrl};
 use crate::sftp::batch::{Batch, download_files};
 use crate::sftp::local::{Destination, STATE_DIR, lock_file};
-use crate::sftp::stamp::FileStamp;
+use crate::sftp::stamp::{Compare, Difference, FileStamp, Verdict, modify_window};
 use crate::ui;
 
 use super::report::confirm_bulk_delete;
 use super::sftp_orphans::{self, matches_extension};
+
+/// How many stale files are explained before the transfers begin.
+const SAMPLE: usize = 5;
+
+/// What the scan decided, with enough detail to explain a surprising run.
+#[derive(Default)]
+struct Plan {
+    current: usize,
+    retimed: usize,
+    missing: usize,
+    resized: usize,
+    restamped: usize,
+    sample: Vec<String>,
+}
+
+impl Plan {
+    fn stale(&mut self, reason: Difference, relative: &str, stamp: &FileStamp) {
+        match reason {
+            Difference::Missing | Difference::Replaced => self.missing += 1,
+            Difference::Size { .. } => self.resized += 1,
+            Difference::Modified { .. } => self.restamped += 1,
+        }
+        if self.sample.len() < SAMPLE {
+            // A listing chooses these names, so they are only ever drawn safely.
+            self.sample.push(format!(
+                "{} - {}", ui::terminal_safe(relative), explain(reason, stamp),
+            ));
+        }
+    }
+}
+
+/// The reason in the terms a user can check with `ls -l` and `stat`.
+fn explain(reason: Difference, stamp: &FileStamp) -> String {
+    match reason {
+        Difference::Missing => String::from("not present locally"),
+        Difference::Replaced => String::from("changed while sync was inspecting it"),
+        Difference::Size { local } => format!("{local} bytes locally, {} remotely", stamp.size),
+        Difference::Modified { local } => match (local, stamp.modified) {
+            (Some(local), Some(remote)) => format!("mtime {local} locally, {remote} remotely"),
+            (None, Some(remote)) => format!("no usable local mtime, {remote} remotely"),
+            (Some(local), None) => format!("mtime {local} locally, none reported remotely"),
+            (None, None) => String::from("no usable timestamps"),
+        },
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
@@ -30,6 +76,8 @@ pub(super) async fn run(
     cancel: CancellationToken,
 ) -> Result<()> {
     ensure!(!delete || output_dir.is_some(), "SFTP sync --delete requires -o naming a dedicated mirror directory");
+    let compare = Compare::from_env()?;
+    let window = modify_window()?;
     let target = SftpUrl::parse(url)?;
     let options = SftpOptions::from_config(cfg)?;
     let listing = sftp::list(url, &options, allow_private, cancel.clone()).await?
@@ -52,7 +100,8 @@ pub(super) async fn run(
     if requested_connections.is_some_and(|count| count > 1) {
         eprintln!("  SFTP uses one stream per file; -p controls concurrent files.");
     }
-    let mut up_to_date = 0;
+    let mut plan = Plan::default();
+    let mut keep = HashSet::new();
     let mut to_download = Vec::new();
     for remote in &listing.files {
         if !matches_extension(&remote.relative_path, &extensions) { continue; }
@@ -60,26 +109,56 @@ pub(super) async fn run(
         if output_dir.is_none() {
             file.relative_path = format!("{}/{}", target.folder_name(), file.relative_path);
         }
+        // The same string the orphan sweep reads off disk, so a file this run
+        // keeps can never be collected as an orphan of the same run.
+        keep.insert(file.relative_path.clone());
         let destination = Destination::beneath(&root, &file.relative_path)?;
         destination.prepare()?;
         let stamp = FileStamp { size: file.size, modified: file.modified };
-        if destination.metadata()?.is_some_and(|metadata| stamp.matches_local(&metadata)) {
-            up_to_date += 1;
-        } else {
-            to_download.push(file);
+        let verdict = match destination.metadata()? {
+            None => Verdict::Stale(Difference::Missing),
+            Some(local) => match stamp.compare_local(&local, compare, window) {
+                // A repair writes no payload bytes, so it happens here rather
+                // than being queued as a transfer.
+                Verdict::Retime { seconds } => {
+                    if destination.align_modified(&local, seconds)? {
+                        Verdict::Retime { seconds }
+                    } else {
+                        Verdict::Stale(Difference::Replaced)
+                    }
+                }
+                verdict => verdict,
+            },
+        };
+        match verdict {
+            Verdict::Current => plan.current += 1,
+            Verdict::Retime { .. } => plan.retimed += 1,
+            Verdict::Stale(reason) => {
+                plan.stale(reason, &file.relative_path, &stamp);
+                to_download.push(file);
+            }
         }
     }
-    let keep: HashSet<String> = listing.files.iter().map(|file| file.relative_path.clone()).collect();
+    to_download.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     let orphans = if delete {
         sftp_orphans::collect(&root, &keep, &extensions, &cancel)?
     } else {
         Vec::new()
     };
     let download_count = to_download.len();
-    eprintln!("  Up to date : {up_to_date}");
-    eprintln!("  To download: {download_count}");
+    eprintln!("  Up to date : {}", plan.current);
+    if plan.retimed > 0 {
+        eprintln!("  Retimed    : {} (same size; timestamp taken from the server)", plan.retimed);
+    }
+    eprintln!(
+        "  To download: {download_count} ({} missing, {} resized, {} restamped)",
+        plan.missing, plan.resized, plan.restamped,
+    );
     eprintln!("  Skipped    : {} symlink(s) or special file(s)", listing.skipped);
     if delete { eprintln!("  To delete  : {}", orphans.len()); }
+    for line in &plan.sample {
+        eprintln!("    + {line}");
+    }
     // This does not touch the persistent queue or run unrelated queue items.
     // Every error is propagated before the deletion phase can be reached.
     download_files(to_download, options.clone(), Batch {
@@ -96,7 +175,8 @@ pub(super) async fn run(
         let refreshed = sftp::list(url, &options, allow_private, cancel.clone()).await?
             .context("SFTP source stopped being a directory; refusing deletion")?;
         ensure!(refreshed == listing, "SFTP tree changed during sync; no orphan deletion performed");
-        if !confirm_bulk_delete(orphans.len(), up_to_date + download_count + orphans.len()) {
+        let local_total = plan.current + plan.retimed + download_count + orphans.len();
+        if !confirm_bulk_delete(orphans.len(), local_total) {
             return Ok(());
         }
         for orphan in &orphans {

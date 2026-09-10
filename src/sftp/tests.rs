@@ -1,3 +1,4 @@
+mod compare;
 mod hostkeys;
 mod live;
 mod storage;
