@@ -28,6 +28,7 @@ struct Plan {
     retimed: usize,
     busy: usize,
     missing: usize,
+    replaced: usize,
     resized: usize,
     restamped: usize,
     reclaimed: u64,
@@ -37,7 +38,8 @@ struct Plan {
 impl Plan {
     fn stale(&mut self, reason: Difference, relative: &str, stamp: &FileStamp) {
         match reason {
-            Difference::Missing | Difference::Replaced => self.missing += 1,
+            Difference::Missing => self.missing += 1,
+            Difference::Replaced => self.replaced += 1,
             Difference::Size { .. } => self.resized += 1,
             Difference::Modified { .. } => self.restamped += 1,
         }
@@ -53,8 +55,10 @@ impl Plan {
 /// The reason in the terms a user can check with `ls -l` and `stat`.
 fn explain(reason: Difference, stamp: &FileStamp) -> String {
     match reason {
-        Difference::Missing => String::from("not present locally"),
-        Difference::Replaced => String::from("changed while sync was inspecting it"),
+        // The name is already on the line; what the reader does not know is
+        // how much this run is about to pull down.
+        Difference::Missing => format!("not here yet; {} to fetch", ui::format_size(stamp.size)),
+        Difference::Replaced => String::from("changed locally while sync was inspecting it"),
         Difference::Size { local } => format!("{local} bytes locally, {} remotely", stamp.size),
         Difference::Modified { local } => match (local, stamp.modified) {
             (Some(local), Some(remote)) => format!("mtime {local} locally, {remote} remotely"),
@@ -163,15 +167,36 @@ pub(super) async fn run(
     if plan.reclaimed > 0 {
         eprintln!("  Reclaimed  : {} of abandoned partial data", ui::format_size(plan.reclaimed));
     }
-    eprintln!(
-        "  To download: {download_count} ({} missing, {} resized, {} restamped)",
-        plan.missing, plan.resized, plan.restamped,
-    );
-    eprintln!("  Skipped    : {} symlink(s) or special file(s)", listing.skipped);
-    if delete { eprintln!("  To delete  : {}", orphans.len()); }
-    for line in &plan.sample {
-        eprintln!("    + {line}");
+    // Built from the nonzero reasons only, so it always adds up to the total
+    // and never invites a reader to scan categories that do not apply.
+    let breakdown: Vec<String> = [
+        (plan.missing, "new"),
+        (plan.resized, "different size"),
+        (plan.restamped, "different timestamp"),
+        (plan.replaced, "changed mid-scan"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect();
+    if breakdown.is_empty() {
+        eprintln!("  To download: 0");
+    } else {
+        eprintln!("  To download: {download_count} ({})", breakdown.join(", "));
     }
+    eprintln!("  Skipped    : {} symlink(s) or special file(s)", listing.skipped);
+    if !plan.sample.is_empty() {
+        eprintln!("  Will download:");
+        for line in &plan.sample {
+            eprintln!("    + {line}");
+        }
+        // Five lines under a count of six reads as the whole list. Say so.
+        let hidden = download_count.saturating_sub(plan.sample.len());
+        if hidden > 0 {
+            eprintln!("    … and {hidden} more");
+        }
+    }
+    if delete { eprintln!("  To delete  : {}", orphans.len()); }
     // This does not touch the persistent queue or run unrelated queue items.
     // Every error is propagated before the deletion phase can be reached.
     download_files(to_download, options.clone(), Batch {
