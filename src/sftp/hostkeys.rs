@@ -16,6 +16,23 @@ const PREFERENCE: [(&str, &str); 5] = [
     ("ssh-rsa", "rsa-sha2-512,rsa-sha2-256,ssh-rsa"),
 ];
 
+/// Refuses marked entries wherever the text came from.
+///
+/// Both `read` and `load` call this rather than `read` alone: `load` is what
+/// feeds libssh2, so it has to be the thing that refuses, or text obtained
+/// any other way bypasses the policy entirely. libssh2 is not OpenSSH's
+/// certificate/revocation engine — never silently ignore `@revoked` or
+/// accept a certificate as an ordinary key.
+fn validate(text: &str) -> Result<()> {
+    for line in entries(text) {
+        ensure!(
+            !line.starts_with('@'),
+            "Marked known_hosts entries are unsupported; use RDM_SFTP_KNOWN_HOSTS with a dedicated, verified ordinary-key file"
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn read(path: &Path) -> Result<String> {
     const MAX_BYTES: u64 = 4 * 1024 * 1024;
     let file = std::fs::File::open(path)
@@ -24,17 +41,12 @@ pub(super) fn read(path: &Path) -> Result<String> {
     file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= MAX_BYTES, "SSH known_hosts exceeds 4 MiB");
     let text = std::str::from_utf8(&bytes).context("SSH known_hosts is not UTF-8")?;
-    for line in entries(text) {
-        // libssh2 is not OpenSSH's certificate/revocation policy engine.
-        ensure!(
-            !line.starts_with('@'),
-            "Marked known_hosts entries are unsupported; use RDM_SFTP_KNOWN_HOSTS with a dedicated, verified ordinary-key file"
-        );
-    }
+    validate(text)?;
     Ok(text.to_owned())
 }
 
 pub(super) fn load(hosts: &mut KnownHosts, text: &str) -> Result<()> {
+    validate(text)?;
     for line in entries(text) {
         hosts.read_str(line, KnownHostFileKind::OpenSSH)
             .context("Cannot parse SSH known_hosts")?;
@@ -50,6 +62,9 @@ pub(super) fn load(hosts: &mut KnownHosts, text: &str) -> Result<()> {
 pub(super) fn algorithms(text: &str, host: &str, port: u16) -> Option<String> {
     let mut enrolled: Vec<&str> = Vec::new();
     for line in entries(text) {
+        if line.starts_with('@') {
+            continue; // Marked entries are rejected by `validate`; never derive preference from one.
+        }
         let Some((patterns, rest)) = line.split_once(char::is_whitespace) else { continue };
         if !matches_target(patterns, host, port) {
             continue;
