@@ -105,7 +105,7 @@ fn scan(sftp: &Sftp, target: &SftpUrl, cancel: &CancellationToken) -> Result<Opt
         loop {
             check_cancel(cancel)?;
             ensure!(started.elapsed() <= MAX_DURATION, "SFTP scan exceeded ten minutes");
-            let (name, _) = match directory.readdir() {
+            let (name, listed) = match directory.readdir() {
                 Ok(entry) => entry,
                 Err(error) if error.code() == ErrorCode::Session(DIRECTORY_EOF) => break,
                 Err(error) => return Err(error).context("SFTP directory enumeration failed"),
@@ -118,7 +118,13 @@ fn scan(sftp: &Sftp, target: &SftpUrl, cancel: &CancellationToken) -> Result<Opt
             let child = relative.join(name);
             ensure!(seen.insert(child.clone()), "SFTP server returned a duplicate directory entry");
             let child_url = target.with_path(&target.path().join(&child))?;
-            let stat = sftp.lstat(child_url.path()).context("Cannot inspect SFTP directory entry")?;
+            let complete = listed.perm.is_some()
+                && (!listed.is_file() || (listed.size.is_some() && listed.mtime.is_some()));
+            let stat = if complete {
+                listed
+            } else {
+                sftp.lstat(child_url.path()).context("Cannot inspect SFTP directory entry")?
+            };
             if stat.is_dir() {
                 ensure!(depth < MAX_DEPTH && pending.len() + directories < MAX_DIRS, "SFTP directory scan limit exceeded");
                 pending.push_back((child, depth + 1));
