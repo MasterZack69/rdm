@@ -23,7 +23,7 @@
             pname = "rdm";
             version = "0.3.0";
             src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoHash = "sha256-jmkdG7wooILVnkbTgpng4iBt4UEIiCclsHv30964GXY=";
             nativeBuildInputs = with pkgs; [ pkg-config ];
             buildInputs = with pkgs; [ openssl zlib libssh2 ];
             doCheck = false;
