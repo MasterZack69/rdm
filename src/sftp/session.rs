@@ -69,14 +69,22 @@ where
     let interrupt = Interrupt { socket: tcp.try_clone()?, cancel: worker_cancel.clone() };
     let mut worker = tokio::task::spawn_blocking(move || {
         check_cancel(&worker_cancel)?;
+        let trusted = super::hostkeys::read(&authentication.known_hosts)?;
         let mut session = Session::new().context("Cannot initialise SSH")?;
         session.set_timeout(15_000);
         session.set_tcp_stream(tcp);
+        // Negotiate only types we can verify. Otherwise libssh2 may present an RSA
+        // key for a host enrolled by ed25519, and the comparison below reports
+        // MISMATCH for a server that never changed its keys.
+        if let Some(preference) = super::hostkeys::algorithms(&trusted, target.host(), target.port()) {
+            session.method_pref(ssh2::MethodType::HostKey, &preference)
+                .context("Cannot restrict SSH host-key algorithms to the enrolled types")?;
+        }
         session.handshake().context("SSH handshake failed")?;
         let mut hosts = session.known_hosts().context("Cannot initialise host-key verification")?;
-        super::hostkeys::load(&mut hosts, &authentication.known_hosts)?;
-        let (key, _) = session.host_key().context("SSH server supplied no host key")?;
-        verify_host(&hosts, &target, key)?;
+        super::hostkeys::load(&mut hosts, &trusted)?;
+        let (key, kind) = session.host_key().context("SSH server supplied no host key")?;
+        verify_host(&hosts, &target, key, kind)?;
         // Verification MUST precede every authentication attempt.
         check_cancel(&worker_cancel)?;
         authenticate(&session, &target, &authentication, &worker_cancel)?;
@@ -108,14 +116,30 @@ where
     })
 }
 
-pub(crate) fn verify_host(hosts: &KnownHosts, target: &SftpUrl, key: &[u8]) -> Result<()> {
+pub(crate) fn verify_host(hosts: &KnownHosts, target: &SftpUrl, key: &[u8], kind: ssh2::HostKeyType) -> Result<()> {
     match hosts.check_port(target.host(), target.port(), key) {
         CheckResult::Match => Ok(()),
-        CheckResult::Mismatch => anyhow::bail!("SSH host key changed; refusing authentication"),
+        CheckResult::Mismatch => anyhow::bail!(
+            "SSH host key mismatch: the server offered a {} key that does not match the entry enrolled for {}:{}. \
+             If you have not enrolled every key type for this host, enrol the offered one; otherwise treat this as an attack",
+            describe(kind), target.host(), target.port()
+        ),
         CheckResult::NotFound => anyhow::bail!(
             "SSH host key is not trusted; verify its fingerprint independently and enrol it in known_hosts"
         ),
         CheckResult::Failure => anyhow::bail!("SSH host-key verification failed"),
+    }
+}
+
+fn describe(kind: ssh2::HostKeyType) -> &'static str {
+    match kind {
+        ssh2::HostKeyType::Ed25519 => "ssh-ed25519",
+        ssh2::HostKeyType::Ecdsa256 => "ecdsa-sha2-nistp256",
+        ssh2::HostKeyType::Ecdsa384 => "ecdsa-sha2-nistp384",
+        ssh2::HostKeyType::Ecdsa521 => "ecdsa-sha2-nistp521",
+        ssh2::HostKeyType::Rsa => "ssh-rsa",
+        ssh2::HostKeyType::Dss => "ssh-dss",
+        ssh2::HostKeyType::Unknown => "unknown",
     }
 }
 

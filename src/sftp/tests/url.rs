@@ -61,12 +61,12 @@ fn known_hosts_match_the_host_port_and_key() {
     let key = b"opaque-test-host-key";
     hosts.add("[example.test]:2222", key, "test", ssh2::HostKeyType::Ed25519.into()).unwrap();
     let correct = SftpUrl::parse("sftp://alice@example.test:2222/a").unwrap();
-    assert!(verify_host(&hosts, &correct, key).is_ok());
-    assert!(verify_host(&hosts, &correct, b"changed-key").is_err());
+    assert!(verify_host(&hosts, &correct, key, ssh2::HostKeyType::Ed25519).is_ok());
+    assert!(verify_host(&hosts, &correct, b"changed-key", ssh2::HostKeyType::Ed25519).is_err());
     let other_port = SftpUrl::parse("sftp://alice@example.test/a").unwrap();
-    assert!(verify_host(&hosts, &other_port, key).is_err());
+    assert!(verify_host(&hosts, &other_port, key, ssh2::HostKeyType::Ed25519).is_err());
     let other_host = SftpUrl::parse("sftp://alice@other.test:2222/a").unwrap();
-    assert!(verify_host(&hosts, &other_host, key).is_err());
+    assert!(verify_host(&hosts, &other_host, key, ssh2::HostKeyType::Ed25519).is_err());
 }
 
 #[test]
