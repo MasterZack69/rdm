@@ -192,7 +192,7 @@ pub async fn download(
 
     if !info.supports_range {
         let meta_path = crate::resume::ResumeMetadata::meta_path(&output_path);
-        let part_path = format!("{}.part", &output_path);
+        let part_path = format!("{}.part", output_path);
         let _ = std::fs::remove_file(&meta_path);
         let _ = std::fs::remove_file(&part_path);
     }
