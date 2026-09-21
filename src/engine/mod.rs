@@ -31,10 +31,14 @@ mod run;
 mod streaming;
 mod url;
 
+pub use client::set_shared_config;
 pub use dispatch::download;
 pub use name::safe_filename;
 pub use output::resolve_existing_output;
 pub use request::{DownloadRequest, ExistingPolicy, Outcome, OutputDecision};
 pub use run::{run_download, run_download_with_client, run_download_with_identity};
-pub use streaming::{build_streaming_request, resolve_resume_action, ResumeAction};
+pub use streaming::{
+    ResumeAction, StreamIdentity, StreamStart, build_streaming_request, plan_streaming_resume,
+    resolve_resume_action,
+};
 pub use url::{extract_filename_from_url, normalize_download_url, percent_decode};

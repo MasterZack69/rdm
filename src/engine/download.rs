@@ -1,6 +1,6 @@
 //! Turning a [`DownloadRequest`] into a file on disk.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -16,7 +16,7 @@ use super::client::shared_config;
 use super::name::safe_filename;
 use super::output::{resolve_existing_output, resolve_output_path};
 use super::request::{DownloadRequest, Outcome, OutputDecision};
-use super::streaming::download_streaming;
+use super::streaming::{StreamIdentity, download_streaming};
 use super::url::normalize_download_url;
 
 /// Downloads one file, reporting everything through `sink`.
@@ -112,7 +112,21 @@ pub async fn download(
 
     // Unknown file size → streaming fallback.
     let file_size = match info.size {
-        Some(0) => anyhow::bail!("Cannot download empty file (Content-Length: 0)"),
+        // An empty file is a file. There is no body to stream and no range to
+        // ask for, so the whole transfer is creating it.
+        Some(0) => {
+            sink.detail("File size : 0 B (empty file)");
+            sink.detail(&format!("Output    : {}", ui::terminal_safe(&output_path)));
+            sink.total(Some(0));
+            sink.state(SlotState::Finishing);
+            let result = write_empty_file(&output_path).await;
+            sink.finish();
+            result?;
+            return Ok(Outcome::Completed {
+                path: output_path,
+                bytes: 0,
+            });
+        }
         Some(s) => s,
         None => {
             sink.detail("File size : unknown (streaming)");
@@ -122,9 +136,20 @@ pub async fn download(
             sink.total(None);
             sink.state(SlotState::Downloading);
 
-            let result =
-                download_streaming(client, &fetch_url, &output_path, cancel, Arc::clone(&sink))
-                    .await;
+            let result = download_streaming(
+                client,
+                &fetch_url,
+                &output_path,
+                StreamIdentity {
+                    url: &url,
+                    identity: req.resume_identity.as_deref(),
+                    etag: info.etag.as_deref(),
+                    last_modified: info.last_modified.as_deref(),
+                },
+                cancel,
+                Arc::clone(&sink),
+            )
+            .await;
             sink.finish();
 
             return match result {
@@ -167,7 +192,7 @@ pub async fn download(
 
     if !info.supports_range {
         let meta_path = crate::resume::ResumeMetadata::meta_path(&output_path);
-        let part_path = format!("{}.part", &output_path);
+        let part_path = format!("{}.part", output_path);
         let _ = std::fs::remove_file(&meta_path);
         let _ = std::fs::remove_file(&part_path);
     }
@@ -215,6 +240,42 @@ pub async fn download(
         }),
         Err(e) => Err(e),
     }
+}
+
+/// Creates a zero-length file at `output_path`.
+///
+/// Written as `<output>.part` and renamed, so an empty file arrives the same
+/// way every other download does: through a guarded open that will not follow
+/// a symlink, and through the rename that refuses to replace a file which
+/// appeared while we were working.
+async fn write_empty_file(output_path: &str) -> Result<()> {
+    use crate::safe_file::{self, Access, Existing};
+    use std::path::Path;
+
+    let temp_path = format!("{}.part", output_path);
+    let temp = Path::new(&temp_path);
+    let destination_existed = tokio::fs::symlink_metadata(output_path).await.is_ok();
+
+    let file = safe_file::open_guarded(
+        temp,
+        Existing::Open,
+        Access::ReadWrite,
+        safe_file::DEFAULT_FILE_MODE,
+    )
+    .context("Failed to create .part file")?;
+    // A `.part` left over from a previous, larger version of this file.
+    file.set_len(0).context("Failed to truncate .part file")?;
+    drop(file);
+
+    // Resume state for a file that is now empty describes something else.
+    let _ = tokio::fs::remove_file(crate::resume::ResumeMetadata::meta_path(output_path)).await;
+
+    if destination_existed {
+        safe_file::rename_replacing(temp, Path::new(output_path))
+    } else {
+        safe_file::rename_no_replace(temp, Path::new(output_path))
+    }
+    .with_context(|| format!("Failed to rename '{}' to '{}'", temp_path, output_path))
 }
 
 /// Where a server-suggested filename would move the download to, or `None` if
@@ -286,6 +347,45 @@ mod tests {
             etag: None,
             last_modified: None,
         }
+    }
+
+    /// `Content-Length: 0` used to be rejected outright ("Cannot download
+    /// empty file"), which is a correctness bug: an empty file is a file.
+    #[tokio::test]
+    async fn an_empty_file_downloads_to_an_empty_file() {
+        use axum::routing::get;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = axum::Router::new().route("/empty.txt", get(|| async { "" }));
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("empty.txt").to_string_lossy().into_owned();
+
+        let outcome = download(
+            DownloadRequest::new(format!("http://{}/empty.txt", addr), Some(output.clone()), 4)
+                .with_allow_private(true),
+            CancellationToken::new(),
+            crate::ui::silent(),
+        )
+        .await
+        .expect("an empty file is a perfectly valid download");
+
+        assert_eq!(
+            outcome,
+            Outcome::Completed {
+                path: output.clone(),
+                bytes: 0
+            }
+        );
+        assert_eq!(tokio::fs::metadata(&output).await.unwrap().len(), 0);
+        // No `.part` and no resume state left behind.
+        assert!(
+            tokio::fs::metadata(format!("{}.part", output))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

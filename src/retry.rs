@@ -49,6 +49,114 @@ pub fn is_transient_status(status: StatusCode) -> bool {
 #[derive(Debug)]
 pub struct TransientError {
     pub message: String,
+    /// What the server asked us to wait, when it said.
+    ///
+    /// A `429` or `503` carrying `Retry-After` is the one case where the
+    /// server has told us exactly how to behave, and guessing an exponential
+    /// backoff instead is how a client earns a longer ban.
+    pub retry_after: Option<Duration>,
+}
+
+impl TransientError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    pub fn after(message: impl Into<String>, retry_after: Option<Duration>) -> Self {
+        Self {
+            message: message.into(),
+            retry_after,
+        }
+    }
+}
+
+/// The longest pause a server may ask for and be believed.
+///
+/// `Retry-After: 86400` is a valid answer and not one a download session can
+/// act on; honouring it literally would hang the run for a day.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
+
+/// Parses `Retry-After`, in either of its two forms.
+///
+/// Delta-seconds (`Retry-After: 30`) or an HTTP-date
+/// (`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`). A date already in the past
+/// means "now", which is `Duration::ZERO` rather than an error. The result is
+/// capped at [`MAX_RETRY_AFTER`].
+pub fn parse_retry_after(value: &str, now_unix: u64) -> Option<Duration> {
+    let value = value.trim();
+
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER));
+    }
+
+    let target = parse_http_date(value)?;
+    Some(Duration::from_secs(target.saturating_sub(now_unix)).min(MAX_RETRY_AFTER))
+}
+
+/// Seconds since the epoch for an IMF-fixdate, the form servers must send.
+///
+/// `Sun, 06 Nov 1994 08:49:37 GMT`. The two obsolete formats in the spec are
+/// not parsed; a client that cannot read one falls back to its own backoff,
+/// which is the same thing it does for a missing header.
+fn parse_http_date(value: &str) -> Option<u64> {
+    let rest = value.split_once(", ").map(|(_, rest)| rest).unwrap_or(value);
+    let mut parts = rest.split_whitespace();
+
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts.next()?.parse().ok()?;
+
+    let time = parts.next()?;
+    let mut hms = time.split(':');
+    let hour: u64 = hms.next()?.parse().ok()?;
+    let minute: u64 = hms.next()?.parse().ok()?;
+    let second: u64 = hms.next()?.parse().ok()?;
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day);
+    if days < 0 {
+        return None;
+    }
+
+    Some(days as u64 * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Days between 1970-01-01 and the given civil date (Howard Hinnant's
+/// `days_from_civil`, the standard branch-free form).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The pause the server asked for, anywhere in an error chain.
+pub fn retry_after(err: &anyhow::Error) -> Option<Duration> {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<TransientError>())
+        .find_map(|transient| transient.retry_after)
 }
 
 impl std::fmt::Display for TransientError {
@@ -163,9 +271,7 @@ mod tests {
 
     #[test]
     fn test_transient_marker_is_retryable() {
-        let err = anyhow::Error::new(TransientError {
-            message: "server busy".into(),
-        });
+        let err = anyhow::Error::new(TransientError::new("server busy"));
         assert!(is_retryable(&err));
     }
 
@@ -257,9 +363,7 @@ mod tests {
     fn test_permanent_io_overrides_transient_marker() {
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let inner = anyhow::Error::new(io_err);
-        let outer = inner.context(TransientError {
-            message: "transient wrapper".into(),
-        });
+        let outer = inner.context(TransientError::new("transient wrapper"));
         assert!(!is_retryable(&outer));
     }
 
@@ -267,10 +371,56 @@ mod tests {
     fn test_write_zero_overrides_transient_marker() {
         let io_err = std::io::Error::new(std::io::ErrorKind::WriteZero, "disk full");
         let inner = anyhow::Error::new(io_err);
-        let outer = inner.context(TransientError {
-            message: "should not matter".into(),
-        });
+        let outer = inner.context(TransientError::new("should not matter"));
         assert!(!is_retryable(&outer));
+    }
+
+    #[test]
+    fn retry_after_in_seconds_is_taken_literally() {
+        assert_eq!(parse_retry_after("30", 0), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("  5 ", 0), Some(Duration::from_secs(5)));
+        assert_eq!(parse_retry_after("0", 0), Some(Duration::ZERO));
+    }
+
+    /// A server may ask for a day. A download session cannot give it one.
+    #[test]
+    fn an_absurd_retry_after_is_capped() {
+        assert_eq!(parse_retry_after("86400", 0), Some(MAX_RETRY_AFTER));
+    }
+
+    #[test]
+    fn retry_after_as_a_date_is_the_distance_from_now() {
+        // 1994-11-06 08:49:37 GMT
+        let epoch = 784_111_777;
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:47 GMT", epoch),
+            Some(Duration::from_secs(10))
+        );
+        // Already past: retry now rather than error.
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:00 GMT", epoch),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_retry_after_we_cannot_read_is_simply_absent() {
+        assert_eq!(parse_retry_after("soon", 0), None);
+        assert_eq!(parse_retry_after("", 0), None);
+        assert_eq!(parse_retry_after("Sun, 06 Foo 1994 08:49:37 GMT", 0), None);
+    }
+
+    #[test]
+    fn a_servers_pause_is_found_through_the_error_chain() {
+        let err = anyhow::Error::new(TransientError::after(
+            "HTTP 429",
+            Some(Duration::from_secs(12)),
+        ))
+        .context("chunk #3 failed");
+        assert_eq!(retry_after(&err), Some(Duration::from_secs(12)));
+
+        let plain = anyhow::Error::new(TransientError::new("HTTP 503"));
+        assert_eq!(retry_after(&plain), None);
     }
 
     #[test]

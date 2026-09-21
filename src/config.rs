@@ -162,17 +162,81 @@ pub fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// The 1-based line and column of a byte offset into `text`.
+///
+/// `toml::de::Error` reports a byte span; a person reading the message wants
+/// the place in the file it points at.
+fn line_col(text: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(text.len());
+    let before = &text[..offset];
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rfind('\n')
+        .map(|nl| offset - nl - 1)
+        .unwrap_or(offset)
+        + 1;
+    (line, column)
+}
+
+/// The first line of a `toml` error, which is the part that names the problem.
+///
+/// The rest is the snippet the crate draws underneath it, and it is repeated
+/// in the location this function's caller adds.
+fn first_line(message: &str) -> String {
+    message.lines().next().unwrap_or(message).trim().to_owned()
+}
+
 impl Config {
-    pub fn load() -> Self {
+    /// Reads `config.toml`, or writes a default one when there is none.
+    ///
+    /// An unreadable or unparseable file is an error rather than a shrug. It
+    /// used to be `unwrap_or_default()`, which threw away *the whole file* on
+    /// a single typo: the download directory moved back to `~/Downloads`,
+    /// concurrency and retries reverted, and the GoFile, Drive and pixeldrain
+    /// credentials silently became empty — all without a word. A configuration
+    /// the user wrote is never discarded; they are told where the problem is
+    /// so they can fix it.
+    ///
+    /// A missing file is the one case that is not an error: that is a first
+    /// run, and the defaults are written out as a starting point.
+    pub fn load() -> Result<Self> {
         let path = config_path();
         match std::fs::read_to_string(&path) {
-            Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
-            Err(_) => {
+            Ok(contents) => Self::parse(&path, &contents),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let cfg = Config::default();
                 let _ = cfg.save();
-                cfg
+                Ok(cfg)
             }
+            // Permissions, a directory where the file should be, an I/O
+            // error: the file exists in some form and we could not read it,
+            // so its contents are unknown rather than absent.
+            Err(e) => Err(e).with_context(|| {
+                format!("Failed to read configuration file: {}", path.display())
+            }),
         }
+    }
+
+    /// Parses configuration text, naming the file and the place in it.
+    pub fn parse(path: &std::path::Path, contents: &str) -> Result<Self> {
+        toml::from_str::<Config>(contents).map_err(|err| {
+            let location = match err.span() {
+                Some(span) => {
+                    let (line, column) = line_col(contents, span.start);
+                    format!(" at line {}, column {}", line, column)
+                }
+                None => String::new(),
+            };
+            anyhow::anyhow!(
+                "Invalid configuration in {}{}: {}\n  \
+                 Fix the file (or move it aside) and run again. rdm will not fall back to \
+                 defaults, because that would silently change your download directory, \
+                 connection count, retry behaviour and stored credentials.",
+                path.display(),
+                location,
+                first_line(&err.to_string()),
+            )
+        })
     }
 
     /// Writes the config file, readable only by its owner.
@@ -361,6 +425,55 @@ queue_parallel = 5
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.pixeldrain_workers, 6);
         assert_eq!(back.pixeldrain_api_key, "deadbeef");
+    }
+
+    /// A typo used to cost the user every setting in the file: `load`
+    /// answered `Config::default()` and said nothing, so the download
+    /// directory, the connection count and three credentials all changed
+    /// behind their back.
+    #[test]
+    fn an_invalid_config_is_an_error_naming_the_file_and_the_place() {
+        let path = std::path::Path::new("/home/u/.config/rdm/config.toml");
+        let broken = "connections = 12\ndownload_dir = \"/tmp/dl\"\nmax_retries = \n";
+
+        let err = Config::parse(path, broken).expect_err("a broken config must not be defaulted");
+        let message = format!("{:#}", err);
+
+        assert!(message.contains("/home/u/.config/rdm/config.toml"), "{message}");
+        assert!(message.contains("line 3"), "{message}");
+    }
+
+    /// A value of the wrong type is located too, not just a syntax error.
+    #[test]
+    fn a_wrongly_typed_value_is_located() {
+        let path = std::path::Path::new("/tmp/config.toml");
+        let wrong = "connections = \"eight\"\ndownload_dir = \"/tmp/dl\"\nmax_retries = 6\nqueue_parallel = 3\n";
+
+        let err = Config::parse(path, wrong).expect_err("a string is not a connection count");
+        let message = format!("{:#}", err);
+
+        assert!(message.contains("/tmp/config.toml"), "{message}");
+        assert!(message.contains("line 1"), "{message}");
+    }
+
+    #[test]
+    fn a_valid_config_still_parses_through_the_new_path() {
+        let path = std::path::Path::new("/tmp/config.toml");
+        let good = "connections = 12\ndownload_dir = \"/tmp/dl\"\nmax_retries = 69\nqueue_parallel = 5\n";
+
+        let cfg = Config::parse(path, good).expect("a valid config must load");
+        assert_eq!(cfg.connections, 12);
+        assert_eq!(cfg.download_dir, "/tmp/dl");
+    }
+
+    #[test]
+    fn offsets_map_to_lines_and_columns() {
+        assert_eq!(line_col("abc", 0), (1, 1));
+        assert_eq!(line_col("abc", 2), (1, 3));
+        assert_eq!(line_col("ab\ncd", 3), (2, 1));
+        assert_eq!(line_col("ab\ncd", 4), (2, 2));
+        // Past the end rather than panicking.
+        assert_eq!(line_col("ab", 99), (1, 3));
     }
 
     /// The reason `save` goes through `secret_file`: the serialized form

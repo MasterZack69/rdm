@@ -160,21 +160,30 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
     })
 }
 
+/// The stated body length, including a stated length of zero.
+///
+/// `Content-Length: 0` used to be filtered out here and turned into "unknown
+/// size", which sent an empty file down the streaming path and from there
+/// into "Cannot download empty file". An empty file is a perfectly ordinary
+/// file, and a server that states its size has told us what it is.
 fn extract_content_length(headers: &header::HeaderMap) -> Option<u64> {
     headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&len| len > 0)
+        .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
+/// The total from a `Content-Range`, including a total of zero.
+///
+/// `bytes */0` is how a server answers a ranged request for an empty file,
+/// and zero is the real size rather than a missing one. An unknown total
+/// (`*`) still parses to `None`.
 fn extract_size_from_content_range(headers: &header::HeaderMap) -> Option<u64> {
     headers
         .get(header::CONTENT_RANGE)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.rsplit('/').next())
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&len| len > 0)
+        .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
 #[cfg(test)]
@@ -201,11 +210,13 @@ mod tests {
         assert_eq!(extract_content_length(&headers), None);
     }
 
+    /// Was `None`, which meant "size unknown" and sent a perfectly valid
+    /// empty file down the streaming path to be rejected.
     #[test]
     fn test_extract_content_length_zero() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
-        assert_eq!(extract_content_length(&headers), None);
+        assert_eq!(extract_content_length(&headers), Some(0));
     }
 
     #[test]
@@ -231,10 +242,23 @@ mod tests {
         assert_eq!(extract_size_from_content_range(&headers), None);
     }
 
+    /// `bytes */0` is the answer to a ranged request for an empty file. The
+    /// total is zero, not absent.
     #[test]
     fn test_extract_size_from_content_range_star() {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_RANGE, HeaderValue::from_static("bytes */0"));
+        assert_eq!(extract_size_from_content_range(&headers), Some(0));
+    }
+
+    /// A genuinely unknown total stays unknown.
+    #[test]
+    fn test_extract_size_from_content_range_unknown_total() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-99/*"),
+        );
         assert_eq!(extract_size_from_content_range(&headers), None);
     }
 

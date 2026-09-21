@@ -6,6 +6,7 @@ pub mod hoster;
 pub mod inspect;
 pub mod net;
 pub mod parallel;
+pub mod pressure;
 pub mod queue;
 pub mod range_download;
 pub mod resume;

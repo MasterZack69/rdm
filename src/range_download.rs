@@ -11,6 +11,14 @@ use tokio_util::sync::CancellationToken;
 use crate::retry::{TransientError, is_transient_status};
 use crate::safe_file::{self, Access, Existing};
 
+/// Seconds since the epoch, for `Retry-After`'s date form.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[derive(Debug)]
 pub enum DownloadStatus {
     Complete { bytes_written: u64 },
@@ -79,13 +87,22 @@ pub async fn download_range(
         );
     } else if status != StatusCode::PARTIAL_CONTENT {
         if is_transient_status(status) {
-            return Err(anyhow::Error::new(TransientError {
-                message: format!(
+            // A 429 or 503 often says how long to wait. Reading it is what
+            // turns a retry storm into a queue.
+            let retry_after = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| crate::retry::parse_retry_after(v, unix_now()));
+
+            return Err(anyhow::Error::new(TransientError::after(
+                format!(
                     "Transient HTTP {} for range {}",
                     status.as_u16(),
                     range_value
                 ),
-            }));
+                retry_after,
+            )));
         }
         anyhow::bail!(
             "Permanent HTTP error for range {}: {} {}",
