@@ -6,18 +6,76 @@ use tokio::io::AsyncWriteExt;
 use crate::chunk::Chunk;
 use crate::safe_file;
 
+/// Which download path wrote a manifest.
+///
+/// Both paths write the same file in the same format; this says which shape
+/// of state is in it. A manifest written by one path is never resumed by the
+/// other: a segmented manifest describes a chunk plan for a known size, and a
+/// streaming manifest describes a single append-only body whose size the
+/// server never stated.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferKind {
+    /// A chunk plan over a file of known size.
+    #[default]
+    Segmented,
+    /// One open-ended body appended to a `.part` file.
+    Streaming,
+}
+
+/// What the stored validator says about the bytes now on offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityCheck {
+    /// A strong validator was stored, the server offered one, and they agree.
+    Match,
+    /// Both sides have one and they differ: this is a different resource.
+    Changed,
+    /// One side has nothing to compare. Continuity cannot be established, so
+    /// there is no honest way to tell these two apart.
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResumeMetadata {
     pub url: String,
     /// A stable identity for the remote content, when the URL is not one.
     #[serde(default)]
     pub identity: Option<String>,
+    /// The size the server stated, or `0` for a streaming transfer whose size
+    /// it never did.
     pub file_size: u64,
+    /// The chunk plan. Empty for a streaming transfer, which has none: the
+    /// length of the `.part` file is its whole progress state.
     pub chunks: Vec<ChunkState>,
     #[serde(default)]
     pub etag: Option<String>,
     #[serde(default)]
     pub last_modified: Option<String>,
+    /// Which path wrote this. Absent in manifests written before streaming
+    /// transfers kept one, and those were all segmented.
+    #[serde(default)]
+    pub transfer: TransferKind,
+}
+
+/// The validator a byte-range resume may be conditioned on, strongest first.
+///
+/// A weak ETag (`W/"..."`) is deliberately refused: it marks two
+/// representations as *semantically* equivalent, which is exactly the
+/// guarantee a byte-range resume cannot use — two weakly-equal bodies may
+/// differ byte for byte, and splicing one onto the other is the corruption
+/// this is here to prevent. `Last-Modified` is what remains, and it is what
+/// `If-Range` was given a date form for.
+pub fn strong_validator<'a>(
+    etag: Option<&'a str>,
+    last_modified: Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(etag) = etag.map(str::trim).filter(|e| !e.is_empty())
+        && !etag.starts_with("W/")
+        && !etag.starts_with("w/")
+    {
+        return Some(etag);
+    }
+    last_modified.map(str::trim).filter(|v| !v.is_empty())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -51,22 +109,45 @@ impl ResumeMetadata {
         format!("{}.rdm", output_path)
     }
 
+    /// The validator this manifest was written with, if it is one we may
+    /// resume on.
+    pub fn stored_validator(&self) -> Option<&str> {
+        strong_validator(self.etag.as_deref(), self.last_modified.as_deref())
+    }
+
+    /// Whether the bytes on offer now are provably the bytes this manifest
+    /// describes.
+    ///
+    /// The old form only rejected when both sides had a value and the values
+    /// differed, so a server that stopped sending an `ETag` — or that never
+    /// sent one — looked exactly like a server confirming the file had not
+    /// changed. Resuming on that appends the new resource to the old partial
+    /// file and renames the result as complete.
+    ///
+    /// There are three answers, not two, and only [`IdentityCheck::Match`] is
+    /// good enough to resume on.
+    pub fn compare_server_identity(
+        &self,
+        current_etag: Option<&str>,
+        current_last_modified: Option<&str>,
+    ) -> IdentityCheck {
+        match (
+            self.stored_validator(),
+            strong_validator(current_etag, current_last_modified),
+        ) {
+            (Some(stored), Some(current)) if stored == current => IdentityCheck::Match,
+            (Some(_), Some(_)) => IdentityCheck::Changed,
+            _ => IdentityCheck::Unknown,
+        }
+    }
+
+    /// Continuity established: the same resource, provably.
     pub fn matches_server_identity(
         &self,
         current_etag: Option<&str>,
         current_last_modified: Option<&str>,
     ) -> bool {
-        if let (Some(stored), Some(current)) = (&self.etag, current_etag)
-            && stored != current
-        {
-            return false;
-        }
-        if let (Some(stored), Some(current)) = (&self.last_modified, current_last_modified)
-            && stored != current
-        {
-            return false;
-        }
-        true
+        self.compare_server_identity(current_etag, current_last_modified) == IdentityCheck::Match
     }
 
     /// Whether saved state belongs to the content now being downloaded.
@@ -103,6 +184,30 @@ pub fn create_new(url: String, file_size: u64, chunks: &[Chunk]) -> ResumeMetada
         chunks: chunk_states,
         etag: None,
         last_modified: None,
+        transfer: TransferKind::Segmented,
+    }
+}
+
+/// The manifest for a transfer with no chunk plan.
+///
+/// Same file, same format, same identity rules as the segmented one — which
+/// is the point. The streaming path used to keep no state at all and resume
+/// from nothing but the length of the `.part` file, so a resource that
+/// changed between runs was appended to the previous one's remains.
+pub fn create_streaming(
+    url: String,
+    identity: Option<&str>,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> ResumeMetadata {
+    ResumeMetadata {
+        url,
+        identity: identity.map(str::to_owned),
+        file_size: 0,
+        chunks: Vec::new(),
+        etag: etag.map(str::to_owned),
+        last_modified: last_modified.map(str::to_owned),
+        transfer: TransferKind::Streaming,
     }
 }
 
@@ -262,6 +367,12 @@ pub fn validate_against(
     file_size: u64,
     chunks: &[Chunk],
 ) -> bool {
+    // A streaming manifest describes a body of unknown size with no chunk
+    // plan. Its `.part` file is not laid out for random-access writes.
+    if meta.transfer != TransferKind::Segmented {
+        return false;
+    }
+
     if !meta.describes_same_source(url, identity) || meta.file_size != file_size {
         return false;
     }
@@ -575,6 +686,138 @@ mod tests {
             2000,
             &chunks
         ));
+    }
+
+    // ---------- Validator continuity ----------
+
+    fn with_validators(etag: Option<&str>, last_modified: Option<&str>) -> ResumeMetadata {
+        let mut meta = create_new("https://example.com/file.bin".into(), 2000, &sample_chunks());
+        meta.etag = etag.map(str::to_owned);
+        meta.last_modified = last_modified.map(str::to_owned);
+        meta
+    }
+
+    #[test]
+    fn a_matching_strong_etag_is_the_only_confident_answer() {
+        let meta = with_validators(Some("\"abc\""), None);
+        assert_eq!(
+            meta.compare_server_identity(Some("\"abc\""), None),
+            IdentityCheck::Match
+        );
+        assert_eq!(
+            meta.compare_server_identity(Some("\"xyz\""), None),
+            IdentityCheck::Changed
+        );
+    }
+
+    /// The hole this closes: the server stops sending a validator, and the
+    /// old check read that as "nothing contradicts the stored one". It is not
+    /// a confirmation, it is the absence of one.
+    #[test]
+    fn a_vanished_validator_is_not_a_confirmation() {
+        let meta = with_validators(Some("\"abc\""), None);
+        assert_eq!(
+            meta.compare_server_identity(None, None),
+            IdentityCheck::Unknown
+        );
+        assert!(!meta.matches_server_identity(None, None));
+    }
+
+    /// And the other way round: nothing was stored, so there is nothing to
+    /// establish continuity with, whatever the server says now.
+    #[test]
+    fn a_manifest_without_a_validator_can_never_prove_continuity() {
+        let meta = with_validators(None, None);
+        assert_eq!(
+            meta.compare_server_identity(Some("\"abc\""), None),
+            IdentityCheck::Unknown
+        );
+        assert_eq!(
+            meta.compare_server_identity(None, None),
+            IdentityCheck::Unknown
+        );
+    }
+
+    /// Last-Modified carries the comparison when there is no strong ETag.
+    #[test]
+    fn last_modified_stands_in_for_a_missing_etag() {
+        let meta = with_validators(None, Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert_eq!(
+            meta.compare_server_identity(None, Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            IdentityCheck::Match
+        );
+        assert_eq!(
+            meta.compare_server_identity(None, Some("Thu, 22 Oct 2015 07:28:00 GMT")),
+            IdentityCheck::Changed
+        );
+    }
+
+    /// A weak ETag says two bodies mean the same thing, not that they are the
+    /// same bytes — which is precisely what splicing a range onto a partial
+    /// file needs.
+    #[test]
+    fn a_weak_etag_is_not_a_range_validator() {
+        assert_eq!(strong_validator(Some("W/\"abc\""), None), None);
+        assert_eq!(
+            strong_validator(Some("W/\"abc\""), Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+        assert_eq!(strong_validator(Some("\"abc\""), None), Some("\"abc\""));
+        // Nothing usable at all.
+        assert_eq!(strong_validator(Some("  "), Some("")), None);
+
+        let meta = with_validators(Some("W/\"abc\""), None);
+        assert_eq!(
+            meta.compare_server_identity(Some("W/\"abc\""), None),
+            IdentityCheck::Unknown,
+            "two equal weak tags still do not prove equal bytes"
+        );
+    }
+
+    #[test]
+    fn a_streaming_manifest_is_never_used_as_a_chunk_plan() {
+        let meta = create_streaming(
+            "https://example.com/file.bin".into(),
+            None,
+            Some("\"abc\""),
+            None,
+        );
+        assert_eq!(meta.transfer, TransferKind::Streaming);
+        assert!(meta.chunks.is_empty());
+        assert!(!validate_against(
+            &meta,
+            "https://example.com/file.bin",
+            None,
+            0,
+            &[]
+        ));
+    }
+
+    /// Both paths write the same file, so both have to read each other's.
+    #[test]
+    fn a_streaming_manifest_round_trips_through_the_shared_format() {
+        let meta = create_streaming(
+            "https://example.com/file.bin".into(),
+            Some("gdrive:123"),
+            Some("\"abc\""),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        let back: ResumeMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta, back);
+        assert_eq!(back.stored_validator(), Some("\"abc\""));
+    }
+
+    /// A manifest from a version that predates the field is a segmented one.
+    #[test]
+    fn a_manifest_without_a_transfer_kind_is_segmented() {
+        let json = r#"{
+            "url": "https://example.com/file.bin",
+            "file_size": 2000,
+            "chunks": []
+        }"#;
+        let meta: ResumeMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.transfer, TransferKind::Segmented);
     }
 
     #[tokio::test]

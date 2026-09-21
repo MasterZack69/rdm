@@ -17,7 +17,10 @@ use rdm::{config, engine, mega, queue, scrape, secret_url, signal, sync};
 
 fn main() -> Result<()> {
     let args = Cli::parse();
-    let cfg = config::Config::load();
+    let cfg = config::Config::load()?;
+    // One load per run: the engine reads retry and SFTP settings from the
+    // same values, rather than re-reading (and possibly re-defaulting) them.
+    engine::set_shared_config(cfg.clone());
 
     match args.command {
         None => {

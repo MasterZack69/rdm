@@ -10,6 +10,17 @@
 //! agrees with what was asked for, and the body is only renamed into place
 //! when every stated byte arrived. Everything else restarts or fails, and the
 //! `.part` file is left alone so the next run can try again.
+//!
+//! The other half of "without proof" is *which file*. A `.part` file's length
+//! says how many bytes are on disk and nothing about where they came from, so
+//! this path keeps the same [`ResumeMetadata`](crate::resume::ResumeMetadata)
+//! manifest the segmented path does — one format, one set of rules — holding
+//! the strong validator the bytes were fetched under. The next run resumes
+//! only when that validator is still the one the server offers, sends it back
+//! as `If-Range` so the server itself can refuse, and restarts whenever
+//! continuity cannot be established. Without that, a resource that changed
+//! behind a stable URL had its new bytes appended to the old partial file and
+//! the result renamed as though it were one download.
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -18,6 +29,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::resume::{self, IdentityCheck, ResumeMetadata, TransferKind};
 use crate::safe_file::{self, Access, Existing};
 use crate::ui::{self, ProgressSink, SlotState};
 
@@ -93,6 +105,111 @@ pub fn parse_content_range(value: &str) -> Option<ContentRange> {
     };
 
     Some(ContentRange { start, end, total })
+}
+
+/// What the caller knows about *which* resource is being fetched.
+///
+/// `url` is the address the download is keyed by, which is not always the one
+/// being fetched: a signed CDN link changes every run. `identity` is the
+/// durable name when a hoster has one, and the two validators are what the
+/// inspection request reported.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamIdentity<'a> {
+    pub url: &'a str,
+    pub identity: Option<&'a str>,
+    pub etag: Option<&'a str>,
+    pub last_modified: Option<&'a str>,
+}
+
+/// Whether an existing `.part` file may be continued, decided before any
+/// request is sent.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StreamStart {
+    /// Start from byte zero. `discarded` says why an existing `.part` is
+    /// being thrown away, and is `None` when there was nothing there.
+    Fresh { discarded: Option<&'static str> },
+    /// Continue from `offset`, conditioned on `if_range`.
+    Resume { offset: u64, if_range: String },
+}
+
+/// Decides whether the bytes already on disk belong to the file now on offer.
+///
+/// Everything here is a reason to restart except one path through it: a
+/// streaming manifest, for this source, whose strong validator is still the
+/// validator the server offers. Restarting costs bandwidth. The alternative
+/// costs the file, silently, and only shows up when someone opens it.
+pub fn plan_streaming_resume(
+    existing_bytes: u64,
+    saved: Option<&ResumeMetadata>,
+    id: &StreamIdentity<'_>,
+) -> StreamStart {
+    if existing_bytes == 0 {
+        return StreamStart::Fresh { discarded: None };
+    }
+
+    let discard = |reason: &'static str| StreamStart::Fresh {
+        discarded: Some(reason),
+    };
+
+    // A `.part` with no manifest beside it is bytes of unknown provenance.
+    // That is the state every streaming download used to be resumed from.
+    let Some(meta) = saved else {
+        return discard("no resume manifest beside the partial file");
+    };
+
+    if meta.transfer != TransferKind::Streaming {
+        return discard("the partial file was written by a segmented transfer");
+    }
+
+    if !meta.describes_same_source(id.url, id.identity) {
+        return discard("the saved state is for a different source");
+    }
+
+    match meta.compare_server_identity(id.etag, id.last_modified) {
+        IdentityCheck::Changed => discard("the server's copy changed since the partial download"),
+        IdentityCheck::Unknown => {
+            discard("the server no longer proves this is the same file (no usable validator)")
+        }
+        IdentityCheck::Match => match meta.stored_validator() {
+            // `Match` means both sides had one, so this cannot be `None`.
+            Some(validator) => StreamStart::Resume {
+                offset: existing_bytes,
+                if_range: validator.to_owned(),
+            },
+            None => discard("the saved validator vanished between checks"),
+        },
+    }
+}
+
+/// The validator a response offers for its own body.
+fn response_validator(resp: &reqwest::Response) -> (Option<String>, Option<String>) {
+    let header = |name: reqwest::header::HeaderName| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned())
+    };
+    (
+        header(reqwest::header::ETAG),
+        header(reqwest::header::LAST_MODIFIED),
+    )
+}
+
+/// Whether a `206` really is a continuation of the bytes already on disk.
+///
+/// The resume was conditioned on a validator; this checks that the body the
+/// server actually sent still carries it. A response that offers no validator
+/// of its own proves nothing, and a resume is the one place where an unproven
+/// answer is worse than a slow one.
+fn body_continues_the_same_file(resp: &reqwest::Response, if_range: &Option<String>) -> bool {
+    let Some(expected) = if_range.as_deref() else {
+        return false;
+    };
+    let (etag, last_modified) = response_validator(resp);
+    match resume::strong_validator(etag.as_deref(), last_modified.as_deref()) {
+        Some(current) => current == expected,
+        None => false,
+    }
 }
 
 pub fn resolve_resume_action(
@@ -199,14 +316,25 @@ fn validate_whole_body(resp: &reqwest::Response) -> Result<()> {
     Ok(())
 }
 
+/// The (possibly ranged, possibly conditional) request that starts a stream.
+///
+/// `if_range` is the server's own chance to refuse: given a validator it no
+/// longer recognises, a conforming server ignores the `Range` and answers
+/// `200` with the whole body, which [`resolve_resume_action`] reads as a
+/// restart. The client-side comparison stays as well, because a server that
+/// ignores `If-Range` is exactly the kind that would answer `206` to anything.
 pub fn build_streaming_request(
     client: &reqwest::Client,
     url: &str,
     existing_bytes: u64,
+    if_range: Option<&str>,
 ) -> reqwest::RequestBuilder {
     let mut req = client.get(url);
     if existing_bytes > 0 {
         req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_bytes));
+        if let Some(validator) = if_range {
+            req = req.header(reqwest::header::IF_RANGE, validator);
+        }
     }
     req
 }
@@ -236,10 +364,12 @@ pub(super) async fn download_streaming(
     client: &reqwest::Client,
     url: &str,
     output_path: &str,
+    id: StreamIdentity<'_>,
     cancel: CancellationToken,
     sink: Arc<dyn ProgressSink>,
 ) -> Result<u64> {
     let temp_path = format!("{}.part", output_path);
+    let meta_path = ResumeMetadata::meta_path(output_path);
     let temp = Path::new(&temp_path);
     let dir = dir_of(&temp_path);
 
@@ -255,18 +385,35 @@ pub(super) async fn download_streaming(
     // partial download, and its target's size would be a lie. This is not the
     // security check — `open_guarded` below is, because any check made before
     // an open can be overtaken between the two.
-    let existing_bytes = match tokio::fs::symlink_metadata(temp).await {
+    let bytes_on_disk = match tokio::fs::symlink_metadata(temp).await {
         Ok(meta) if meta.is_file() => meta.len(),
         _ => 0,
     };
 
-    // Phase 1: Build and send (possibly ranged) request
+    // Phase 0: Decide whether those bytes are this file's bytes.
+    //
+    // The length of a `.part` file is a number, not a provenance. The
+    // manifest beside it is what says which resource those bytes came from,
+    // and it is the same manifest the segmented path writes.
+    let saved = resume::load(&meta_path).await.ok();
+    let (existing_bytes, if_range) =
+        match plan_streaming_resume(bytes_on_disk, saved.as_ref(), &id) {
+            StreamStart::Resume { offset, if_range } => (offset, Some(if_range)),
+            StreamStart::Fresh { discarded } => {
+                if let Some(reason) = discarded {
+                    sink.note(&format!("Restarting from zero: {}", reason));
+                }
+                (0, None)
+            }
+        };
+
+    // Phase 1: Build and send (possibly ranged, possibly conditional) request
     //
     // `without_url` on every one of these: reqwest puts the URL it was given
     // into its own error Display, `context` keeps that error in the chain, and
     // `{:#}` prints the chain. The URL is the fetch URL, which is where the
     // gdrive `key=` and every signed parameter live.
-    let resp = build_streaming_request(client, url, existing_bytes)
+    let resp = build_streaming_request(client, url, existing_bytes, if_range.as_deref())
         .send()
         .await
         .map_err(reqwest::Error::without_url)
@@ -284,9 +431,32 @@ pub(super) async fn download_streaming(
     // Phase 2: Decide resume/restart/fresh/fail
     let (resume_offset, append, resp) =
         match resolve_resume_action(status, existing_bytes, content_range.as_deref()) {
-            ResumeAction::Resume(offset) => {
+            ResumeAction::Resume(offset) if body_continues_the_same_file(&resp, &if_range) => {
                 sink.note(&format!("Resuming from {}", ui::format_size(offset)));
                 (offset, true, resp)
+            }
+            // A 206 whose own validator is not the one we conditioned on.
+            // `If-Range` asked the server to refuse this itself; a server
+            // that answers anyway does not get to decide.
+            ResumeAction::Resume(_) => {
+                drop(resp);
+                sink.note("Server answered with a different version of the file, restarting from zero");
+                let fresh_resp = client
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(reqwest::Error::without_url)
+                    .context("Fresh GET request failed")?;
+
+                if !fresh_resp.status().is_success() {
+                    anyhow::bail!(
+                        "Restart request failed with status {} {}",
+                        fresh_resp.status().as_u16(),
+                        fresh_resp.status().canonical_reason().unwrap_or("Unknown"),
+                    );
+                }
+                validate_whole_body(&fresh_resp)?;
+                (0u64, false, fresh_resp)
             }
             ResumeAction::Restart => {
                 // Drop the unusable response and issue a fresh non-range GET
@@ -383,6 +553,25 @@ pub(super) async fn download_streaming(
     // draw a real bar and ETA instead of a byte counter.
     if let Some(len) = resp.content_length() {
         sink.total(Some(len + resume_offset));
+    }
+
+    // The manifest for the bytes about to be written. On a resume the file
+    // already holds one that describes them; on a fresh body it is written
+    // from the validator this very response carries, which is the one the
+    // next run has to match before it appends anything.
+    if !append {
+        let (body_etag, body_last_modified) = response_validator(&resp);
+        let meta = resume::create_streaming(
+            id.url.to_owned(),
+            id.identity,
+            body_etag.as_deref().or(id.etag),
+            body_last_modified.as_deref().or(id.last_modified),
+        );
+        if let Err(e) = resume::save_atomic(&meta_path, &meta).await {
+            // Losing the manifest costs the next run its resume, not this
+            // run its download.
+            sink.note(&format!("Could not write resume state: {:#}", e));
+        }
     }
 
     // Phase 3: Open file and stream body
@@ -527,30 +716,44 @@ pub(super) async fn download_streaming(
     }
     .with_context(|| format!("Failed to rename '{}' to '{}'", temp_path, output_path))?;
 
+    // The transfer is finished, so the state describing how to continue it is
+    // not just useless but misleading.
+    let _ = resume::delete(&meta_path).await;
+
     Ok(downloaded)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
 
     #[test]
     fn test_build_request_no_existing_bytes() {
         let client = reqwest::Client::new();
-        let req = build_streaming_request(&client, "https://example.com/file.bin", 0)
+        let req = build_streaming_request(&client, "https://example.com/file.bin", 0, None)
             .build()
             .unwrap();
         assert!(req.headers().get(reqwest::header::RANGE).is_none());
+        assert!(req.headers().get(reqwest::header::IF_RANGE).is_none());
     }
 
     #[test]
     fn test_build_request_with_existing_bytes() {
         let client = reqwest::Client::new();
-        let req = build_streaming_request(&client, "https://example.com/file.bin", 4096)
-            .build()
-            .unwrap();
+        let req = build_streaming_request(
+            &client,
+            "https://example.com/file.bin",
+            4096,
+            Some("\"v1\""),
+        )
+        .build()
+        .unwrap();
         let range = req.headers().get(reqwest::header::RANGE).unwrap();
         assert_eq!(range.to_str().unwrap(), "bytes=4096-");
+        // The server's own chance to refuse a resume across a change.
+        let if_range = req.headers().get(reqwest::header::IF_RANGE).unwrap();
+        assert_eq!(if_range.to_str().unwrap(), "\"v1\"");
     }
 
     #[test]
@@ -729,6 +932,314 @@ mod tests {
             parse_content_range("bytes 4096-5000/*").map(|r| r.total),
             Some(None)
         );
+    }
+
+    // ---------- Whose bytes are these ----------
+
+    fn identity<'a>(etag: Option<&'a str>, last_modified: Option<&'a str>) -> StreamIdentity<'a> {
+        StreamIdentity {
+            url: "https://example.com/file.bin",
+            identity: None,
+            etag,
+            last_modified,
+        }
+    }
+
+    fn streaming_manifest(etag: Option<&str>, last_modified: Option<&str>) -> ResumeMetadata {
+        resume::create_streaming(
+            "https://example.com/file.bin".into(),
+            None,
+            etag,
+            last_modified,
+        )
+    }
+
+    #[test]
+    fn nothing_on_disk_is_simply_a_fresh_download() {
+        assert_eq!(
+            plan_streaming_resume(0, None, &identity(Some("\"v1\""), None)),
+            StreamStart::Fresh { discarded: None }
+        );
+    }
+
+    /// The finding: the streaming path resumed from the length of the `.part`
+    /// file alone. Bytes with no manifest have no provenance, and appending
+    /// to them can splice two different files together.
+    #[test]
+    fn a_partial_file_with_no_manifest_is_never_appended_to() {
+        assert!(matches!(
+            plan_streaming_resume(4096, None, &identity(Some("\"v1\""), None)),
+            StreamStart::Fresh {
+                discarded: Some(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn a_matching_validator_resumes_and_conditions_the_request() {
+        let saved = streaming_manifest(Some("\"v1\""), None);
+        assert_eq!(
+            plan_streaming_resume(4096, Some(&saved), &identity(Some("\"v1\""), None)),
+            StreamStart::Resume {
+                offset: 4096,
+                if_range: "\"v1\"".into(),
+            }
+        );
+    }
+
+    /// The resource changed behind a stable URL. This is the case where the
+    /// old code produced a file made of two different downloads.
+    #[test]
+    fn a_changed_validator_restarts() {
+        let saved = streaming_manifest(Some("\"v1\""), None);
+        assert!(matches!(
+            plan_streaming_resume(4096, Some(&saved), &identity(Some("\"v2\""), None)),
+            StreamStart::Fresh {
+                discarded: Some(_)
+            }
+        ));
+    }
+
+    /// Continuity that cannot be established is not continuity: a server
+    /// that has stopped offering a validator is not confirming anything.
+    #[test]
+    fn a_vanished_or_absent_validator_restarts() {
+        let saved = streaming_manifest(Some("\"v1\""), None);
+        assert!(matches!(
+            plan_streaming_resume(4096, Some(&saved), &identity(None, None)),
+            StreamStart::Fresh {
+                discarded: Some(_)
+            }
+        ));
+
+        let no_validator = streaming_manifest(None, None);
+        assert!(matches!(
+            plan_streaming_resume(4096, Some(&no_validator), &identity(Some("\"v1\""), None)),
+            StreamStart::Fresh {
+                discarded: Some(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn a_manifest_for_another_source_restarts() {
+        let saved = resume::create_streaming(
+            "https://elsewhere.example/other.bin".into(),
+            None,
+            Some("\"v1\""),
+            None,
+        );
+        assert!(matches!(
+            plan_streaming_resume(4096, Some(&saved), &identity(Some("\"v1\""), None)),
+            StreamStart::Fresh {
+                discarded: Some(_)
+            }
+        ));
+    }
+
+    /// The two paths share a manifest format, so each has to recognise the
+    /// other's and decline it: a segmented `.part` is a preallocated file
+    /// with holes, not a prefix.
+    #[test]
+    fn a_segmented_manifest_is_not_a_streaming_one() {
+        let mut saved = streaming_manifest(Some("\"v1\""), None);
+        saved.transfer = TransferKind::Segmented;
+        assert!(matches!(
+            plan_streaming_resume(4096, Some(&saved), &identity(Some("\"v1\""), None)),
+            StreamStart::Fresh {
+                discarded: Some(_)
+            }
+        ));
+    }
+
+    /// A server that ignores `If-Range` and answers 206 anyway is checked
+    /// again on this side.
+    #[test]
+    fn a_206_that_carries_another_version_is_not_a_continuation() {
+        fn response(etag: Option<&'static str>) -> reqwest::Response {
+            use axum::http;
+            let mut builder = http::Response::builder().status(reqwest::StatusCode::PARTIAL_CONTENT);
+            if let Some(etag) = etag {
+                builder = builder.header("etag", etag);
+            }
+            reqwest::Response::from(builder.body(String::new()).unwrap())
+        }
+
+        let expected = Some("\"v1\"".to_owned());
+        assert!(body_continues_the_same_file(&response(Some("\"v1\"")), &expected));
+        assert!(!body_continues_the_same_file(
+            &response(Some("\"v2\"")),
+            &expected
+        ));
+        // Nothing to compare against is not a pass.
+        assert!(!body_continues_the_same_file(&response(None), &expected));
+        assert!(!body_continues_the_same_file(&response(Some("\"v1\"")), &None));
+    }
+
+    // ---------- End to end ----------
+
+    async fn serve(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    /// The finding, end to end: a `.part` file left by version one of a
+    /// resource, and a server now holding version two at the same URL.
+    ///
+    /// The old code sent `Range: bytes=5-`, saw a well-formed `206`, and
+    /// appended the tail of the new file to the head of the old one. The
+    /// result was renamed as a finished download and nothing ever said
+    /// otherwise.
+    #[tokio::test]
+    async fn a_changed_resource_is_never_spliced_onto_the_old_partial_file() {
+        use axum::http::header;
+        use axum::routing::get;
+
+        // Version two, served whole to anyone who asks, and served as a
+        // range to anyone who asks for one — a server that ignores
+        // `If-Range`, which is the case the client-side check is for.
+        let body = "NEW-CONTENT-ENTIRELY";
+        let base = serve(axum::Router::new().route(
+            "/file.bin",
+            get(move |headers: header::HeaderMap| async move {
+                match headers.get(header::RANGE) {
+                    Some(_) => (
+                        reqwest::StatusCode::PARTIAL_CONTENT,
+                        [
+                            (header::CONTENT_RANGE, format!("bytes 5-19/{}", body.len())),
+                            (header::ETAG, "\"v2\"".to_owned()),
+                        ],
+                        &body[5..],
+                    )
+                        .into_response(),
+                    None => (
+                        reqwest::StatusCode::OK,
+                        [(header::ETAG, "\"v2\"".to_owned())],
+                        body,
+                    )
+                        .into_response(),
+                }
+            }),
+        ))
+        .await;
+        let url = format!("{}/file.bin", base);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("file.bin").to_string_lossy().into_owned();
+
+        // What version one left behind: five bytes, and a manifest saying
+        // which file they came from.
+        tokio::fs::write(format!("{}.part", output), b"OLD-1")
+            .await
+            .unwrap();
+        let old_meta = resume::create_streaming(url.clone(), None, Some("\"v1\""), None);
+        resume::save_atomic(&ResumeMetadata::meta_path(&output), &old_meta)
+            .await
+            .unwrap();
+
+        let written = download_streaming(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &url,
+            &output,
+            StreamIdentity {
+                url: &url,
+                identity: None,
+                etag: Some("\"v2\""),
+                last_modified: None,
+            },
+            CancellationToken::new(),
+            crate::ui::silent(),
+        )
+        .await
+        .expect("the download itself should succeed, from zero");
+
+        let on_disk = tokio::fs::read_to_string(&output).await.unwrap();
+        assert_eq!(on_disk, body, "two versions were spliced together");
+        assert_eq!(written, body.len() as u64);
+
+        // Finished, so the resume state is gone rather than left to mislead.
+        assert!(
+            tokio::fs::metadata(ResumeMetadata::meta_path(&output))
+                .await
+                .is_err()
+        );
+    }
+
+    /// The other half: unchanged content really does resume, and the manifest
+    /// is what makes that safe rather than lucky.
+    #[tokio::test]
+    async fn an_unchanged_resource_resumes_from_the_partial_file() {
+        use axum::http::header;
+        use axum::routing::get;
+
+        let body = "0123456789ABCDEF";
+        let base = serve(axum::Router::new().route(
+            "/file.bin",
+            get(move |headers: header::HeaderMap| async move {
+                let range = headers
+                    .get(header::RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("bytes="))
+                    .and_then(|v| v.split('-').next())
+                    .and_then(|v| v.parse::<usize>().ok());
+
+                match range {
+                    Some(start) => (
+                        reqwest::StatusCode::PARTIAL_CONTENT,
+                        [
+                            (
+                                header::CONTENT_RANGE,
+                                format!("bytes {}-{}/{}", start, body.len() - 1, body.len()),
+                            ),
+                            (header::ETAG, "\"v1\"".to_owned()),
+                        ],
+                        &body[start..],
+                    )
+                        .into_response(),
+                    None => (
+                        reqwest::StatusCode::OK,
+                        [(header::ETAG, "\"v1\"".to_owned())],
+                        body,
+                    )
+                        .into_response(),
+                }
+            }),
+        ))
+        .await;
+        let url = format!("{}/file.bin", base);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("file.bin").to_string_lossy().into_owned();
+
+        tokio::fs::write(format!("{}.part", output), &body.as_bytes()[..6])
+            .await
+            .unwrap();
+        let meta = resume::create_streaming(url.clone(), None, Some("\"v1\""), None);
+        resume::save_atomic(&ResumeMetadata::meta_path(&output), &meta)
+            .await
+            .unwrap();
+
+        let written = download_streaming(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &url,
+            &output,
+            StreamIdentity {
+                url: &url,
+                identity: None,
+                etag: Some("\"v1\""),
+                last_modified: None,
+            },
+            CancellationToken::new(),
+            crate::ui::silent(),
+        )
+        .await
+        .expect("an unchanged file should resume");
+
+        assert_eq!(tokio::fs::read_to_string(&output).await.unwrap(), body);
+        // Only the tail came over the wire.
+        assert_eq!(written, body.len() as u64);
     }
 
     // ---------- Limits ----------

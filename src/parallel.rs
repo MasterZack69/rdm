@@ -10,8 +10,9 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::chunk::Chunk;
+use crate::pressure::PressureController;
 use crate::range_download::{self, DownloadStatus};
-use crate::resume::{self, ResumeMetadata};
+use crate::resume::{self, IdentityCheck, ResumeMetadata};
 use crate::retry::{self, RetryConfig};
 use crate::safe_file::{self, Access, Existing};
 
@@ -90,7 +91,6 @@ where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
     use std::collections::VecDeque;
-    use std::sync::atomic::AtomicUsize;
 
     let meta = load_or_create_metadata(
         meta_path,
@@ -133,7 +133,9 @@ where
         .map(|(_, c)| c.load(Ordering::Relaxed))
         .sum();
 
-    let retry_pressure = Arc::new(AtomicUsize::new(0));
+    // One view of how the server is coping, shared by every worker and by
+    // the loop that hands out ranges.
+    let pressure = Arc::new(PressureController::new(chunks.len().max(1)));
     let done_flag = Arc::new(AtomicBool::new(false));
 
     let autosave_handle = spawn_autosave(
@@ -153,12 +155,30 @@ where
         ctx.file_size,
     );
 
-    let mut active_workers = chunks.len().max(1);
     let mut join_set: JoinSet<Result<u64>> = JoinSet::new();
     let mut total_bytes: u64 = initial_completed;
 
     while !queue.is_empty() || !join_set.is_empty() {
-        while join_set.len() < active_workers && !queue.is_empty() {
+        // A server that asked for a pause gets one before any further range
+        // is assigned. With nothing in flight there is nothing else to wait
+        // on, so the loop waits out the pause itself rather than spinning.
+        if join_set.is_empty()
+            && let Some(wait) = pressure.pause_remaining()
+        {
+            tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    anyhow::bail!("Cancelled while waiting out the server's back-off");
+                }
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+
+        // Read fresh each time round: the controller may have lowered it
+        // while these workers were running.
+        let active_workers = pressure.limit();
+
+        while join_set.len() < active_workers && !queue.is_empty() && !pressure.is_paused() {
             let chunk = queue.pop_front().unwrap();
 
             let client = ctx.client.clone();
@@ -173,10 +193,10 @@ where
                 .1
                 .clone();
 
-            let pressure = retry_pressure.clone();
+            let pressure = Arc::clone(&pressure);
 
             join_set.spawn(async move {
-                match download_chunk_with_retry(
+                download_chunk_with_retry(
                     &client,
                     &url,
                     &path,
@@ -184,28 +204,15 @@ where
                     &config,
                     chunk_progress,
                     cancel,
+                    &pressure,
                 )
                 .await
-                {
-                    Ok(b) => Ok(b),
-                    Err(e) => {
-                        if retry::is_retryable(&e) {
-                            pressure.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(e)
-                    }
-                }
             });
         }
 
-        if retry_pressure.load(Ordering::Relaxed) >= active_workers * 2 && active_workers > 1 {
-            let new = (active_workers / 2).max(1);
-            eprintln!(
-                "  \u{26a0} Server overloaded \u{2014} reducing parallel connections: {} \u{2192} {}",
-                active_workers, new
-            );
-            active_workers = new;
-            retry_pressure.store(0, Ordering::Relaxed);
+        // Paused with nothing spawned yet: go back and wait it out.
+        if join_set.is_empty() {
+            continue;
         }
 
         match join_set.join_next().await {
@@ -245,8 +252,10 @@ async fn load_or_create_metadata(
     last_modified: Option<&str>,
 ) -> Result<ResumeMetadata> {
     if let Ok(existing) = resume::load(meta_path).await {
+        let identity_check = existing.compare_server_identity(etag, last_modified);
+
         if resume::validate_against(&existing, url, identity, file_size, chunks)
-            && existing.matches_server_identity(etag, last_modified)
+            && identity_check == IdentityCheck::Match
         {
             eprintln!(
                 "  [Resume] Using existing chunk layout ({} chunks)",
@@ -255,10 +264,24 @@ async fn load_or_create_metadata(
             return Ok(existing);
         }
 
-        if !existing.matches_server_identity(etag, last_modified) {
-            eprintln!("  [Resume] Server file changed (ETag/Last-Modified mismatch), restarting");
-        } else {
-            eprintln!("  [Resume] Saved state is for a different source, restarting");
+        match identity_check {
+            IdentityCheck::Changed => {
+                eprintln!(
+                    "  [Resume] Server file changed (ETag/Last-Modified mismatch), restarting"
+                );
+            }
+            // The gap this closes: a missing validator on either side used to
+            // pass the check, so bytes from a changed resource could be
+            // written into the old file's chunks.
+            IdentityCheck::Unknown => {
+                eprintln!(
+                    "  [Resume] Cannot prove the server still has the same file \
+                     (no usable ETag/Last-Modified), restarting"
+                );
+            }
+            IdentityCheck::Match => {
+                eprintln!("  [Resume] Saved state is for a different source, restarting");
+            }
         }
         let _ = resume::delete(meta_path).await;
         let _ = fs::remove_file(temp_path).await;
@@ -342,6 +365,7 @@ fn spawn_autosave(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_chunk_with_retry(
     client: &Client,
     url: &str,
@@ -350,11 +374,15 @@ async fn download_chunk_with_retry(
     config: &RetryConfig,
     chunk_progress: Arc<AtomicU64>,
     cancel: CancellationToken,
+    pressure: &PressureController,
 ) -> Result<u64> {
     let full_chunk_size = chunk.end - chunk.start + 1;
     let initial_completed = chunk_progress.load(Ordering::SeqCst);
 
     for attempt in 0..=config.max_retries {
+        // A pause another worker was told about applies here too.
+        pressure.wait_while_paused(&cancel).await;
+
         if cancel.is_cancelled() {
             let written = chunk_progress.load(Ordering::SeqCst);
             anyhow::bail!(
@@ -384,6 +412,12 @@ async fn download_chunk_with_retry(
         .await
         {
             Ok(DownloadStatus::Complete { bytes_written: _ }) => {
+                if let Some(restored) = pressure.record_success() {
+                    eprintln!(
+                        "  \u{2713} Server steady again \u{2014} parallel connections back to {}",
+                        restored
+                    );
+                }
                 return Ok(chunk_progress.load(Ordering::SeqCst) - initial_completed);
             }
 
@@ -404,6 +438,7 @@ async fn download_chunk_with_retry(
                     && attempt < config.max_retries =>
             {
                 chunk_progress.store(0, Ordering::SeqCst);
+                pressure.record_retryable(None);
                 eprintln!(
                     "   \u{26a0} Chunk #{}: range not supported, restarting from byte 0",
                     chunk.id,
@@ -412,7 +447,31 @@ async fn download_chunk_with_retry(
             }
 
             Err(e) if retry::is_retryable(&e) && attempt < config.max_retries => {
-                let delay = config.delay_for_attempt(attempt);
+                // Reported now, while this worker is still alive and about to
+                // try again — not on the way out with a final error, which is
+                // why the old counter never reached its threshold.
+                let asked_for = retry::retry_after(&e);
+                let reaction = pressure.record_retryable(asked_for);
+
+                if let Some(from) = reaction.reduced_from {
+                    eprintln!(
+                        "  \u{26a0} Server overloaded \u{2014} reducing parallel connections: {} \u{2192} {}",
+                        from, reaction.limit
+                    );
+                }
+                if let Some(pause) = reaction.pause {
+                    eprintln!(
+                        "  \u{23f8} Server asked for {:.0}s \u{2014} holding every connection",
+                        pause.as_secs_f64()
+                    );
+                }
+
+                // The server's own figure wins over our guess when it is the
+                // longer of the two; backing off less than we were asked to
+                // is how a 429 becomes a ban.
+                let backoff = config.delay_for_attempt(attempt);
+                let delay = asked_for.map_or(backoff, |wait| wait.max(backoff));
+
                 eprintln!(
                     "   \u{26a0} Chunk #{}: {}/{} failed, retry in {:.1}s \u{2014} {}",
                     chunk.id,

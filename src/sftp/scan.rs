@@ -58,7 +58,7 @@ pub async fn discover_files(
     wrap_in_folder: bool,
     allow_private: bool,
 ) -> Result<Option<Vec<crate::scrape::DiscoveredFile>>> {
-    let cfg = crate::config::Config::load();
+    let cfg = crate::config::Config::load()?;
     let options = SftpOptions::from_config(&cfg)?;
     let target = SftpUrl::parse(url)?;
     let Some(listing) = list(url, &options, allow_private, CancellationToken::new()).await? else {
