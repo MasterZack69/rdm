@@ -88,7 +88,7 @@
 //! remember to opt into.
 
 use anyhow::{Context, Result, bail};
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -301,6 +301,29 @@ fn verify_dir_beneath_impl(root: &Path, relative: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Metadata for `relative` beneath `root`, resolved entirely by descriptor.
+///
+/// `Ok(None)` when nothing is there. Symlinks are never followed and a
+/// non-regular file is an error rather than a stat of something rdm would
+/// refuse to write to anyway.
+///
+/// The point is that the parent walk and the stat are one resolution: a
+/// pathname `symlink_metadata` performed *after* a separate parent check can
+/// be redirected by an intermediate directory swapped in between the two, so
+/// the answer would describe a file outside the root. Here the final
+/// component is `fstatat(AT_SYMLINK_NOFOLLOW)` against the descriptor the
+/// walk ended on, and the returned [`Metadata`] comes from a descriptor we
+/// hold open, so it cannot describe anything but the inode that was there.
+pub fn metadata_beneath(root: &Path, relative: &Path) -> Result<Option<Metadata>> {
+    metadata_beneath_impl(root, relative).with_context(|| {
+        format!(
+            "Failed to safely inspect '{}' beneath {}",
+            relative.display(),
+            root.display()
+        )
+    })
 }
 
 /// Removes `relative` beneath `root`, resolving the parent by descriptor walk.
@@ -676,6 +699,84 @@ fn create_dirs_beneath_impl(root: &Path, relative: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn metadata_beneath_impl(root: &Path, relative: &Path) -> io::Result<Option<Metadata>> {
+    let (dirs, name) = split_untrusted(relative)?;
+    let dir_fd = walk_dirs(root, &dirs, false)?;
+    let c_name = cstr(name)?;
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+
+    // SAFETY: dir_fd is open, c_name is NUL-terminated and stat is a valid
+    // writable stat buffer.
+    let rc = unsafe {
+        libc::fstatat(
+            dir_fd.fd,
+            c_name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+
+    // Reopen against the same descriptor so the value handed back belongs to
+    // a file we are holding rather than to a name. `O_PATH` where it exists:
+    // it needs no read permission and cannot block on a FIFO planted between
+    // the stat above and this open. Elsewhere the stat has already ruled out
+    // everything that `O_RDONLY` could hang on, and `File::metadata` below is
+    // still the authoritative check.
+    #[cfg(target_os = "linux")]
+    let kind = libc::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::O_RDONLY;
+
+    // SAFETY: dir_fd is open and c_name is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.fd,
+            c_name.as_ptr(),
+            kind | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(e)
+        };
+    }
+
+    // SAFETY: openat returned a fresh owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let meta = file.metadata()?;
+
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+
+    Ok(Some(meta))
+}
+
+#[cfg(unix)]
 fn unlink_beneath_impl(root: &Path, relative: &Path) -> io::Result<()> {
     let (dirs, name) = split_untrusted(relative)?;
     let dir_fd = walk_dirs(root, &dirs, false)?;
@@ -687,7 +788,9 @@ fn unlink_beneath_impl(root: &Path, relative: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    Ok(())
+    // A removal is a directory change like any other: without this the entry
+    // can come back after a power loss.
+    fsync_dir(dir_fd.fd)
 }
 
 #[cfg(unix)]
@@ -705,7 +808,7 @@ fn rename_beneath_impl(root: &Path, from: &Path, to: &Path, replace: bool) -> io
         #[cfg(target_os = "linux")]
         {
             match linux::renameat2_at(from_fd.fd, &c_from, to_fd.fd, &c_to) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return sync_renamed_dirs(&from_fd, &to_fd, &from_dirs, &to_dirs),
                 Err(e) if is_unsupported(&e) => {
                     // Older kernel or an exotic filesystem: the link/unlink
                     // emulation below gives the same no-clobber guarantee.
@@ -729,13 +832,57 @@ fn rename_beneath_impl(root: &Path, from: &Path, to: &Path, replace: bool) -> io
             debug_assert!(false, "failed to unlink temp after publish");
         }
 
-        return Ok(());
+        return sync_renamed_dirs(&from_fd, &to_fd, &from_dirs, &to_dirs);
     }
 
     // SAFETY: both descriptors are open and both names are NUL-terminated.
     let rc = unsafe { libc::renameat(from_fd.fd, c_from.as_ptr(), to_fd.fd, c_to.as_ptr()) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
+    }
+
+    sync_renamed_dirs(&from_fd, &to_fd, &from_dirs, &to_dirs)
+}
+
+/// Persists the directory entries a rename just changed.
+///
+/// Flushing the payload only guarantees its *contents* survive a power loss;
+/// the rename that publishes it lives in the parent directory, and that is a
+/// separate write. Both parents are synced, deduplicated for the common case
+/// of a rename within one directory. The component lists are the ones the
+/// walk used, so equal lists mean the same descriptor was reached twice.
+#[cfg(unix)]
+fn sync_renamed_dirs(
+    from_fd: &OwnedFd,
+    to_fd: &OwnedFd,
+    from_dirs: &[&OsStr],
+    to_dirs: &[&OsStr],
+) -> io::Result<()> {
+    fsync_dir(from_fd.fd)?;
+
+    if from_dirs != to_dirs {
+        fsync_dir(to_fd.fd)?;
+    }
+
+    Ok(())
+}
+
+/// `fsync` on a directory descriptor, which is how a rename or unlink is made
+/// durable.
+///
+/// A filesystem that does not implement it at all is tolerated: there is
+/// nothing the caller could do instead, and failing the transfer over it
+/// would be worse than the weaker guarantee.
+#[cfg(unix)]
+fn fsync_dir(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fd is an open directory descriptor owned by the caller.
+    let rc = unsafe { libc::fsync(fd) };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        if is_unsupported(&e) {
+            return Ok(());
+        }
+        return Err(e);
     }
 
     Ok(())
@@ -1114,6 +1261,19 @@ fn open_beneath_impl(
 #[cfg(not(unix))]
 fn create_dirs_beneath_impl(root: &Path, relative: &Path) -> io::Result<()> {
     std::fs::create_dir_all(joined_beneath(root, relative)?)
+}
+
+#[cfg(not(unix))]
+fn metadata_beneath_impl(root: &Path, relative: &Path) -> io::Result<Option<Metadata>> {
+    match std::fs::symlink_metadata(joined_beneath(root, relative)?) {
+        Ok(meta) if meta.is_file() => Ok(Some(meta)),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(not(unix))]
@@ -1655,5 +1815,46 @@ mod tests {
         assert!(verify_dir_beneath(root.path(), Path::new("album")).is_err());
         assert!(verify_dir_beneath(root.path(), Path::new("missing")).is_err());
         assert!(verify_dir_beneath(root.path(), Path::new("../elsewhere")).is_err());
+    }
+
+    /// The TOCTOU a parent check followed by a pathname stat leaves open: the
+    /// stat itself must be unable to land outside the root.
+    #[cfg(unix)]
+    #[test]
+    fn metadata_is_read_by_descriptor_and_never_through_a_link() {
+        let root = tmpdir();
+        let outside = tmpdir();
+        std::fs::write(outside.path().join("secret.txt"), b"not ours").unwrap();
+
+        // Absent is an answer, not a failure.
+        assert!(
+            metadata_beneath(root.path(), Path::new("absent.bin"))
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::write(root.path().join("real.bin"), b"abcd").unwrap();
+        let meta = metadata_beneath(root.path(), Path::new("real.bin"))
+            .unwrap()
+            .expect("a real file");
+        assert_eq!(meta.len(), 4);
+
+        // A symlinked intermediate directory: exactly what a pathname stat
+        // after a separate parent check would follow.
+        std::os::unix::fs::symlink(outside.path(), root.path().join("album")).unwrap();
+        assert!(metadata_beneath(root.path(), Path::new("album/secret.txt")).is_err());
+
+        // A symlink at the final component is not the file it points at.
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("link.bin"),
+        )
+        .unwrap();
+        assert!(metadata_beneath(root.path(), Path::new("link.bin")).is_err());
+
+        // Nor is a directory, or anything reached by climbing out.
+        std::fs::create_dir(root.path().join("dir")).unwrap();
+        assert!(metadata_beneath(root.path(), Path::new("dir")).is_err());
+        assert!(metadata_beneath(root.path(), Path::new("../elsewhere")).is_err());
     }
 }

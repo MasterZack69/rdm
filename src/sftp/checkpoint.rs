@@ -1,5 +1,10 @@
 //! Durable checkpoints and atomic publication. The old output survives until
 //! its replacement is complete; HTTP .part/.rdm files are never reused.
+//!
+//! Durability here is payload *and* directory: the file contents are fsynced
+//! before every checkpoint and before publication, and `safe_file`'s rename
+//! and unlink fsync the directories whose entries they changed, so a power
+//! loss cannot lose the rename that made those contents reachable.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -125,15 +130,16 @@ pub(crate) fn discard_state(destination: &Destination) -> Result<u64> {
     let part = directory.join(format!("{key}.part"));
     // A file that was simply already current has no state at all, so the
     // common case takes no lock and creates no state directory for it.
-    if std::fs::symlink_metadata(destination.root.join(&part)).is_err() {
+    // Resolved by descriptor, like every other look at the output tree.
+    if !matches!(safe_file::metadata_beneath(&destination.root, &part), Ok(Some(_))) {
         return Ok(0);
     }
     let Some(_lock) = try_lock_output(&destination.root, &destination.relative)? else {
         // Another transfer owns this destination, so its state is in use.
         return Ok(0);
     };
-    let reclaimed = match std::fs::symlink_metadata(destination.root.join(&part)) {
-        Ok(meta) if meta.is_file() => meta.len(),
+    let reclaimed = match safe_file::metadata_beneath(&destination.root, &part) {
+        Ok(Some(meta)) => meta.len(),
         // Anything else is not ours to account for. The unlink below still
         // refuses to follow it.
         _ => 0,

@@ -129,6 +129,24 @@ fn directory_and_state_symlinks_cannot_redirect_writes() {
     assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
 }
 
+/// The destination stat is the decision that skips or classifies a download,
+/// so it has to be as unforgeable as the write is.
+#[test]
+fn destination_metadata_is_never_read_through_a_swapped_parent() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("file"), b"not ours").unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
+
+    let linked = Destination::beneath(root.path(), "linked/file").unwrap();
+    assert!(linked.metadata().is_err(), "a file outside the root was inspected");
+
+    let plain = Destination::beneath(root.path(), "file").unwrap();
+    assert!(plain.metadata().unwrap().is_none());
+    std::fs::write(plain.path(), b"abc").unwrap();
+    assert_eq!(plain.metadata().unwrap().unwrap().len(), 3);
+}
+
 #[test]
 fn outside_outputs_do_not_turn_untrusted_parents_into_roots() {
     let destination = Destination::from_output(Path::new("/tmp/elsewhere/a/file"), Path::new("/tmp/downloads")).unwrap();

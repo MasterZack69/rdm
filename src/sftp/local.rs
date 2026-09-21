@@ -66,19 +66,16 @@ impl Destination {
         )
     }
 
+    /// The destination's current metadata, or `None` when it is not there.
+    ///
+    /// Read entirely by descriptor. Verifying the parents and then calling a
+    /// path-based `symlink_metadata` is two resolutions: an attacker with
+    /// write access to the output tree can replace an intermediate directory
+    /// between them, and the answer then describes a file outside the root,
+    /// which is enough to make a download be skipped or misclassified.
     pub fn metadata(&self) -> Result<Option<Metadata>> {
-        safe_file::verify_dir_beneath(
-            &self.root,
-            self.relative.parent().unwrap_or(Path::new("")),
-        )?;
-        match std::fs::symlink_metadata(self.path()) {
-            Ok(meta) => {
-                ensure!(meta.is_file(), "SFTP destination is not a regular file");
-                Ok(Some(meta))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).context("Cannot inspect SFTP destination"),
-        }
+        safe_file::metadata_beneath(&self.root, &self.relative)
+            .context("Cannot inspect SFTP destination")
     }
 
     /// Adopts the server's modification time for a file that already has the
