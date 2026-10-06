@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use rdm::args::{
     ClearTarget, Cli, Command, DownloadOpts, QueueCommand, RetryTarget, normalize_extensions,
 };
-use rdm::hoster::{dropbox, gdrive, gofile, onedrive, pixeldrain};
+use rdm::hoster::{dropbox, gdrive, onedrive, pixeldrain};
 use rdm::ui::{self, ProgressSink};
 use rdm::{config, engine, mega, queue, scrape, secret_url, signal, sync};
 
@@ -51,12 +51,6 @@ fn main() -> Result<()> {
                 return mega_route(&cfg, &url, &opts);
             }
 
-            // Likewise for GoFile: `/d/<id>` is an API handle, not a path, and
-            // normalising it as one would corrupt the content id.
-            if gofile::is_gofile_url(&url) {
-                return gofile_download(&cfg, &url, &opts);
-            }
-
             // And for Dropbox, for a different reason: the link is fetchable,
             // it just serves an HTML preview page until `dl=1` asks for the
             // file. The share key lives in the query string, so it needs
@@ -65,7 +59,7 @@ fn main() -> Result<()> {
                 return dropbox_download(&cfg, &url, &opts);
             }
 
-            // And OneDrive, for the same reason as MEGA and GoFile: a share
+            // And OneDrive, for the same reason as MEGA: a share
             // link has no extension and no trailing slash, so the directory
             // heuristic would call it a listing, and the generic engine would
             // save an HTML preview page under a plausible filename. Only the
@@ -74,7 +68,7 @@ fn main() -> Result<()> {
                 return onedrive_download(&cfg, &url, &opts);
             }
 
-            // And Google Drive, the same story a fifth time: every shape of
+            // And Google Drive, for the same reason: every shape of
             // Drive link is a viewer page or an API handle rather than the
             // bytes, so normalising it as a path would only rename the page it
             // gets saved under. Only resolution knows what is behind it.
@@ -110,20 +104,7 @@ fn main() -> Result<()> {
             delete,
             ext,
         }) => {
-            // Sync mirrors a listing it can re-read on demand. A GoFile
-            // content id is an API handle behind a throwaway account, with no
-            // listing to diff and no per-file URLs to keep. Without this the
-            // link falls through to the scraper, which finds an empty
-            // JavaScript page and reports "no files found" \u{2014} an accusation
-            // against a link that is perfectly fine.
-            if gofile::is_gofile_url(&url) {
-                anyhow::bail!(
-                    "GoFile links cannot be synced \u{2014} run `rdm <gofile link>` instead; \
-                     rerunning it skips whatever is already on disk"
-                );
-            }
-
-            // Dropbox has the same problem from the other end: a share link is
+            // Dropbox shares cannot be diffed: a share link is
             // one file, or one folder that Dropbox zips before serving. Either
             // way there is a single response and no listing to diff against
             // the local directory.
@@ -215,18 +196,8 @@ fn quick_download(
         return mega_route(cfg, url, opts);
     }
 
-    // GoFile falls into exactly the same trap: `/d/AbCdEf` has no extension,
-    // so the listing heuristic below claims it and the scraper finds an empty
-    // JavaScript page.
-    if gofile::is_gofile_url(url) {
-        if parallel.is_some() && !opts.quiet {
-            eprintln!("  \u{26a0} -p applies to directory listings; GoFile uses gofile_workers.");
-        }
-        return gofile_download(cfg, url, opts);
-    }
-
-    // And Dropbox, for the third time: a folder share's `/scl/fo/<id>/h` has
-    // no extension either, so the heuristic would call it a listing and send
+    // And Dropbox: a folder share's `/scl/fo/<id>/h` has no extension
+    // either, so the heuristic would call it a listing and send
     // it to the scraper, which finds a preview page.
     if dropbox::is_dropbox_url(url) {
         if parallel.is_some() && !opts.quiet {
@@ -237,7 +208,7 @@ fn quick_download(
         return dropbox_download(cfg, url, opts);
     }
 
-    // OneDrive is the same trap a fourth time: `1drv.ms/u/s!Abc` has no
+    // OneDrive falls into the same trap: `1drv.ms/u/s!Abc` has no
     // extension and no trailing slash either, so the listing heuristic claims
     // it, and the generic engine would save the HTML preview page under a
     // plausible filename. Hence the check sitting above it.
@@ -248,7 +219,7 @@ fn quick_download(
         return onedrive_download(cfg, url, opts);
     }
 
-    // Google Drive is the trap a fifth time: `/file/d/<id>/view` ends in an
+    // Google Drive falls into the same trap: `/file/d/<id>/view` ends in an
     // extensionless segment too, so the heuristic claims it and hands a
     // viewer page to the scraper. A folder link dodges the heuristic the
     // other way \u{2014} its id is long enough to read as an opaque file id \u{2014}
@@ -395,36 +366,6 @@ fn mega_folder_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) ->
     })
 }
 
-/// `rdm <gofile link>` \u{2014} resolve the content id and download everything behind
-/// it.
-///
-/// `-o` names a destination directory here rather than a filename, the same
-/// deal as a MEGA share: one content id can hold a whole tree and the link
-/// does not say which, so there is nothing a single filename could reliably
-/// mean. Where an unqualified download lands is decided after the listing
-/// comes back \u{2014} see `gofile::destination_root`.
-fn gofile_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
-    let url = url.trim().to_owned();
-    let options = gofile_options(cfg, opts);
-    let quiet = opts.quiet;
-
-    let output = opts.output.as_deref().map(|o| {
-        let trimmed = o.trim_end_matches('/').trim_end_matches("\\\\");
-        resolve_relative_to_config(trimmed, cfg)
-    });
-    let download_dir = cfg.download_dir.clone();
-
-    run_async(|cancel| async move {
-        let client = reqwest::Client::new();
-
-        let summary =
-            gofile::download(client, &url, output, &download_dir, options, cancel, quiet).await?;
-
-        report_gofile(&summary, quiet);
-        Ok(())
-    })
-}
-
 /// `rdm <onedrive link>` \u{2014} redeem the share and download whatever it turns
 /// out to be.
 ///
@@ -521,7 +462,7 @@ fn gdrive_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Resu
 }
 
 /// pixeldrain: `/u/<id>` is one file, `/l/<id>` is a list, and the link says
-/// which — so unlike GoFile or OneDrive no request is needed just to find out
+/// which — so unlike OneDrive no request is needed just to find out
 /// the shape of the download. `resolve` still makes one call, for a file's name
 /// or a list's contents.
 fn pixeldrain_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()> {
@@ -585,7 +526,7 @@ fn pixeldrain_download(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> 
 /// which happened to know the word "dropbox" would be strictly worse. All this
 /// function decides is which URL to fetch and what to call the result.
 ///
-/// Unlike MEGA and GoFile, `-o` here means a filename, because a share link is
+/// Unlike a MEGA folder share, `-o` here means a filename, because a share link is
 /// always one response \u{2014} a folder share included, since Dropbox zips it.
 ///
 /// A password-protected share is the one thing a rewritten URL cannot express,
@@ -723,14 +664,6 @@ fn queue_add(cfg: &config::Config, url: &str, opts: &DownloadOpts) -> Result<()>
     if mega::folder::is_folder_link(url) {
         anyhow::bail!(
             "MEGA folder links cannot be queued \u{2014} run `rdm <folder link>` to download the whole share"
-        );
-    }
-
-    // Same reasoning for GoFile, which has no single-file link shape at all:
-    // every content id is a potential tree.
-    if gofile::is_gofile_url(url) {
-        anyhow::bail!(
-            "GoFile links cannot be queued \u{2014} run `rdm <gofile link>` to download the whole content"
         );
     }
 
@@ -918,30 +851,6 @@ fn mega_options(cfg: &config::Config, opts: &DownloadOpts) -> mega::MegaOptions 
     }
 }
 
-/// `-c` means files in flight here, not chunks per file \u{2014} GoFile rate-limits
-/// per connection, so splitting one file gains nothing.
-///
-/// The password and account token come from the environment rather than flags:
-/// a password on the command line ends up in shell history and in `ps` output
-/// for every other user on the machine.
-fn gofile_options(cfg: &config::Config, opts: &DownloadOpts) -> gofile::GofileOptions {
-    gofile::GofileOptions {
-        workers: opts.connections.unwrap_or(cfg.gofile_workers),
-        max_retries: cfg.max_retries,
-        password: std::env::var("RDM_GOFILE_PASSWORD")
-            .ok()
-            .filter(|p| !p.trim().is_empty()),
-        token: std::env::var("RDM_GOFILE_TOKEN")
-            .ok()
-            .filter(|t| !t.trim().is_empty())
-            .or_else(|| {
-                let configured = cfg.gofile_token.trim();
-                (!configured.is_empty()).then(|| configured.to_owned())
-            }),
-        overwrite: false,
-    }
-}
-
 /// The key comes from the environment or the config file, never from a flag: an
 /// argument ends up in shell history and in `ps` output for every other user on
 /// the machine.
@@ -955,7 +864,7 @@ fn pixeldrain_options(cfg: &config::Config, opts: &DownloadOpts) -> pixeldrain::
     }
 }
 
-/// `-c` means files in flight here, the same double meaning it has for GoFile:
+/// `-c` means files in flight here, not chunks per file:
 /// a OneDrive folder share is downloaded one connection per file.
 fn onedrive_options(cfg: &config::Config, opts: &DownloadOpts) -> onedrive::OneDriveOptions {
     onedrive::OneDriveOptions {
@@ -965,8 +874,8 @@ fn onedrive_options(cfg: &config::Config, opts: &DownloadOpts) -> onedrive::OneD
     }
 }
 
-/// `-c` means files in flight here, the same double meaning it has for GoFile
-/// and OneDrive: a Drive folder is downloaded one connection per file.
+/// `-c` means files in flight here, the same double meaning it has for
+/// OneDrive: a Drive folder is downloaded one connection per file.
 ///
 /// The API key comes from the environment ahead of the config: a billable key
 /// is one people would rather not leave on disk. A blank key from either
@@ -1054,43 +963,7 @@ fn report_mega_folder(summary: &mega::folder::FolderSummary, quiet: bool) {
     }
 }
 
-/// Same shape as the MEGA folder report, for the same reason: one dead file in
-/// a content id does not make the other forty a failure.
-fn report_gofile(summary: &gofile::GofileSummary, quiet: bool) {
-    if quiet {
-        return;
-    }
-
-    eprintln!();
-    eprintln!("  \u{1f4c1} {}", summary.root.display());
-    eprintln!(
-        "     {} of {} file(s), {}",
-        summary.completed,
-        summary.total,
-        ui::format_size(summary.bytes)
-    );
-
-    if summary.skipped > 0 {
-        eprintln!("     {} already on disk", summary.skipped);
-    }
-
-    if !summary.failed.is_empty() {
-        eprintln!();
-        eprintln!("  \u{26a0} {} file(s) failed:", summary.failed.len());
-        for (path, reason) in &summary.failed {
-            eprintln!("     - {path}: {reason}");
-        }
-    }
-
-    if summary.cancelled {
-        eprintln!();
-        eprintln!(
-            "  \u{23f8} Stopped \u{2014} rerun the same link to pick up where this left off."
-        );
-    }
-}
-
-/// Same shape as the MEGA and GoFile folder reports, for the same reason: one
+/// Same shape as the MEGA folder report, for the same reason: one
 /// dead file in a OneDrive share does not make the other forty a failure.
 fn report_onedrive(summary: &onedrive::OneDriveSummary, quiet: bool) {
     if quiet {
@@ -1126,7 +999,7 @@ fn report_onedrive(summary: &onedrive::OneDriveSummary, quiet: bool) {
     }
 }
 
-/// Same shape as the MEGA, GoFile and OneDrive folder reports, for the same
+/// Same shape as the MEGA and OneDrive folder reports, for the same
 /// reason: one dead file in a Drive folder does not make the other forty a
 /// failure. The one line of its own is the unsupported count, because a
 /// shortcut or an Apps Script project is not a failed download \u{2014} there was
@@ -1422,90 +1295,9 @@ mod tests {
         assert_eq!(mega_options(&cfg, &opts).workers, 3);
     }
 
-    // -- GoFile routing --
-
-    /// Exactly the MEGA trap again: `/d/AbCdEf` has no extension and is short
-    /// enough not to read as an opaque id, so the heuristic calls it a
-    /// listing. Hence the GoFile check sitting above it.
-    #[test]
-    fn gofile_links_would_be_mistaken_for_listings() {
-        let link = "https://gofile.io/d/AbCdEf";
-        assert!(gofile::is_gofile_url(link));
-        assert!(
-            looks_like_directory(link),
-            "if this ever stops being true the ordering comment above is stale, not wrong"
-        );
-    }
-
-    #[test]
-    fn ordinary_links_are_not_sent_to_gofile() {
-        assert!(!gofile::is_gofile_url(
-            "https://example.com/gofile.io/d/abc"
-        ));
-        assert!(!gofile::is_gofile_url("https://example.com/song.flac"));
-    }
-
-    /// Sync has to refuse GoFile links for the same reason the scraper cannot
-    /// handle them: there is no listing page behind the link, only an API the
-    /// scraper knows nothing about. The refusal lives in the Sync arm, and
-    /// this pins the condition it turns on.
-    #[test]
-    fn sync_can_tell_a_gofile_link_from_a_listing() {
-        assert!(gofile::is_gofile_url("https://gofile.io/d/jWwmJp"));
-
-        // An ordinary listing must still reach sync untouched.
-        assert!(!gofile::is_gofile_url("https://example.com/music/"));
-        assert!(!gofile::is_gofile_url("https://example.com/d/jWwmJp"));
-    }
-
-    #[test]
-    fn gofile_workers_come_from_connections_then_config() {
-        let cfg = config::Config::default();
-
-        let defaults = gofile_options(&cfg, &DownloadOpts::default());
-        assert_eq!(defaults.workers, cfg.gofile_workers);
-        assert_eq!(defaults.max_retries, cfg.max_retries);
-        assert!(!defaults.overwrite);
-
-        let opts = DownloadOpts {
-            connections: Some(2),
-            ..DownloadOpts::default()
-        };
-        assert_eq!(gofile_options(&cfg, &opts).workers, 2);
-    }
-
-    /// A configured token is used when the environment does not override it.
-    /// The environment variable itself is left alone here: tests share a
-    /// process, and setting it would leak into every other test.
-    #[test]
-    fn a_configured_account_token_is_picked_up() {
-        let cfg = config::Config {
-            gofile_token: "tok-from-config".to_owned(),
-            ..config::Config::default()
-        };
-
-        if std::env::var("RDM_GOFILE_TOKEN").is_err() {
-            let options = gofile_options(&cfg, &DownloadOpts::default());
-            assert_eq!(options.token.as_deref(), Some("tok-from-config"));
-        }
-
-        // A blank token means "guest", not an empty bearer header.
-        let blank = config::Config {
-            gofile_token: "   ".to_owned(),
-            ..config::Config::default()
-        };
-        if std::env::var("RDM_GOFILE_TOKEN").is_err() {
-            assert!(
-                gofile_options(&blank, &DownloadOpts::default())
-                    .token
-                    .is_none()
-            );
-        }
-    }
-
     // -- Dropbox routing --
 
-    /// The same trap a third time, and the worst of the three: a folder share
+    /// The same listing trap: a folder share
     /// ends in `/h`, so the heuristic calls it a listing and the scraper finds
     /// a preview page. Hence the Dropbox check sitting above it.
     #[test]
@@ -1526,7 +1318,7 @@ mod tests {
         assert!(!dropbox::is_dropbox_url("https://example.com/song.flac"));
     }
 
-    /// Sync refuses Dropbox for a different reason than GoFile: the link is
+    /// Sync refuses Dropbox because the link is
     /// fetchable, there is just nothing behind it to diff, because a folder
     /// share is zipped into a single response.
     #[test]
@@ -1593,7 +1385,7 @@ mod tests {
 
     // -- OneDrive routing --
 
-    /// The same trap a fourth time: `u/s!AbCdEfGh` has no extension and no
+    /// The same listing trap: `u/s!AbCdEfGh` has no extension and no
     /// trailing slash, so the heuristic calls it a listing and the scraper
     /// would find a preview page. Hence the OneDrive check sitting above it.
     #[test]
@@ -1632,7 +1424,7 @@ mod tests {
 
     // -- Google Drive routing --
 
-    /// The same trap a fifth time: `/file/d/<id>/view` has no extension and no
+    /// The same listing trap: `/file/d/<id>/view` has no extension and no
     /// trailing slash, so the heuristic calls it a listing and the scraper
     /// would find a viewer page. Hence the Drive check sitting above it.
     #[test]
@@ -1704,7 +1496,7 @@ mod tests {
     // -- pixeldrain routing --
 
     /// pixeldrain is the one host whose link says which it is, so routing must
-    /// not treat every link as a listing the way GoFile has to.
+    /// distinguish single files from lists before downloading.
     #[test]
     fn pixeldrain_links_would_be_mistaken_for_listings() {
         let link = "https://pixeldrain.com/u/AbCdEf12";
@@ -1716,7 +1508,7 @@ mod tests {
     }
 
     /// pixeldrain is the one host here whose link says which shape it is, so
-    /// this is the inverse of the GoFile and OneDrive cases: nothing is
+    /// this is unlike the OneDrive case: nothing is
     /// assumed and nothing is asked.
     #[test]
     fn a_pixeldrain_link_says_whether_it_is_a_list() {
@@ -1754,7 +1546,7 @@ mod tests {
         assert_eq!(pixeldrain_options(&cfg, &opts).workers, 7);
     }
 
-    /// The key never comes from a flag. Same care as the GoFile and Dropbox
+    /// The key never comes from a flag. Same care as the Dropbox
     /// tests: the variable is read but never set, because tests share a
     /// process and setting it would leak into every other one.
     #[test]

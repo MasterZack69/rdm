@@ -2,8 +2,7 @@
 //!
 //! Three of the files rdm writes carry something worth stealing:
 //!
-//! - `config.toml`: the GoFile account token, the pixeldrain API key, the
-//!   Google Drive API key.
+//! - `config.toml`: the pixeldrain API key and the Google Drive API key.
 //! - `queue.json`: every queued URL, which for a private share *is* the
 //!   credential.
 //! - `<file>.rdm`: the URL a download is resuming from. A MEGA link carries
@@ -122,7 +121,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        write(&path, b"gofile_token = \"secret\"").unwrap();
+        write(&path, b"pixeldrain_api_key = \"secret\"").unwrap();
 
         assert_eq!(mode_of(&path), OWNER_ONLY_FILE);
     }

@@ -21,8 +21,7 @@
 //!     into a flat set of files.
 //!
 //! That is why [`crate::hoster::Kind::link_kind`] can give a real answer for
-//! pixeldrain, where for GoFile it has to assume and for OneDrive it has to
-//! defer to the API.
+//! pixeldrain, where for OneDrive it has to defer to the API.
 //!
 //! The `/api/file/<id>` and `/api/list/<id>` forms are accepted too, because
 //! anyone who reads the API documentation will eventually paste one.

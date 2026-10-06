@@ -79,7 +79,7 @@ const PASSWORD_MARKER: &str = "/sm/password";
 
 /// The environment variable a share password is read from.
 ///
-/// An environment variable rather than a flag, matching `RDM_GOFILE_PASSWORD`:
+/// An environment variable rather than a flag:
 /// a password on the command line ends up in shell history and in `ps` output
 /// for every other user on the machine.
 pub const PASSWORD_ENV: &str = "RDM_DROPBOX_PASSWORD";

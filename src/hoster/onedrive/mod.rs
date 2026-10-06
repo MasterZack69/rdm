@@ -1,7 +1,7 @@
 //! OneDrive (1drv.ms, onedrive.live.com) support.
 //!
 //! A OneDrive share link is not a fetchable address, and it fails in a nastier
-//! way than a MEGA or GoFile one: it *is* a real page, so handing it to the
+//! way than a MEGA one: it *is* a real page, so handing it to the
 //! generic engine saves an HTML preview under a plausible filename rather than
 //! failing outright. Only the API knows what is behind it.
 //!
@@ -34,7 +34,7 @@
 //! `@odata.nextLink` while the pages last, and every file in it goes through
 //! the engine too, several at a time. So `-c` means chunks-per-file for a file
 //! share and files-in-flight for a folder share, the way it already means
-//! workers for MEGA and GoFile.
+//! workers for MEGA.
 //!
 //! ## What this deliberately does not do
 //!

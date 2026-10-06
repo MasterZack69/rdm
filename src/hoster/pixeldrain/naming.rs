@@ -1,8 +1,7 @@
 //! Turning names pixeldrain reports into names a filesystem will accept.
 //!
-//! Split out for the same reason GoFile's naming is: it is pure, it is where
-//! all the sharp edges are, and it is worth testing without a network in
-//! sight.
+//! Split out because it is pure, it is where all the sharp edges are, and
+//! it is worth testing without a network in sight.
 
 use std::collections::HashSet;
 use std::path::Path;

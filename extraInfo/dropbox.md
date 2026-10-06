@@ -47,8 +47,8 @@ Put the password in the environment, not on the command line:
 RDM_DROPBOX_PASSWORD=hunter2 rdm "https://www.dropbox.com/scl/fi/abc123/report.pdf?rlkey=xyz&dl=0"
 ```
 
-Same reasoning as `RDM_GOFILE_PASSWORD`: an argument ends up in shell history
-and in `ps` output for every other user on the machine.
+A password argument ends up in shell history and in `ps` output for every
+other user on the machine.
 
 **Not supported yet:** `rdm queue add` of a password-protected share. The queue
 runner is deliberately hoster-agnostic and holds no session, so it would fetch

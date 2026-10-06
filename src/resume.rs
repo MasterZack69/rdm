@@ -666,7 +666,7 @@ mod tests {
     }
 
     /// Metadata written before identities existed, or by a host that has none:
-    /// the URL still decides, so MEGA, GoFile and Dropbox are unaffected.
+    /// the URL still decides, so MEGA and Dropbox are unaffected.
     #[test]
     fn without_an_identity_the_url_still_decides() {
         let chunks = sample_chunks();

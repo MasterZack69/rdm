@@ -5,7 +5,7 @@
 `rdm` is a Linux-focused Rust command-line download manager. It downloads
 ordinary HTTP/HTTPS files, recursively discovers conventional HTTP directory
 listings, and supports native SFTP. It also has first-class routes for MEGA,
-GoFile, Dropbox, OneDrive, Google Drive, and pixeldrain links. The project is
+Dropbox, OneDrive, Google Drive, and pixeldrain links. The project is
 an application crate (`src/main.rs`) backed by a library crate (`src/lib.rs`),
 so command dispatch remains thin and testable behavior lives in library
 modules.
@@ -56,7 +56,7 @@ is explicitly the purpose of the test.
 | `src/queue/` | Persistent queue items/state/store, cross-process locks, signals, hoster dispatch, table output, and concurrent runner. |
 | `src/sync/` | Remote mirror planning, verification, extension filtering, controlled deletion, and hoster/SFTP-specific sync routes. |
 | `src/sftp/` | Read-only native SFTP URL parsing, host-key/session handling, remote scanning, resumable transfer/checkpoint state, and sync support. |
-| `src/hoster/` | Provider-specific parsing/resolution/download behavior. `mega/`, `gofile/`, `dropbox/`, `onedrive/`, `gdrive/`, and `pixeldrain/` are independent integrations. |
+| `src/hoster/` | Provider-specific parsing/resolution/download behavior. `mega/`, `dropbox/`, `onedrive/`, `gdrive/`, and `pixeldrain/` are independent integrations. |
 | `src/ui/` | All terminal presentation: single-download bars, concurrent board, counters/spinners, formatting, terminal width, and terminal-text sanitization. |
 | Root utility modules | `safe_path`, `safe_file`, `secret_file`, `secret_url`, `resume`, `retry`, `range_download`, `pressure`, `parallel`, and `signal` provide shared safety, retry, transfer, concurrency, and cancellation building blocks. |
 | `extraInfo/` | Hoster- and SFTP-specific end-user documentation. |
@@ -97,7 +97,7 @@ is explicitly the purpose of the test.
   Missing config creates defaults; unreadable or invalid existing config is an
   error and must never silently reset user settings.
 - New config fields need serde defaults for backwards compatibility. Treat
-  GoFile tokens and Drive/pixeldrain keys as secrets: do not print them, and
+  Drive/pixeldrain keys as secrets: do not print them, and
   preserve owner-only file permissions through `secret_file`.
 - Environment overrides currently include `RDM_GDRIVE_API_KEY`,
   `RDM_PIXELDRAIN_API_KEY`, `RDM_ALLOW_PRIVATE`, `RDM_ALLOW_PROXY`, and
