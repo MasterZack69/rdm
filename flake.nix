@@ -68,7 +68,7 @@
             buildInputs = with pkgs; [
               rustc
               cargo
-              openssl
+              libressl
               zlib
               libssh2
             ];
