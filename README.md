@@ -154,7 +154,7 @@ Zack encourages you to build from source. As some random internet person once sa
 NixOS users get a flake for easy installation :)
 
 # Build From Source
-Make sure you have libressl, zlib, libssh, pkg-config and cargo installed
+Make sure you have libressl, zlib, libssh2, pkg-config and cargo installed
 
 ```
 git clone https://github.com/MasterZack69/rdm
