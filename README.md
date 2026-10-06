@@ -151,6 +151,7 @@ All optional, there are other hoster specific env variables which can find in th
 
 # Release
 Zack encourages you to build from source. As some random internet person once said, "Always build from source"
+
 NixOS users get a flake for easy installation :)
 
 # Build From Source
