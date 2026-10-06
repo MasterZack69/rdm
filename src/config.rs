@@ -29,20 +29,6 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub mega_resume_on_ip_change: bool,
 
-    /// How many GoFile files to download at once.
-    ///
-    /// Files, not chunks: GoFile rate-limits per connection, so throughput
-    /// comes from running several files side by side rather than splitting
-    /// one.
-    #[serde(default = "default_gofile_workers")]
-    pub gofile_workers: usize,
-
-    /// A GoFile account token, for people who have an account and want their
-    /// quota rather than a throwaway guest one. Empty means "create a guest
-    /// account per run", which is what the website does for visitors.
-    #[serde(default)]
-    pub gofile_token: String,
-
     /// Files of a OneDrive folder share to download at once.
     ///
     /// Files, not chunks: each file takes its own connection, so a folder
@@ -65,7 +51,7 @@ pub struct Config {
     ///
     /// A key is a quota identity rather than a credential — a restricted share
     /// stays unreadable with or without one — but it is billable, so it is
-    /// treated like the GoFile token and never printed.
+    /// treated as a secret and never printed.
     #[serde(default)]
     pub gdrive_api_key: String,
 
@@ -99,10 +85,6 @@ pub struct Config {
 
 fn default_mega_workers() -> usize {
     crate::mega::WORKERS_DEFAULT
-}
-
-fn default_gofile_workers() -> usize {
-    crate::hoster::gofile::WORKERS_DEFAULT
 }
 
 fn default_onedrive_workers() -> usize {
@@ -143,8 +125,6 @@ impl Default for Config {
             mega_workers: default_mega_workers(),
             mega_verify_mac: true,
             mega_resume_on_ip_change: true,
-            gofile_workers: default_gofile_workers(),
-            gofile_token: String::new(),
             onedrive_workers: default_onedrive_workers(),
             gdrive_workers: default_gdrive_workers(),
             gdrive_api_key: String::new(),
@@ -192,7 +172,7 @@ impl Config {
     /// An unreadable or unparseable file is an error rather than a shrug. It
     /// used to be `unwrap_or_default()`, which threw away *the whole file* on
     /// a single typo: the download directory moved back to `~/Downloads`,
-    /// concurrency and retries reverted, and the GoFile, Drive and pixeldrain
+    /// concurrency and retries reverted, and the Drive and pixeldrain
     /// credentials silently became empty — all without a word. A configuration
     /// the user wrote is never discarded; they are told where the problem is
     /// so they can fix it.
@@ -241,11 +221,11 @@ impl Config {
 
     /// Writes the config file, readable only by its owner.
     ///
-    /// Three of the fields here are credentials: the GoFile account token,
-    /// the pixeldrain API key and the billable Drive API key. A plain
-    /// `fs::write` asks for mode 0666 and leaves the rest to the umask, and
+    /// Two of the fields here are credentials: the pixeldrain API key and
+    /// the billable Drive API key. A plain `fs::write` asks for mode 0666 and
+    /// leaves the rest to the umask, and
     /// the usual 022 turns that into 0644 — every other account on the
-    /// machine could read all three.
+    /// machine could read both.
     ///
     /// [`crate::secret_file`] pins the mode instead. It also sets it on a file
     /// that already exists, which is what repairs a config.toml an earlier
@@ -295,12 +275,11 @@ impl Config {
         eprintln!("  MEGA slots : {}", self.mega_workers);
         eprintln!("  MEGA verify: {}", self.mega_verify_mac);
         eprintln!("  MEGA VPN   : {}", self.mega_resume_on_ip_change);
-        eprintln!("  GoFile     : {} file(s) at a time", self.gofile_workers);
         eprintln!("  OneDrive   : {} file(s) at a time", self.onedrive_workers);
         eprintln!("  Drive      : {} file(s) at a time", self.gdrive_workers);
         eprintln!("  Drive docs : exported as {}", self.gdrive_doc_format);
-        // Whether a key is set, never the key: same rule as the GoFile token
-        // below.
+        // Whether a key is set, never the key: config output gets pasted into
+        // bug reports.
         eprintln!(
             "  pixeldrain : {} file(s) at a time ({})",
             self.pixeldrain_workers,
@@ -308,16 +287,6 @@ impl Config {
                 "anonymous"
             } else {
                 "API key set"
-            }
-        );
-        // Never print the token itself: config output gets pasted into bug
-        // reports.
-        eprintln!(
-            "  GoFile acct: {}",
-            if self.gofile_token.trim().is_empty() {
-                "guest"
-            } else {
-                "account token set"
             }
         );
         // Same rule, and the same reason a folder download can refuse before
@@ -337,7 +306,7 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// A 0.2.1 config file has none of the mega_* or gofile_* keys. It must
+    /// A 0.2.1 config file has none of the newer hoster keys. It must
     /// still load, keeping the values the user did set.
     #[test]
     fn older_config_files_still_parse() {
@@ -355,7 +324,6 @@ queue_parallel = 5
         assert_eq!(cfg.mega_workers, crate::mega::WORKERS_DEFAULT);
         assert!(cfg.mega_verify_mac);
         assert!(cfg.mega_resume_on_ip_change);
-        assert_eq!(cfg.gofile_workers, crate::hoster::gofile::WORKERS_DEFAULT);
         assert_eq!(
             cfg.onedrive_workers,
             crate::hoster::onedrive::WORKERS_DEFAULT
@@ -365,12 +333,31 @@ queue_parallel = 5
             cfg.pixeldrain_workers,
             crate::hoster::pixeldrain::WORKERS_DEFAULT
         );
-        assert!(cfg.gofile_token.is_empty());
         // No key means anonymous access, which is a working configuration for
         // everything except a folder.
         assert!(cfg.gdrive_api_key.is_empty());
         assert_eq!(cfg.gdrive_doc_format, "pdf");
         assert!(cfg.pixeldrain_api_key.is_empty());
+    }
+
+    /// Obsolete fields must not prevent an existing configuration from loading.
+    #[test]
+    fn unknown_settings_are_ignored_and_not_serialized() {
+        let cfg = Config {
+            connections: 12,
+            gdrive_api_key: "key-from-config".to_owned(),
+            ..Default::default()
+        };
+        let text = format!(
+            "{}\nretired_workers = 3\nretired_token = \"old-token\"\n",
+            toml::to_string_pretty(&cfg).unwrap()
+        );
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.connections, 12);
+        assert_eq!(back.gdrive_api_key, "key-from-config");
+        let saved = toml::to_string_pretty(&back).unwrap();
+        assert!(!saved.contains("retired_workers"));
+        assert!(!saved.contains("retired_token"));
     }
 
     #[test]
@@ -384,19 +371,6 @@ queue_parallel = 5
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.mega_workers, 12);
         assert!(!back.mega_verify_mac);
-    }
-
-    #[test]
-    fn gofile_settings_round_trip() {
-        let cfg = Config {
-            gofile_workers: 3,
-            gofile_token: "abc123".to_owned(),
-            ..Default::default()
-        };
-        let text = toml::to_string_pretty(&cfg).unwrap();
-        let back: Config = toml::from_str(&text).unwrap();
-        assert_eq!(back.gofile_workers, 3);
-        assert_eq!(back.gofile_token, "abc123");
     }
 
     #[test]
@@ -477,7 +451,7 @@ queue_parallel = 5
     }
 
     /// The reason `save` goes through `secret_file`: the serialized form
-    /// really does carry all three credentials in the clear, so the mode on
+    /// really does carry both credentials in the clear, so the mode on
     /// the file is the only thing keeping them from the rest of the machine.
     #[cfg(unix)]
     #[test]
@@ -488,7 +462,6 @@ queue_parallel = 5
         let path = dir.path().join("config.toml");
 
         let cfg = Config {
-            gofile_token: "gofile-secret".to_owned(),
             gdrive_api_key: "AIzaSySecret".to_owned(),
             pixeldrain_api_key: "pixeldrain-secret".to_owned(),
             ..Default::default()
@@ -496,7 +469,6 @@ queue_parallel = 5
         let text = toml::to_string_pretty(&cfg).unwrap();
         crate::secret_file::write(&path, text.as_bytes()).unwrap();
 
-        assert!(text.contains("gofile-secret"));
         assert!(text.contains("AIzaSySecret"));
         assert!(text.contains("pixeldrain-secret"));
 

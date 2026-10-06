@@ -55,9 +55,6 @@ pub mod dropbox;
 /// API for a folder listing.
 pub mod gdrive;
 
-/// GoFile (gofile.io): API-resolved content trees, guest or account tokens.
-pub mod gofile;
-
 /// MEGA (mega.nz): AES-CTR chunked downloads, folder shares, MAC verification.
 pub mod mega;
 
@@ -74,7 +71,6 @@ pub mod pixeldrain;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Mega,
-    Gofile,
     Dropbox,
     OneDrive,
     Gdrive,
@@ -119,9 +115,6 @@ impl Kind {
         if mega::is_mega_url(url) {
             return Some(Self::Mega);
         }
-        if gofile::is_gofile_url(url) {
-            return Some(Self::Gofile);
-        }
         if dropbox::is_dropbox_url(url) {
             return Some(Self::Dropbox);
         }
@@ -141,7 +134,6 @@ impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Mega => "mega",
-            Self::Gofile => "gofile",
             Self::Dropbox => "dropbox",
             Self::OneDrive => "onedrive",
             Self::Gdrive => "gdrive",
@@ -153,7 +145,6 @@ impl Kind {
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Mega => "MEGA",
-            Self::Gofile => "GoFile",
             Self::Dropbox => "Dropbox",
             Self::OneDrive => "OneDrive",
             Self::Gdrive => "Google Drive",
@@ -172,17 +163,6 @@ impl Kind {
                 resume: true,
                 integrity_check: true,
                 parallel_chunks: true,
-            },
-            // No integrity check: GoFile publishes no per-file digest, so a
-            // finished download can only be checked against the advertised
-            // length. No parallel chunks: its storage nodes rate-limit per
-            // connection, and running several files at once beats splitting
-            // one.
-            Self::Gofile => Capabilities {
-                folders: true,
-                resume: true,
-                integrity_check: false,
-                parallel_chunks: false,
             },
             // No folders: a Dropbox folder share does not expand into a
             // listing, it is zipped and served as one response, so there is
@@ -267,19 +247,12 @@ impl Kind {
                     LinkKind::File
                 }
             }
-            // Always a folder. A GoFile content id is opaque: the same
-            // `/d/<id>` shape is used whether it holds one file or a tree of
-            // them, and which it is only becomes known after the API call.
-            // Treating every link as a folder means the one-file case lands
-            // in a directory of its own, which is the harmless direction to
-            // be wrong in.
-            Self::Gofile => LinkKind::Folder,
             // Always a file, folder shares included: Dropbox zips a folder
             // and serves it as one response, so there is exactly one
             // destination path either way. `dropbox::is_folder_link` is still
             // available for callers that want to say which it was.
             Self::Dropbox => LinkKind::File,
-            // Unknowable from the link, and unlike GoFile there is no harmless
+            // Unknowable from the link, and there is no harmless
             // direction to guess in: a OneDrive share id is opaque, and a file
             // and a folder differ in where the download lands rather than only
             // in how it is counted. So the syntactic answer is the shape a
@@ -332,7 +305,7 @@ pub fn detect(url: &str) -> Option<Kind> {
 /// Does any hoster module claim this link?
 ///
 /// A `true` here means the generic HTTP engine must not be handed the URL as
-/// it stands: MEGA and GoFile links are API handles plus decryption keys
+/// it stands: MEGA links are API handles plus decryption keys
 /// rather than fetchable addresses, a Dropbox share link serves an HTML
 /// preview page until [`dropbox::resolve`] rewrites it into a direct one, a
 /// OneDrive link is a preview page too until [`onedrive::resolve`] asks the API
@@ -358,19 +331,6 @@ mod tests {
             Kind::detect("https://mega.co.nz/folder/AbCdEfGh#key"),
             Some(Kind::Mega)
         );
-    }
-
-    #[test]
-    fn gofile_links_are_routed_to_gofile() {
-        assert_eq!(
-            Kind::detect("https://gofile.io/d/AbCdEf"),
-            Some(Kind::Gofile)
-        );
-        assert_eq!(
-            Kind::detect("https://www.gofile.io/d/AbCdEf"),
-            Some(Kind::Gofile)
-        );
-        assert!(is_hoster_url("https://gofile.io/d/AbCdEf"));
     }
 
     #[test]
@@ -457,8 +417,6 @@ mod tests {
         assert_eq!(Kind::detect("https://example.com/file.zip"), None);
         assert_eq!(Kind::detect("https://notmega.nz/file/abc#key"), None);
         assert_eq!(Kind::detect("https://mega.nz.evil.com/file/abc#key"), None);
-        assert_eq!(Kind::detect("https://notgofile.io/d/abc"), None);
-        assert_eq!(Kind::detect("https://gofile.io.evil.com/d/abc"), None);
         assert_eq!(
             Kind::detect("https://notdropbox.com/scl/fi/abc/f.zip"),
             None
@@ -507,19 +465,8 @@ mod tests {
         assert!(!mega.is_folder_link("https://mega.nz/file/AbCdEfGh#key"));
     }
 
-    /// One content id can be a single file or a whole tree, and the link does
-    /// not say which, so every GoFile link is handled as a folder.
-    #[test]
-    fn every_gofile_link_is_treated_as_a_folder() {
-        assert!(Kind::Gofile.is_folder_link("https://gofile.io/d/AbCdEf"));
-        assert_eq!(
-            Kind::Gofile.link_kind("https://gofile.io/d/AbCdEf"),
-            LinkKind::Folder
-        );
-    }
-
-    /// Dropbox is the other way round from GoFile: the link does say which it
-    /// is, and it does not matter, because a folder share arrives as one zip.
+    /// A Dropbox link says whether it is a file or folder, but that does not
+    /// matter here, because a folder share arrives as one zip.
     /// Both halves of that are easy to get wrong in the other direction.
     #[test]
     fn a_dropbox_folder_share_is_still_a_single_download() {
@@ -592,19 +539,6 @@ mod tests {
         assert!(caps.parallel_chunks);
         assert_eq!(Kind::Mega.name(), "mega");
         assert_eq!(Kind::Mega.display_name(), "MEGA");
-    }
-
-    /// The two `false`s are the point of this test: callers are meant to read
-    /// them and not offer what GoFile cannot do.
-    #[test]
-    fn gofile_advertises_what_it_implements() {
-        let caps = Kind::Gofile.capabilities();
-        assert!(caps.folders);
-        assert!(caps.resume);
-        assert!(!caps.integrity_check);
-        assert!(!caps.parallel_chunks);
-        assert_eq!(Kind::Gofile.name(), "gofile");
-        assert_eq!(Kind::Gofile.display_name(), "GoFile");
     }
 
     #[test]

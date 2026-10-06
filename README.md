@@ -79,7 +79,6 @@ Directory-looking URLs are scraped: `rdm <URL>` on a listing enqueues everything
 # Hoster Section
 
 - [mega - click to view](extraInfo/mega.md)
-- [gofile - click to view](extraInfo/gofile.md)
 - [dropbox - click to view](extraInfo/dropbox.md)
 - [onedrive - click to view](extraInfo/onedrive.md)
 - [gdrive - click to view](extraInfo/gdrive.md)
@@ -109,12 +108,6 @@ mega_verify_mac = true
 
 # MEGA: when quota-blocked, resume early if your public IP changes
 mega_resume_on_ip_change = true
-
-# GoFile: how many files to download at once (max 10)
-gofile_workers = 5
-
-# GoFile: your account token
-gofile_token = ""
 
 # OneDrive: how many files to download at once (max 15)
 onedrive_workers = 5
@@ -180,7 +173,6 @@ cargo build --release
 
 # Prior art
 - [MegaBasterd](https://github.com/tonikelope/megabasterd)
-- [gofile-downloader](https://github.com/ltsdw/gofile-downloader)
 - [onedrive-downloader](https://github.com/eugenenuke/onedrive-downloader)
 - [goodls](https://github.com/tanaikech/goodls)
 - [gdown](https://github.com/wkentaro/gdown)
