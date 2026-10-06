@@ -87,7 +87,7 @@ impl Partial {
             serde_json::to_writer(&mut file, &record).context("Cannot encode SFTP checkpoint")?;
             file.flush()?;
             file.sync_all()?;
-            safe_file::rename_beneath(&self.destination.root, &temp, &self.metadata, true)
+            safe_file::publish_beneath(&self.destination.root, &temp, &self.metadata, true)
         })();
         if result.is_err() {
             let _ = safe_file::unlink_beneath(&self.destination.root, &temp);
@@ -105,7 +105,7 @@ impl Partial {
 
     pub fn publish(self, replace: bool) -> Result<()> {
         self.file.sync_all().context("Cannot flush completed SFTP file")?;
-        safe_file::rename_beneath(
+        safe_file::publish_beneath(
             &self.destination.root, &self.part, &self.destination.relative, replace,
         )?;
         // The payload is already published. A leftover checkpoint is harmless

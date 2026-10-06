@@ -274,23 +274,14 @@ pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
             .await
             .context("Failed to sync metadata temp file to disk")?;
 
-        drop(file);
+        // Published from the descriptor that was just written, not from the
+        // temp file's name: a random name is hard to guess but it is still a
+        // name, and an attacker who sees it can replace the entry before the
+        // publication step reads it. `publish_open_file` gives the `.rdm` name
+        // to this inode, and flushes both directory entries.
+        let written = file.into_std().await;
 
-        fs::rename(&tmp_path, path).await.with_context(|| {
-            format!("Failed to rename '{}' to '{}'", tmp_path.display(), path)
-        })?;
-
-        let parent = std::path::Path::new(path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-
-        let dir = fs::File::open(parent)
-            .await
-            .with_context(|| format!("Failed to open parent dir: {}", parent.display()))?;
-
-        dir.sync_all()
-            .await
-            .context("Failed to sync parent directory")?;
+        safe_file::publish_open_file(&written, &tmp_path, std::path::Path::new(path), true)?;
 
         Ok::<(), anyhow::Error>(())
     }
@@ -326,11 +317,15 @@ pub async fn save_best_effort(path: &str, meta: &ResumeMetadata) -> Result<()> {
 
     file.flush().await.context("Failed to flush metadata")?;
 
-    drop(file);
+    // Published by descriptor, as in `save_atomic`. The difference between the
+    // two is the payload `fsync`, not how the name is handed over.
+    let written = file.into_std().await;
 
-    fs::rename(&tmp_path, path)
-        .await
-        .with_context(|| format!("Failed to rename '{}' to '{}'", tmp_path.display(), path))?;
+    if let Err(e) = safe_file::publish_open_file(&written, &tmp_path, std::path::Path::new(path), true)
+    {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(e);
+    }
 
     Ok(())
 }

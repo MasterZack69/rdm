@@ -56,13 +56,18 @@ where
             resume::delete(&meta_path).await?;
             let temp = Path::new(&temp_path);
             let final_path = Path::new(ctx.output_path);
+
+            // The chunk workers have each closed their own handle, so
+            // publication reopens the staged file — and validates it again
+            // before linking it into place, because what gets published is
+            // that descriptor and not the `.part` name it was found under.
             if destination_existed {
-                safe_file::rename_replacing(temp, final_path)
+                safe_file::publish_replacing(temp, final_path)
             } else {
-                safe_file::rename_no_replace(temp, final_path)
+                safe_file::publish_no_replace(temp, final_path)
             }
             .with_context(|| {
-                format!("Failed to rename '{}' to '{}'", temp_path, ctx.output_path)
+                format!("Failed to publish '{}' as '{}'", temp_path, ctx.output_path)
             })?;
             Ok(total)
         }

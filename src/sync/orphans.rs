@@ -1,24 +1,42 @@
 //! What `--delete` may remove.
 //!
-//! Everything here walks with `DirEntry::file_type` rather than with
-//! `Path::is_dir`/`Path::is_file`. That pair follows symlinks, so a link
-//! planted inside the destination was walked as though it were part of the
-//! mirror, and every path found underneath was handed to the deletion phase to
-//! reconstruct and unlink. One `ln -s ~ dest/pics` aimed `--delete` at a home
-//! directory. `file_type` is metadata the readdir call already returned and
-//! follows nothing, so a link reports as a link.
+//! Every walk here goes through [`safe_file::read_dir_beneath`]: the directory
+//! is resolved by descriptor, anchored at the root, and both the `readdir` and
+//! the per-entry stat happen through that descriptor.
 //!
-//! Symlinks are then skipped outright rather than followed: not recursed into,
-//! and not reported as orphans either. rdm only ever writes regular files, so
-//! a link inside the destination is something the user put there and removing
-//! it is not this sweep's business.
+//! The reason is that the sweep's input decides what gets deleted. Walking by
+//! pathname with `std::fs::read_dir` re-resolves every component on every
+//! level, so a directory inside the mirror could be replaced with a symlink
+//! between one level and the next and the files behind it would be enumerated
+//! as part of the mirror — and handed to the deletion phase. The older version
+//! of this module fixed the easy half of that by reading `DirEntry::file_type`
+//! instead of `Path::is_dir`, so a link reported as a link; it still trusted
+//! the pathname it was enumerating.
+//!
+//! Symlinks are skipped outright rather than followed: not recursed into, and
+//! not reported as orphans either. rdm only ever writes regular files, so a
+//! link inside the destination is something the user put there and removing it
+//! is not this sweep's business.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::safe_file::{self, EntryKind};
 
 use super::paths::file_has_ext;
 
-/// Local files under `base` that the share no longer contains.
+/// A relative path as the listing comparisons want it: `/`-separated, lossily
+/// decoded. Entry names come from readdir, so they are bytes on Unix.
+fn relative_text(relative: &Path) -> String {
+    relative.to_string_lossy().replace('\\', "/")
+}
+
+/// Local files under `root`/`base` that the share no longer contains.
+///
+/// `root` is the trust boundary — the download directory the user configured —
+/// and `base` is the relative path of the mirror inside it. Every level below
+/// `base` is re-resolved from `root`, so no part of the walk depends on a
+/// pathname staying what it was a moment ago.
 ///
 /// Temp files are recognised structurally rather than by suffix: anything that
 /// is a kept path plus a dot-suffix (`a.jpg.part`, `a.jpg.mctemp`, whatever
@@ -30,61 +48,43 @@ use super::paths::file_has_ext;
 /// orphans. MEGA's undecryptable nodes and OneDrive's unwalkable children are
 /// both that case.
 pub(super) fn collect_listing_orphans(
-    dir: &Path,
+    root: &Path,
     base: &Path,
     keep: &HashSet<String>,
     ext_filter: &Option<HashSet<String>>,
     out: &mut Vec<String>,
 ) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    for (relative, kind) in walk(root, base) {
+        if kind != EntryKind::File {
+            continue;
+        }
 
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
+        let Ok(suffix) = relative.strip_prefix(base) else {
             continue;
         };
-        // Never followed, never deleted. See the module comment.
-        if kind.is_symlink() {
+        let suffix = relative_text(suffix);
+
+        if suffix.is_empty() || keep.contains(&suffix) {
             continue;
         }
 
-        let path = entry.path();
-
-        if kind.is_dir() {
-            collect_listing_orphans(&path, base, keep, ext_filter, out);
-            continue;
-        }
-        if !kind.is_file() {
-            continue;
-        }
-
-        let relative = match path.strip_prefix(base) {
-            Ok(r) => r.to_string_lossy().to_string().replace('\\', "/"),
-            Err(_) => continue,
-        };
-        if relative.is_empty() || keep.contains(&relative) {
-            continue;
-        }
-
-        let is_temp_of_kept = keep.iter().any(|k| {
-            relative.len() > k.len()
-                && relative.starts_with(k)
-                && relative.as_bytes()[k.len()] == b'.'
+        let is_temp_of_kept = keep.iter().any(|kept| {
+            suffix.len() > kept.len()
+                && suffix.starts_with(kept)
+                && suffix.as_bytes()[kept.len()] == b'.'
         });
         if is_temp_of_kept {
             continue;
         }
 
         if let Some(exts) = ext_filter.as_ref() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let name = relative.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !file_has_ext(name, exts) {
                 continue;
             }
         }
 
-        out.push(relative);
+        out.push(suffix);
     }
 }
 
@@ -92,74 +92,107 @@ pub(super) fn collect_listing_orphans(
 /// the mirror's own folder name, so each local path is compared with that
 /// folder put back in front of it.
 pub(super) fn collect_orphan_files(
-    dir: &Path,
+    root: &Path,
     base: &Path,
     remote_decoded: &HashSet<String>,
     ext_filter: &Option<HashSet<String>>,
     out: &mut Vec<String>,
 ) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Some(folder) = base.file_name().and_then(|n| n.to_str()) else {
+        return;
     };
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_symlink() {
+
+    for (relative, kind) in walk(root, base) {
+        if kind != EntryKind::File {
             continue;
         }
 
-        let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && (name.ends_with(".part") || name.ends_with(".rdm"))
+        let name = relative.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        // Partial downloads and resume state belong to a transfer, not to the
+        // listing.
+        if name.ends_with(".part") || name.ends_with(".rdm") {
+            continue;
+        }
+
+        if let Some(exts) = ext_filter.as_ref()
+            && !file_has_ext(name, exts)
         {
             continue;
         }
-        if kind.is_dir() {
-            collect_orphan_files(&path, base, remote_decoded, ext_filter, out);
-        } else if kind.is_file() {
-            if let Some(exts) = ext_filter.as_ref() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !file_has_ext(name, exts) {
-                    continue;
-                }
-            }
-            let relative = match path.strip_prefix(base) {
-                Ok(r) => r.to_string_lossy().to_string().replace('\\', "/"),
-                Err(_) => continue,
-            };
-            if relative.is_empty() {
-                continue;
-            }
-            let folder = match base.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n,
-                None => return,
-            };
-            let full = format!("{}/{}", folder, relative);
-            if !remote_decoded.contains(&full) {
-                out.push(relative);
-            }
+
+        let Ok(suffix) = relative.strip_prefix(base) else {
+            continue;
+        };
+        let suffix = relative_text(suffix);
+
+        if suffix.is_empty() {
+            continue;
+        }
+
+        if !remote_decoded.contains(&format!("{}/{}", folder, suffix)) {
+            out.push(suffix);
         }
     }
 }
 
-pub(super) fn remove_empty_dirs(dir: &Path) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
+/// Every file beneath `base`, as paths relative to `root`.
+///
+/// Depth- and entry-limited so that a mirror that has grown pathological —
+/// or a directory loop made of hard-linked directories on a filesystem that
+/// allows them — cannot turn a sweep into an unbounded walk.
+fn walk(root: &Path, base: &Path) -> Vec<(PathBuf, EntryKind)> {
+    const MAX_DEPTH: usize = 64;
+    const MAX_ENTRIES: usize = 200_000;
+
+    let mut pending = vec![(base.to_path_buf(), 0usize)];
+    let mut out = Vec::new();
+
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = safe_file::read_dir_beneath(root, &dir) else {
             continue;
         };
-        // A linked directory is not ours to descend into or to remove.
-        if kind.is_symlink() || !kind.is_dir() {
-            continue;
+
+        for entry in entries {
+            if out.len() >= MAX_ENTRIES {
+                return out;
+            }
+
+            let relative = dir.join(&entry.name);
+
+            match entry.kind {
+                EntryKind::Dir if depth < MAX_DEPTH => {
+                    pending.push((relative.clone(), depth + 1));
+                    out.push((relative, EntryKind::Dir));
+                }
+                // Links, FIFOs, devices: never followed, never deleted.
+                EntryKind::Dir | EntryKind::Other => {}
+                EntryKind::File => out.push((relative, EntryKind::File)),
+            }
         }
-        let path = entry.path();
-        remove_empty_dirs(&path);
-        let _ = std::fs::remove_dir(&path);
+    }
+
+    out
+}
+
+/// Removes directories that the sweep has emptied, deepest first.
+///
+/// Only directories that are genuinely empty go, and only through the same
+/// anchored resolution as everything else, so a link to a directory outside
+/// the root is neither descended into nor removed.
+pub(super) fn remove_empty_dirs(root: &Path, base: &Path) {
+    let mut dirs: Vec<PathBuf> = walk(root, base)
+        .into_iter()
+        .filter(|(_, kind)| *kind == EntryKind::Dir)
+        .map(|(relative, _)| relative)
+        .collect();
+
+    // Deepest first, so a directory whose only contents were empty
+    // directories is itself empty by the time it is reached.
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+
+    for dir in dirs {
+        let _ = safe_file::remove_dir_beneath(root, &dir);
     }
 }
 
@@ -190,7 +223,7 @@ mod tests {
 
         let keep = keep_set(&["keep.jpg", "sub/nested.jpg"]);
         let mut out = Vec::new();
-        collect_listing_orphans(base, base, &keep, &None, &mut out);
+        collect_listing_orphans(base, Path::new(""), &keep, &None, &mut out);
         out.sort();
 
         assert_eq!(out, vec!["gone.jpg", "sub/also-gone.jpg"]);
@@ -213,7 +246,7 @@ mod tests {
 
         let keep = keep_set(&["movie.mkv"]);
         let mut out = Vec::new();
-        collect_listing_orphans(base, base, &keep, &None, &mut out);
+        collect_listing_orphans(base, Path::new(""), &keep, &None, &mut out);
 
         // Only the leftover with no kept file behind it is an orphan.
         assert_eq!(out, vec!["stray.mkv.part"]);
@@ -229,7 +262,7 @@ mod tests {
 
         let exts: HashSet<String> = keep_set(&["jpg"]);
         let mut out = Vec::new();
-        collect_listing_orphans(base, base, &HashSet::new(), &Some(exts), &mut out);
+        collect_listing_orphans(base, Path::new(""), &HashSet::new(), &Some(exts), &mut out);
 
         // notes.txt was never in scope for this sync, so it is not an orphan.
         assert_eq!(out, vec!["gone.jpg"]);
@@ -250,7 +283,7 @@ mod tests {
         // Only the readable node made it into the listing.
         let keep = keep_set(&["readable.jpg"]);
         let mut out = Vec::new();
-        collect_listing_orphans(base, base, &keep, &None, &mut out);
+        collect_listing_orphans(base, Path::new(""), &keep, &None, &mut out);
 
         assert_eq!(
             out,
@@ -277,7 +310,7 @@ mod tests {
 
         let keep = keep_set(&["keep.jpg"]);
         let mut out = Vec::new();
-        collect_listing_orphans(base, base, &keep, &None, &mut out);
+        collect_listing_orphans(base, Path::new(""), &keep, &None, &mut out);
 
         assert!(
             out.is_empty(),
@@ -300,7 +333,7 @@ mod tests {
 
         let remote = keep_set(&["mirror/keep.jpg"]);
         let mut out = Vec::new();
-        collect_orphan_files(&base, &base, &remote, &None, &mut out);
+        collect_orphan_files(dir.path(), Path::new("mirror"), &remote, &None, &mut out);
 
         assert!(
             out.is_empty(),
@@ -323,7 +356,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, base.join("linked.jpg")).unwrap();
 
         let mut out = Vec::new();
-        collect_listing_orphans(base, base, &HashSet::new(), &None, &mut out);
+        collect_listing_orphans(base, Path::new(""), &HashSet::new(), &None, &mut out);
 
         assert!(out.is_empty(), "got {:?}", out);
     }
@@ -337,7 +370,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("elsewhere")).unwrap();
 
-        remove_empty_dirs(dir.path());
+        remove_empty_dirs(dir.path(), Path::new(""));
 
         assert!(
             outside.path().join("empty-but-not-ours").exists(),

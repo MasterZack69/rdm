@@ -119,7 +119,9 @@ pub async fn download_range(
     // the final component, so a planted link turned these offset writes into
     // writes through to another file. `open_guarded` resolves once relative to
     // the directory, refuses to traverse a symlink, and fstats the descriptor
-    // to confirm a regular file this process owns.
+    // to confirm a regular file this process owns — so a worker only ever
+    // writes to a file this process could have created, and publication at the
+    // end re-validates before linking anything into place.
     let file = safe_file::open_guarded(
         Path::new(file_path),
         Existing::Open,

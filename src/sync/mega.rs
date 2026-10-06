@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -131,7 +131,13 @@ pub(super) async fn run_mega(
             Some(_) => {
                 let keep: HashSet<String> = entries.iter().map(|e| e.display_path()).collect();
                 if base.is_dir() {
-                    collect_listing_orphans(&base, &base, &keep, &ext_filter, &mut to_delete);
+                    collect_listing_orphans(
+                        &base,
+                        Path::new(""),
+                        &keep,
+                        &ext_filter,
+                        &mut to_delete,
+                    );
                     to_delete.sort();
                 }
             }
@@ -293,20 +299,28 @@ pub(super) async fn run_mega(
         let mut delete_failed = 0u64;
 
         for relative in &to_delete {
-            let full_path = base.join(relative);
-            match std::fs::remove_file(&full_path) {
-                Ok(_) => deleted += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Removed through the download root by descriptor, not through a
+            // reconstructed pathname: a directory component replaced with a
+            // symlink between the sweep and the deletion would otherwise
+            // redirect the unlink outside the mirror.
+            match crate::safe_file::unlink_beneath(&base, Path::new(relative)) {
+                Ok(()) => deleted += 1,
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => {}
                 Err(e) => {
                     delete_failed += 1;
-                    progress.note(&format!("  \u{26a0} Failed to delete {}: {}", relative, e));
+                    progress.note(&format!(
+                        "  \u{26a0} Failed to delete {}: {:#}",
+                        relative, e
+                    ));
                 }
             }
             progress.tick();
         }
 
         progress.finish(&format!("{} file(s) deleted", deleted));
-        remove_empty_dirs(&base);
+        remove_empty_dirs(&base, Path::new(""));
 
         if delete_failed > 0 {
             eprintln!("  \u{26a0} Failed to delete {} file(s)", delete_failed);
