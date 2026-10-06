@@ -21,11 +21,15 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "rdm";
-            version = "0.3.0";
+            version = "0.3.1";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = with pkgs; [ pkg-config ];
-            buildInputs = with pkgs; [ openssl zlib libssh2 ];
+            buildInputs = with pkgs; [
+              libressl
+              zlib
+              libssh2
+            ];
             doCheck = false;
             meta = {
               description = "Rust Download Manager - CLI";
@@ -61,7 +65,13 @@
         {
           default = pkgs.mkShell {
             nativeBuildInputs = with pkgs; [ pkg-config ];
-            buildInputs = with pkgs; [ rustup openssl zlib libssh2 ];
+            buildInputs = with pkgs; [
+              rustc
+              cargo
+              openssl
+              zlib
+              libssh2
+            ];
           };
         }
       );
