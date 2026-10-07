@@ -1,3 +1,5 @@
+use unicode_width::UnicodeWidthChar;
+
 //! Column accounting: measuring, clipping and padding text the way a terminal
 //! actually renders it.
 //!
@@ -7,9 +9,6 @@
 /// Approximate column width of a character. Only needs to be right about the
 /// two cases that matter: zero-width joiners/selectors and double-width
 /// glyphs (CJK and emoji), which is what our own status lines contain.
-
-use unicode_width::UnicodeWidthChar;
-
 fn char_width(c: char) -> usize {
     c.width().unwrap_or(0)
 }
