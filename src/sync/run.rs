@@ -308,37 +308,26 @@ pub async fn run(
     to_download.sort_by(|a, b| a.1.cmp(&b.1));
 
     let mut to_delete: Vec<String> = Vec::new();
-    if delete
-        && let SyncRoot::Ok {
-            ref prefix,
-            ref path,
-        } = sync_root_result
-    {
+    if delete && let SyncRoot::Ok { ref prefix, .. } = sync_root_result {
         let download_root = Path::new(&cfg.download_dir);
-        let root_path = Path::new(path);
 
         // The mirror's folder name comes from the listing, so the root of the
-        // sweep is itself an untrusted component. Opening it by pathname
-        // followed a symlinked `download_dir/<folder>` before any protection
-        // began, and the sweep then enumerated whatever it pointed at.
-        // Walking it from the download directory refuses that first.
-        match safe_file::verify_dir_beneath(download_root, Path::new(prefix)) {
-            Ok(()) => {
-                if root_path.is_dir() {
-                    collect_orphan_files(
-                        root_path,
-                        root_path,
-                        &remote_decoded,
-                        &ext_filter,
-                        &mut to_delete,
-                    );
-                    to_delete.sort();
-                }
-            }
-            Err(e) => {
-                eprintln!("  \u{26a0} Skipping delete phase: {:#}", e);
-            }
-        }
+        // sweep is itself an untrusted component: it is passed as a path
+        // *relative to the download directory* and every level of the sweep is
+        // resolved from there by descriptor.
+        //
+        // Verifying the directory and then enumerating it by pathname — which
+        // is what this used to do — left a gap between the two in which the
+        // directory could be replaced with a symlink, and the sweep would then
+        // list someone else's files as orphans to delete.
+        collect_orphan_files(
+            download_root,
+            Path::new(prefix),
+            &remote_decoded,
+            &ext_filter,
+            &mut to_delete,
+        );
+        to_delete.sort();
     }
 
     eprintln!();
@@ -496,13 +485,8 @@ pub async fn run(
         let mut deleted = 0u64;
         let mut delete_failed = 0u64;
 
-        if let SyncRoot::Ok {
-            ref prefix,
-            ref path,
-        } = sync_root_result
-        {
+        if let SyncRoot::Ok { ref prefix, .. } = sync_root_result {
             let download_root = Path::new(&cfg.download_dir);
-            let root_path = Path::new(path);
             let progress = ui::CountProgress::new("Deleting orphans", to_delete.len());
 
             for relative in &to_delete {
@@ -548,7 +532,7 @@ pub async fn run(
             }
 
             progress.finish(&format!("{} file(s) deleted", deleted));
-            remove_empty_dirs(root_path);
+            remove_empty_dirs(download_root, Path::new(prefix));
         }
 
         if delete_failed > 0 {
@@ -567,7 +551,7 @@ pub async fn run(
 /// named the same way it is: root-relative, so the descriptor walk applies to
 /// them too. Formatting `"{}.part"` onto a full pathname would put them back
 /// on the pathname-resolution route the rest of this module just left.
-fn with_suffix(relative: &Path, suffix: &str) -> PathBuf {
+pub(super) fn with_suffix(relative: &Path, suffix: &str) -> PathBuf {
     match relative.file_name() {
         Some(name) => {
             let mut name = name.to_os_string();
@@ -587,7 +571,7 @@ enum HeadStatus {
 }
 
 enum SyncRoot {
-    Ok { prefix: String, path: String },
+    Ok { prefix: String },
     Empty,
     MixedRoots,
 }
@@ -636,9 +620,13 @@ fn derive_sync_root(cfg: &Config, files: &[scrape::DiscoveredFile]) -> SyncRoot 
         return SyncRoot::MixedRoots;
     }
     match safe_path::resolve_under(Path::new(&cfg.download_dir), prefix) {
-        Ok(root) => SyncRoot::Ok {
+        // The resolved pathname is deliberately not kept. The sweep and the
+        // deletions are anchored at the download directory and take the prefix
+        // as a relative component, so a stored pathname for the mirror root
+        // would only be a second way of naming the same place — and the one
+        // that gets re-resolved later.
+        Ok(_) => SyncRoot::Ok {
             prefix: prefix.to_owned(),
-            path: root.to_string_lossy().into_owned(),
         },
         Err(_) => SyncRoot::Empty,
     }

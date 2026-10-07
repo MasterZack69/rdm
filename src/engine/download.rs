@@ -265,17 +265,15 @@ async fn write_empty_file(output_path: &str) -> Result<()> {
     .context("Failed to create .part file")?;
     // A `.part` left over from a previous, larger version of this file.
     file.set_len(0).context("Failed to truncate .part file")?;
-    drop(file);
 
     // Resume state for a file that is now empty describes something else.
     let _ = tokio::fs::remove_file(crate::resume::ResumeMetadata::meta_path(output_path)).await;
 
-    if destination_existed {
-        safe_file::rename_replacing(temp, Path::new(output_path))
-    } else {
-        safe_file::rename_no_replace(temp, Path::new(output_path))
-    }
-    .with_context(|| format!("Failed to rename '{}' to '{}'", temp_path, output_path))
+    // Published from the descriptor that was just validated, so the empty file
+    // that arrives is this one rather than whatever holds the `.part` name by
+    // now.
+    safe_file::publish_open_file(&file, temp, Path::new(output_path), destination_existed)
+        .with_context(|| format!("Failed to publish '{}' as '{}'", temp_path, output_path))
 }
 
 /// Where a server-suggested filename would move the download to, or `None` if

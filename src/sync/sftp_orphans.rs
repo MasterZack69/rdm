@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
-use crate::safe_file;
+use crate::safe_file::{self, EntryKind};
 use crate::sftp::local::{Destination, STATE_DIR, lock_output, path_text};
 
 pub(super) struct Orphan {
@@ -35,23 +35,32 @@ pub(super) fn collect(
     while let Some((relative, depth)) = pending.pop() {
         ensure!(!cancel.is_cancelled(), "SFTP sync cancelled before deletion");
         ensure!(depth <= 64, "Local mirror exceeds the directory-depth limit");
-        safe_file::verify_dir_beneath(root, &relative)?;
-        for entry in std::fs::read_dir(root.join(&relative)).context("Cannot enumerate local mirror")? {
+        // Enumerated through the descriptor the directory was resolved on,
+        // anchored at the mirror root. Verifying the directory and then
+        // reading `root.join(relative)` by pathname left a gap in which the
+        // directory could be replaced with a symlink, and this listing is a
+        // list of files to delete.
+        let entries = safe_file::read_dir_beneath(root, &relative)
+            .context("Cannot enumerate local mirror")?;
+        for entry in entries {
             ensure!(!cancel.is_cancelled(), "SFTP sync cancelled before deletion");
-            let entry = entry.context("Cannot inspect local mirror entry")?;
             visited += 1;
             ensure!(visited <= 200_000, "Local mirror exceeds the entry limit");
-            if entry.file_name() == STATE_DIR { continue; }
-            let kind = entry.file_type()?;
-            // Never follow or remove user-owned symlinks and special files.
-            if kind.is_symlink() || (!kind.is_dir() && !kind.is_file()) { continue; }
-            let path = relative.join(entry.file_name());
-            if kind.is_dir() {
-                pending.push((path, depth + 1));
-            } else if !keep.contains(path_text(&path)?)
-                && matches_extension(path_text(&path)?, extensions)
-            {
-                result.push(Orphan { relative: path, metadata: entry.metadata()? });
+            if entry.name == STATE_DIR { continue; }
+            let path = relative.join(&entry.name);
+            match entry.kind {
+                EntryKind::Dir => pending.push((path, depth + 1)),
+                // Never followed or removed: links and special files are the
+                // user's, not this sweep's.
+                EntryKind::Other => {}
+                EntryKind::File => {
+                    if !keep.contains(path_text(&path)?)
+                        && matches_extension(path_text(&path)?, extensions)
+                        && let Some(metadata) = safe_file::metadata_beneath(root, &path)?
+                    {
+                        result.push(Orphan { relative: path, metadata });
+                    }
+                }
             }
         }
     }

@@ -584,8 +584,11 @@ pub(super) async fn download_streaming(
     // confirm it is a regular file we own.
     //
     // The name stays predictable deliberately — resume has to find it again
-    // between runs, which a randomised name could not do. Randomised temporary
-    // files are used where nothing needs to find them again.
+    // between runs, which a randomised name could not do. That costs nothing
+    // in integrity: the descriptor opened here is the one publication links
+    // into place at the end, so a substituted entry cannot become the output.
+    // Randomised temporary files are used where nothing needs to find them
+    // again.
     let file = if append {
         safe_file::open_guarded(
             temp,
@@ -684,7 +687,13 @@ pub(super) async fn download_streaming(
     }
 
     writer.flush().await?;
-    drop(writer);
+
+    // The descriptor stays open through publication. Publishing by pathname
+    // after closing the writer meant the step acted on whatever entry the
+    // `.part` name held by then, which is not necessarily the inode that was
+    // opened, validated and written; holding the writer means the file that
+    // gets the final name is this exact one.
+    let written = writer.into_inner().into_std().await;
 
     // Every byte the server said would arrive has to have arrived. Short of
     // that the `.part` file is left where it is, because a partial file that
@@ -704,17 +713,14 @@ pub(super) async fn download_streaming(
 
     let final_path = Path::new(output_path);
 
-    if destination_existed {
-        // Something was already there when the download began, and the
-        // decision to overwrite it was taken then.
-        safe_file::rename_replacing(temp, final_path)
-    } else {
-        // Nothing was there when the download began, so anything there now
-        // arrived while it ran and is not ours to replace. This is the race
-        // between the existence check and the rename.
-        safe_file::rename_no_replace(temp, final_path)
-    }
-    .with_context(|| format!("Failed to rename '{}' to '{}'", temp_path, output_path))?;
+    // `destination_existed` is the answer to the overwrite question as it was
+    // asked before the transfer began. Anything that has appeared at the
+    // destination since then was never part of that decision, and publication
+    // refuses to replace it.
+    safe_file::publish_open_file(&written, temp, final_path, destination_existed)
+        .with_context(|| format!("Failed to publish '{}' as '{}'", temp_path, output_path))?;
+
+    drop(written);
 
     // The transfer is finished, so the state describing how to continue it is
     // not just useless but misleading.
