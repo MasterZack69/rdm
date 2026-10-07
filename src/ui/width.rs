@@ -7,37 +7,11 @@
 /// Approximate column width of a character. Only needs to be right about the
 /// two cases that matter: zero-width joiners/selectors and double-width
 /// glyphs (CJK and emoji), which is what our own status lines contain.
+
+use unicode_width::UnicodeWidthChar;
+
 fn char_width(c: char) -> usize {
-    let c = c as u32;
-    if c == 0x200d || c == 0xfe0f || c == 0xfe0e || (0x0300..=0x036f).contains(&c) {
-        return 0;
-    }
-    let wide = (0x1100..=0x115f).contains(&c)
-        || (0x2e80..=0x303e).contains(&c)
-        || (0x3041..=0x33ff).contains(&c)
-        || (0x3400..=0x4dbf).contains(&c)
-        || (0x4e00..=0x9fff).contains(&c)
-        || (0xa000..=0xa4cf).contains(&c)
-        || (0xac00..=0xd7a3).contains(&c)
-        || (0xf900..=0xfaff).contains(&c)
-        || (0xfe30..=0xfe6f).contains(&c)
-        || (0xff00..=0xff60).contains(&c)
-        || (0xffe0..=0xffe6).contains(&c)
-        || (0x1f300..=0x1f64f).contains(&c)
-        || (0x1f680..=0x1f6ff).contains(&c)
-        || (0x1f900..=0x1f9ff).contains(&c)
-        || (0x1fa70..=0x1faff).contains(&c)
-        || matches!(c, 0x231a..=0x231b | 0x23e9..=0x23ec | 0x23f0 | 0x23f3)
-        || matches!(c, 0x25fd..=0x25fe | 0x2614..=0x2615 | 0x2648..=0x2653)
-        || matches!(c, 0x267f | 0x2693 | 0x26a1 | 0x26aa..=0x26ab | 0x26bd..=0x26be)
-        || matches!(c, 0x26c4..=0x26c5 | 0x26ce | 0x26d4 | 0x26ea | 0x26f2..=0x26f3)
-        || matches!(
-            c,
-            0x26f5 | 0x26fa | 0x26fd | 0x2705 | 0x270a..=0x270b | 0x2728
-        )
-        || matches!(c, 0x274c | 0x274e | 0x2753..=0x2755 | 0x2757 | 0x2795..=0x2797)
-        || matches!(c, 0x27b0 | 0x27bf | 0x2b1b..=0x2b1c | 0x2b50 | 0x2b55);
-    if wide { 2 } else { 1 }
+    c.width().unwrap_or(0)
 }
 
 /// Column width of a string.

@@ -27,6 +27,7 @@ serde_json = "1.0"
 toml = "1.0.3"
 libc = "0.2"
 dirs = "6"
+unicode-width = "0.2"
 
 # MEGA's crypto: AES-CTR for the payload, AES-ECB for key unwrapping and an
 # AES-CBC-MAC for integrity. All three are built on this one primitive, so aes
