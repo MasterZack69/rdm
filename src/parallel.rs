@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Mutex;
@@ -141,7 +141,9 @@ where
     // One view of how the server is coping, shared by every worker and by
     // the loop that hands out ranges.
     let pressure = Arc::new(PressureController::new(chunks.len().max(1)));
-    let done_flag = Arc::new(AtomicBool::new(false));
+    let background_stop = CancellationToken::new();
+    // If the caller drops this future, do not leave the background loops alive.
+    let _stop_on_drop = background_stop.clone().drop_guard();
 
     let autosave_handle = spawn_autosave(
         meta_path.to_owned(),
@@ -150,99 +152,117 @@ where
             .iter()
             .map(|(id, c)| (*id, Arc::clone(c)))
             .collect(),
-        Arc::clone(&done_flag),
+        background_stop.clone(),
     );
 
     let monitor_handle = spawn_progress_monitor(
         progress_callback,
         chunk_counters.clone(),
-        Arc::clone(&done_flag),
+        background_stop.clone(),
         ctx.file_size,
     );
 
     let mut join_set: JoinSet<Result<u64>> = JoinSet::new();
     let mut total_bytes: u64 = initial_completed;
 
-    while !queue.is_empty() || !join_set.is_empty() {
-        // A server that asked for a pause gets one before any further range
-        // is assigned. With nothing in flight there is nothing else to wait
-        // on, so the loop waits out the pause itself rather than spinning.
-        if join_set.is_empty()
-            && let Some(wait) = pressure.pause_remaining()
-        {
-            tokio::select! {
-                biased;
-                _ = ctx.cancel.cancelled() => {
-                    anyhow::bail!("Cancelled while waiting out the server's back-off");
+    let worker_result: Result<()> = async {
+        while !queue.is_empty() || !join_set.is_empty() {
+            // A server that asked for a pause gets one before any further range
+            // is assigned. With nothing in flight there is nothing else to wait
+            // on, so the loop waits out the pause itself rather than spinning.
+            if join_set.is_empty()
+                && let Some(wait) = pressure.pause_remaining()
+            {
+                tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => {
+                        anyhow::bail!("Cancelled while waiting out the server's back-off");
+                    }
+                    _ = tokio::time::sleep(wait) => {}
                 }
-                _ = tokio::time::sleep(wait) => {}
+            }
+
+            // Read fresh each time round: the controller may have lowered it
+            // while these workers were running.
+            let active_workers = pressure.limit();
+
+            while join_set.len() < active_workers && !queue.is_empty() && !pressure.is_paused() {
+                let chunk = queue.pop_front().unwrap();
+
+                let client = ctx.client.clone();
+                let url = ctx.fetch_url.to_owned();
+                let path = temp_path.to_owned();
+                let cancel = ctx.cancel.clone();
+                let config = ctx.retry_config.clone();
+                let chunk_progress = chunk_counters
+                    .iter()
+                    .find(|(id, _)| *id == chunk.id)
+                    .unwrap()
+                    .1
+                    .clone();
+
+                let pressure = Arc::clone(&pressure);
+
+                join_set.spawn(async move {
+                    download_chunk_with_retry(
+                        &client,
+                        &url,
+                        &path,
+                        &chunk,
+                        &config,
+                        chunk_progress,
+                        cancel,
+                        &pressure,
+                    )
+                    .await
+                });
+            }
+
+            // Paused with nothing spawned yet: go back and wait it out.
+            if join_set.is_empty() {
+                continue;
+            }
+
+            match join_set.join_next().await {
+                Some(Ok(Ok(bytes))) => total_bytes += bytes,
+                Some(Ok(Err(e))) => return Err(e),
+                Some(Err(e)) => return Err(anyhow::anyhow!("Worker panic: {}", e)),
+                None => break,
             }
         }
 
-        // Read fresh each time round: the controller may have lowered it
-        // while these workers were running.
-        let active_workers = pressure.limit();
-
-        while join_set.len() < active_workers && !queue.is_empty() && !pressure.is_paused() {
-            let chunk = queue.pop_front().unwrap();
-
-            let client = ctx.client.clone();
-            let url = ctx.fetch_url.to_owned();
-            let path = temp_path.to_owned();
-            let cancel = ctx.cancel.clone();
-            let config = ctx.retry_config.clone();
-            let chunk_progress = chunk_counters
-                .iter()
-                .find(|(id, _)| *id == chunk.id)
-                .unwrap()
-                .1
-                .clone();
-
-            let pressure = Arc::clone(&pressure);
-
-            join_set.spawn(async move {
-                download_chunk_with_retry(
-                    &client,
-                    &url,
-                    &path,
-                    &chunk,
-                    &config,
-                    chunk_progress,
-                    cancel,
-                    &pressure,
-                )
-                .await
-            });
-        }
-
-        // Paused with nothing spawned yet: go back and wait it out.
-        if join_set.is_empty() {
-            continue;
-        }
-
-        match join_set.join_next().await {
-            Some(Ok(Ok(bytes))) => total_bytes += bytes,
-            Some(Ok(Err(e))) => return Err(e),
-            Some(Err(e)) => return Err(anyhow::anyhow!("Worker panic: {}", e)),
-            None => break,
-        }
+        Ok(())
     }
+    .await;
 
-    done_flag.store(true, Ordering::Relaxed);
+    // Signal both loops together. On failure, let in-flight workers observe
+    // cancellation and flush before taking the final resume snapshot.
+    if worker_result.is_err() {
+        ctx.cancel.cancel();
+        while join_set.join_next().await.is_some() {}
+    }
+    background_stop.cancel();
     if let Some(h) = monitor_handle {
         let _ = h.await;
     }
+    // A save already in progress must finish before the manifest is deleted
+    // or the final failure snapshot is written.
     let _ = autosave_handle.await;
 
-    if total_bytes != ctx.file_size {
-        anyhow::bail!(
-            "Total bytes mismatch: expected {} but downloaded {}",
-            ctx.file_size,
-            total_bytes
-        );
+    let result = worker_result.and_then(|()| {
+        if total_bytes != ctx.file_size {
+            anyhow::bail!(
+                "Total bytes mismatch: expected {} but downloaded {}",
+                ctx.file_size,
+                total_bytes
+            );
+        }
+        Ok(total_bytes)
+    });
+    if result.is_err() {
+        save_progress(meta_path, &shared_meta, &chunk_counters).await;
     }
-
-    Ok(total_bytes)
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -346,26 +366,35 @@ async fn ensure_file_allocated(path: &str, size: u64, chunk_count: usize) -> Res
     Ok(())
 }
 
+async fn save_progress(
+    meta_path: &str,
+    shared_meta: &Mutex<ResumeMetadata>,
+    counters: &[(u32, Arc<AtomicU64>)],
+) {
+    let snapshot = {
+        let mut meta = shared_meta.lock().await;
+        for (id, counter) in counters {
+            resume::update_progress(&mut meta, *id, counter.load(Ordering::Relaxed));
+        }
+        meta.clone()
+    };
+    let _ = resume::save_best_effort(meta_path, &snapshot).await;
+}
+
 fn spawn_autosave(
     meta_path: String,
     shared_meta: Arc<Mutex<ResumeMetadata>>,
     counters: Vec<(u32, Arc<AtomicU64>)>,
-    done: Arc<AtomicBool>,
+    stop: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if done.load(Ordering::Relaxed) {
-                break;
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
-            let snapshot = {
-                let mut meta = shared_meta.lock().await;
-                for (id, counter) in &counters {
-                    resume::update_progress(&mut meta, *id, counter.load(Ordering::Relaxed));
-                }
-                meta.clone()
-            };
-            let _ = resume::save_best_effort(&meta_path, &snapshot).await;
+            save_progress(&meta_path, &shared_meta, &counters).await;
         }
     })
 }
@@ -538,7 +567,7 @@ fn short_error(err: &anyhow::Error) -> String {
 fn spawn_progress_monitor<F>(
     callback: Option<F>,
     counters: Vec<(u32, Arc<AtomicU64>)>,
-    done: Arc<AtomicBool>,
+    stop: CancellationToken,
     total: u64,
 ) -> Option<JoinHandle<()>>
 where
@@ -547,15 +576,19 @@ where
     let cb = callback?;
     Some(tokio::spawn(async move {
         loop {
+            if stop.is_cancelled() {
+                break;
+            }
             let current: u64 = counters
                 .iter()
                 .map(|(_, c)| c.load(Ordering::Relaxed))
                 .sum();
             cb(current, total);
-            if done.load(Ordering::Relaxed) {
-                break;
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         let current: u64 = counters
             .iter()
@@ -563,4 +596,212 @@ where
             .sum();
         cb(current, total);
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn single_chunk() -> Vec<Chunk> {
+        vec![Chunk {
+            id: 0,
+            start: 0,
+            end: 9,
+        }]
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autosave_sleep_is_interrupted_by_shutdown() {
+        let stop = CancellationToken::new();
+        let meta = resume::create_new("https://example.com/file".into(), 10, &single_chunk());
+        let task = spawn_autosave(
+            "unused.rdm".into(),
+            Arc::new(Mutex::new(meta)),
+            Vec::new(),
+            stop.clone(),
+        );
+        tokio::task::yield_now().await;
+        let started = tokio::time::Instant::now();
+        stop.cancel();
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("autosave waited for its 500 ms sleep")
+            .unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn autosave_still_persists_periodic_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("download.rdm");
+        let path = path.to_str().unwrap();
+        let meta = resume::create_new("https://example.com/file".into(), 10, &single_chunk());
+        let stop = CancellationToken::new();
+        let task = spawn_autosave(
+            path.to_owned(),
+            Arc::new(Mutex::new(meta)),
+            vec![(0, Arc::new(AtomicU64::new(5)))],
+            stop.clone(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !Path::new(path).exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("autosave did not persist progress");
+        stop.cancel();
+        task.await.unwrap();
+        assert_eq!(resume::load(path).await.unwrap().chunks[0].completed, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_monitor_wakes_and_reports_final_progress() {
+        let stop = CancellationToken::new();
+        let counter = Arc::new(AtomicU64::new(2));
+        let reports = Arc::new(StdMutex::new(Vec::new()));
+        let captured = Arc::clone(&reports);
+        let task = spawn_progress_monitor(
+            Some(move |current, total| captured.lock().unwrap().push((current, total))),
+            vec![(0, Arc::clone(&counter))],
+            stop.clone(),
+            10,
+        )
+        .unwrap();
+        tokio::task::yield_now().await;
+        counter.store(10, Ordering::Relaxed);
+        let started = tokio::time::Instant::now();
+        stop.cancel();
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("monitor waited for its 200 ms sleep")
+            .unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(*reports.lock().unwrap(), vec![(2, 10), (10, 10)]);
+    }
+
+    #[tokio::test]
+    async fn already_stopped_monitor_reports_only_the_final_value() {
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let reports = Arc::new(StdMutex::new(Vec::new()));
+        let captured = Arc::clone(&reports);
+        let task = spawn_progress_monitor(
+            Some(move |current, total| captured.lock().unwrap().push((current, total))),
+            vec![(0, Arc::new(AtomicU64::new(10)))],
+            stop,
+            10,
+        )
+        .unwrap();
+        task.await.unwrap();
+        assert_eq!(*reports.lock().unwrap(), vec![(10, 10)]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_before_workers_start_keeps_a_resume_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("download");
+        let output = output.to_str().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        let chunks = single_chunk();
+        let retry_config = RetryConfig::default();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let ctx = ParallelDownloadCtx {
+            client: &client,
+            url: "https://example.com/file",
+            fetch_url: "https://example.com/file",
+            output_path: output,
+            file_size: 10,
+            chunks: &chunks,
+            retry_config: &retry_config,
+            cancel,
+            identity: None,
+            etag: None,
+            last_modified: None,
+        };
+        let result = download_parallel(&ctx, None::<fn(u64, u64)>).await;
+        assert!(result.is_err());
+        let manifest = ResumeMetadata::meta_path(output);
+        assert_eq!(
+            resume::load(&manifest).await.unwrap().chunks[0].completed,
+            0
+        );
+        fs::remove_file(&manifest).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        assert!(!Path::new(&manifest).exists());
+    }
+
+    async fn serve(body: &'static str) -> String {
+        use axum::http::{StatusCode, header};
+        use axum::routing::get;
+
+        let app = axum::Router::new().route(
+            "/file",
+            get(move || async move {
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    [(header::CONTENT_RANGE, "bytes 0-9/10")],
+                    body,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}/file")
+    }
+
+    async fn run_download(body: &'static str, output: &str) -> Result<u64> {
+        let url = serve(body).await;
+        let client = Client::builder().no_proxy().build().unwrap();
+        let chunks = single_chunk();
+        let retry_config = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let ctx = ParallelDownloadCtx {
+            client: &client,
+            url: &url,
+            fetch_url: &url,
+            output_path: output,
+            file_size: 10,
+            chunks: &chunks,
+            retry_config: &retry_config,
+            cancel: CancellationToken::new(),
+            identity: None,
+            etag: None,
+            last_modified: None,
+        };
+        download_parallel(&ctx, Some(|_, _| {})).await
+    }
+
+    #[tokio::test]
+    async fn successful_download_does_not_recreate_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("download");
+        let output = output.to_str().unwrap();
+        assert_eq!(run_download("0123456789", output).await.unwrap(), 10);
+        assert_eq!(fs::read(output).await.unwrap(), b"0123456789");
+        let manifest = ResumeMetadata::meta_path(output);
+        assert!(!Path::new(&manifest).exists());
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        assert!(!Path::new(&manifest).exists());
+    }
+
+    #[tokio::test]
+    async fn failed_download_saves_progress_and_stops_background_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("download");
+        let output = output.to_str().unwrap();
+        assert!(run_download("01234", output).await.is_err());
+        let manifest = ResumeMetadata::meta_path(output);
+        let saved = resume::load(&manifest).await.unwrap();
+        assert_eq!(saved.chunks[0].completed, 5);
+        assert_eq!(fs::read(format!("{output}.part")).await.unwrap(), b"01234");
+        fs::remove_file(&manifest).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        assert!(!Path::new(&manifest).exists());
+    }
 }
