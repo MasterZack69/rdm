@@ -61,13 +61,20 @@ pub async fn download(
     // the resume state. Only the fetching moves to `fetch_url`, because a
     // redirect target is a poor filename and a worse identity.
     let resolved;
-    let (fetch_url, client) = match req.client.as_ref() {
-        Some(session) => (url.clone(), session),
+    let (fetch_url, client, initial_probe) = match req.client.as_ref() {
+        Some(session) => (url.clone(), session, None),
         None => {
-            resolved = net::Policy::new(req.allow_private)
-                .resolve_target(&url)
-                .await?;
-            (resolved.url.to_string(), &resolved.client)
+            let policy = net::Policy::new(req.allow_private);
+            let (target, response) = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    sink.finish();
+                    return Ok(Outcome::Cancelled);
+                }
+                result = policy.probe(&url) => result?,
+            };
+            resolved = target;
+            (resolved.url.to_string(), &resolved.client, Some(response))
         }
     };
 
@@ -78,7 +85,13 @@ pub async fn download(
     // up in scrollback, CI output and support captures.
     sink.detail(&format!("Inspecting: {}", secret_url::redact(&url)));
 
-    let info = inspect::inspect_url(client, &fetch_url).await?;
+    // Policy::probe already made the same bytes=0-0 request after enforcing
+    // redirect and address safety. Use its final response rather than asking
+    // the same server a second time; externally supplied clients still probe.
+    let info = match initial_probe {
+        Some(response) => inspect::inspect_response(client, &fetch_url, response).await?,
+        None => inspect::inspect_url(client, &fetch_url).await?,
+    };
 
     // Use the server-suggested filename when the URL has no extension, but
     // only if the user didn't explicitly choose a name (via rename or -o).
@@ -384,6 +397,246 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_probe_is_reused_but_explicit_clients_still_inspect() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode, header},
+            routing::get,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&probes);
+        let router = Router::new().route(
+            "/file.bin",
+            get(move |headers: HeaderMap| {
+                let count = Arc::clone(&count);
+                async move {
+                    match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+                        Some("bytes=0-0") => {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::PARTIAL_CONTENT,
+                                [(header::CONTENT_RANGE, "bytes 0-0/5")],
+                                "h",
+                            )
+                        }
+                        Some("bytes=0-4") => (
+                            StatusCode::PARTIAL_CONTENT,
+                            [(header::CONTENT_RANGE, "bytes 0-4/5")],
+                            "hello",
+                        ),
+                        _ => (
+                            StatusCode::OK,
+                            [(header::CONTENT_RANGE, "bytes 0-4/5")],
+                            "hello",
+                        ),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("http://{addr}/file.bin");
+        let path = dir.path().join("policy.bin");
+        let req = DownloadRequest::new(url.clone(), Some(path.to_string_lossy().into_owned()), 1)
+            .with_allow_private(true);
+        download(req, CancellationToken::new(), crate::ui::silent())
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"hello");
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        let path = dir.path().join("session.bin");
+        let req = DownloadRequest::new(url, Some(path.to_string_lossy().into_owned()), 1)
+            .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+        download(req, CancellationToken::new(), crate::ui::silent())
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"hello");
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn scoped_probe_follows_a_cross_authority_redirect_and_reuses_final_response() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode, header},
+            response::Redirect,
+            routing::get,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let final_probes = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&final_probes);
+        let target_router = Router::new().route(
+            "/file.bin",
+            get(move |headers: HeaderMap| {
+                let count = Arc::clone(&count);
+                async move {
+                    if headers.get(header::RANGE).and_then(|v| v.to_str().ok()) == Some("bytes=0-0") {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::PARTIAL_CONTENT,
+                            [(header::CONTENT_RANGE, "bytes 0-0/5")],
+                            "h",
+                        )
+                    } else {
+                        (
+                            StatusCode::PARTIAL_CONTENT,
+                            [(header::CONTENT_RANGE, "bytes 0-4/5")],
+                            "hello",
+                        )
+                    }
+                }
+            }),
+        );
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(target_listener, target_router).await.unwrap() });
+
+        let redirect_to = format!("http://{target_addr}/file.bin");
+        let source_router = Router::new().route(
+            "/file.bin",
+            get(move || {
+                let redirect_to = redirect_to.clone();
+                async move { Redirect::temporary(&redirect_to) }
+            }),
+        );
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(source_listener, source_router).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redirect.bin");
+        let req = DownloadRequest::new(
+            format!("http://{source_addr}/file.bin"),
+            Some(path.to_string_lossy().into_owned()),
+            1,
+        )
+        .with_allow_private(true);
+        download(req, CancellationToken::new(), crate::ui::silent())
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"hello");
+        assert_eq!(final_probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reused_probe_keeps_the_head_fallback_for_rejected_range_gets() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode, header},
+            routing::{get, head},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ranged_gets = Arc::new(AtomicUsize::new(0));
+        let ranged_count = Arc::clone(&ranged_gets);
+        let head_requests = Arc::new(AtomicUsize::new(0));
+        let head_count = Arc::clone(&head_requests);
+        let router = Router::new()
+            .route(
+                "/file.bin",
+                get(move |headers: HeaderMap| {
+                    let ranged_count = Arc::clone(&ranged_count);
+                    async move {
+                        if headers.get(header::RANGE).and_then(|v| v.to_str().ok())
+                            == Some("bytes=0-0")
+                        {
+                            ranged_count.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::METHOD_NOT_ALLOWED, "")
+                        } else {
+                            (StatusCode::OK, "hello")
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/file.bin",
+                head(move || {
+                    let head_count = Arc::clone(&head_count);
+                    async move {
+                        head_count.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::OK, [(header::CONTENT_LENGTH, "5")])
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("head.bin");
+        let req = DownloadRequest::new(
+            format!("http://{addr}/file.bin"),
+            Some(path.to_string_lossy().into_owned()),
+            1,
+        )
+        .with_allow_private(true);
+        download(req, CancellationToken::new(), crate::ui::silent())
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"hello");
+        assert_eq!(ranged_gets.load(Ordering::SeqCst), 1);
+        assert_eq!(head_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_the_scoped_probe_stops_before_transfer() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let router = Router::new().route(
+            "/file.bin",
+            get(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    "payload"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancelled.bin");
+        let cancel = CancellationToken::new();
+        let request_cancel = cancel.clone();
+        let output = path.to_string_lossy().into_owned();
+        let task = tokio::spawn(async move {
+            download(
+                DownloadRequest::new(format!("http://{addr}/file.bin"), Some(output), 1)
+                    .with_allow_private(true),
+                request_cancel,
+                crate::ui::silent(),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while requests.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("probe request did not start");
+        cancel.cancel();
+
+        assert_eq!(task.await.unwrap().unwrap(), Outcome::Cancelled);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(!path.exists());
     }
 
     #[test]

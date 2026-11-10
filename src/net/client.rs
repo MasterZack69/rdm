@@ -305,9 +305,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_private_destination_is_refused_before_a_request_is_made() {
+    async fn probe_refuses_a_private_destination_before_a_request_is_made() {
         let err = Policy::new(false)
-            .resolve_target("http://169.254.169.254/latest/meta-data/")
+            .probe("http://169.254.169.254/latest/meta-data/")
             .await
             .expect_err("the metadata service is not a download");
         assert!(err.to_string().contains("private/internal"), "{err}");

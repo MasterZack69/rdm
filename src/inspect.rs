@@ -82,7 +82,16 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         .await
         .map_err(reqwest::Error::without_url)
         .context("Request failed \u{2014} check the URL and your network connection")?;
+    inspect_response(client, url, resp).await
+}
 
+/// Parse a response from the same one-byte GET used by `inspect_url`.
+/// This lets callers reuse a response obtained while safely resolving redirects.
+pub(crate) async fn inspect_response(
+    client: &Client,
+    url: &str,
+    resp: reqwest::Response,
+) -> Result<FileInfo> {
     let status = resp.status();
     let suggested_filename = filename_from_content_disposition(resp.headers());
     let etag = extract_etag(resp.headers());
