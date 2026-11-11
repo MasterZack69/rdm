@@ -145,8 +145,10 @@ All optional, there are other hoster specific env variables which can find in th
 | `RDM_MAX_FILE_BYTES` | Size ceiling for one streaming download. Default 64 GiB, `0` removes it |
 | `RDM_ALLOW_PRIVATE` | Same as `--allow-private` |
 | `RDM_ALLOW_PROXY` | Let `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` apply to RDM's requests |
+| `RDM_ADAPTIVE_RANGES` | Experimental range schedule using queued ranges up to 64 MiB; defaults off |
 
 - `RDM_ALLOW_PRIVATE` and `RDM_ALLOW_PROXY` are off unless set to `1`, `true`, `yes` or `on`. Setting either to nothing, or to `false`, leaves the protection on.
+- `RDM_ADAPTIVE_RANGES` is off unless set to `1`, `true`, `yes` or `on`. It only affects known-size HTTP(S) files with range support and more than one connection. Existing partial downloads continue with the range layout saved in their resume metadata.
 - `RDM_MAX_FILE_BYTES` only bites when a server refuses to say how big a file is.
 
 # Release

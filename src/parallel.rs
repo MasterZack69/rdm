@@ -23,6 +23,9 @@ pub struct ParallelDownloadCtx<'a> {
     pub fetch_url: &'a str,
     pub output_path: &'a str,
     pub file_size: u64,
+    /// Maximum number of simultaneous range requests. This is independent of
+    /// the number of queued ranges in the experimental schedule.
+    pub workers: usize,
     pub chunks: &'a [Chunk],
     pub retry_config: &'a RetryConfig,
     pub cancel: CancellationToken,
@@ -140,7 +143,7 @@ where
 
     // One view of how the server is coping, shared by every worker and by
     // the loop that hands out ranges.
-    let pressure = Arc::new(PressureController::new(chunks.len().max(1)));
+    let pressure = Arc::new(PressureController::new(ctx.workers.max(1)));
     let background_stop = CancellationToken::new();
     // If the caller drops this future, do not leave the background loops alive.
     let _stop_on_drop = background_stop.clone().drop_guard();
@@ -278,8 +281,12 @@ async fn load_or_create_metadata(
 ) -> Result<ResumeMetadata> {
     if let Ok(existing) = resume::load(meta_path).await {
         let identity_check = existing.compare_server_identity(etag, last_modified);
+        let saved_chunks = chunks_from_metadata(&existing);
 
-        if resume::validate_against(&existing, url, identity, file_size, chunks)
+        // The saved ranges are the resume contract. In particular, do not
+        // discard a valid fixed-layout manifest just because the experimental
+        // scheduler would choose a different layout on this invocation.
+        if valid_saved_layout(&existing, url, identity, file_size, &saved_chunks)
             && identity_check == IdentityCheck::Match
         {
             eprintln!(
@@ -320,6 +327,31 @@ async fn load_or_create_metadata(
     resume::save_atomic(meta_path, &meta).await?;
 
     Ok(meta)
+}
+
+fn valid_saved_layout(
+    meta: &ResumeMetadata,
+    url: &str,
+    identity: Option<&str>,
+    file_size: u64,
+    chunks: &[Chunk],
+) -> bool {
+    if !resume::validate_against(meta, url, identity, file_size, chunks) || chunks.is_empty() {
+        return false;
+    }
+
+    let mut next_start = 0u64;
+    for (index, (state, chunk)) in meta.chunks.iter().zip(chunks).enumerate() {
+        if state.id != index as u32 + 1
+            || chunk.start != next_start
+            || chunk.end < chunk.start
+            || chunk.end >= file_size
+        {
+            return false;
+        }
+        next_start = chunk.end + 1;
+    }
+    next_start == file_size
 }
 
 /// Brings the `.part` file to the right length, in a single open.
@@ -714,6 +746,7 @@ mod tests {
             fetch_url: "https://example.com/file",
             output_path: output,
             file_size: 10,
+            workers: 2,
             chunks: &chunks,
             retry_config: &retry_config,
             cancel,
@@ -767,6 +800,7 @@ mod tests {
             fetch_url: &url,
             output_path: output,
             file_size: 10,
+            workers: 2,
             chunks: &chunks,
             retry_config: &retry_config,
             cancel: CancellationToken::new(),

@@ -193,7 +193,18 @@ pub async fn download(
     ));
     sink.detail(&format!("Output    : {}", ui::terminal_safe(&output_path)));
 
-    let chunks = if info.supports_range && connections > 1 {
+    // Experimental work queue: create more bounded ranges than workers so a
+    // fast connection can take another range when it finishes.
+    // Keep the fixed connection-sized layout as the default/control. Existing
+    // partial files always stay on their saved layout; changing the chunk
+    // plan would make their per-chunk resume offsets ambiguous.
+    let adaptive_ranges = info.supports_range
+        && connections > 1
+        && adaptive_ranges_enabled();
+
+    let chunks = if adaptive_ranges {
+        plan_chunks_with_max_size(file_size, 64 * 1024 * 1024, connections)
+    } else if info.supports_range && connections > 1 {
         plan_chunks_with_count(file_size, connections as u32)
     } else {
         vec![Chunk {
@@ -210,7 +221,11 @@ pub async fn download(
         let _ = std::fs::remove_file(&part_path);
     }
 
-    sink.detail(&format!("Chunks    : {}", chunks.len()));
+    sink.detail(&format!(
+        "Ranges    : {}{}",
+        chunks.len(),
+        if adaptive_ranges { " (adaptive schedule)" } else { "" }
+    ));
 
     sink.total(Some(file_size));
     sink.state(SlotState::Downloading);
@@ -233,6 +248,7 @@ pub async fn download(
         fetch_url: &fetch_url,
         output_path: &output_path,
         file_size,
+        workers: connections,
         chunks: &chunks,
         retry_config: &retry_config,
         cancel,
@@ -253,6 +269,41 @@ pub async fn download(
         }),
         Err(e) => Err(e),
     }
+}
+
+/// `RDM_ADAPTIVE_RANGES=1` opts into the experimental multi-range schedule.
+/// It deliberately has no CLI default so stock behavior remains the control.
+fn adaptive_ranges_enabled() -> bool {
+    std::env::var("RDM_ADAPTIVE_RANGES")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+/// Creates contiguous ranges no larger than `max_size`. The parallel runner
+/// schedules these through its existing bounded worker queue, allowing a
+/// worker that finishes early to take another range.
+fn plan_chunks_with_max_size(file_size: u64, max_size: u64, workers: usize) -> Vec<Chunk> {
+    debug_assert!(max_size > 0);
+    let balanced_size = file_size.div_ceil(workers.max(1) as u64);
+    let range_size = max_size.min(balanced_size);
+    let count = file_size.div_ceil(range_size);
+    let mut chunks = Vec::with_capacity(count as usize);
+    let mut start: u64 = 0;
+    for id in 0..count {
+        let end = start.saturating_add(range_size).min(file_size) - 1;
+        chunks.push(Chunk {
+            id: id as u32 + 1,
+            start,
+            end,
+        });
+        start = end + 1;
+    }
+    chunks
 }
 
 /// Creates a zero-length file at `output_path`.
