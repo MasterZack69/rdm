@@ -1041,9 +1041,11 @@ async fn adaptive_request_with_retry(
             scheduler,
             writer,
             worker,
-            anchor,
-            request_start,
-            response_end,
+            AdaptiveRequest {
+                anchor_piece: anchor,
+                start: request_start,
+                end: response_end,
+            },
             cancel,
             stats,
         )
@@ -1108,17 +1110,26 @@ enum AdaptiveBodyEnd {
     Cancelled,
 }
 
+struct AdaptiveRequest {
+    anchor_piece: usize,
+    start: u64,
+    end: u64,
+}
+
 async fn process_adaptive_body(
     response: reqwest::Response,
     scheduler: &AdaptiveScheduler,
     writer: &mut BufWriter<tokio::fs::File>,
     worker: usize,
-    anchor_piece: usize,
-    request_start: u64,
-    response_end: u64,
+    request: AdaptiveRequest,
     cancel: &CancellationToken,
     stats: &AdaptiveStats,
 ) -> Result<AdaptiveBodyEnd> {
+    let AdaptiveRequest {
+        anchor_piece,
+        start: request_start,
+        end: response_end,
+    } = request;
     let expected_len = response_end - request_start + 1;
     writer
         .seek(SeekFrom::Start(request_start))

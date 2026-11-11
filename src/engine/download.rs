@@ -779,7 +779,7 @@ mod tests {
         assert_eq!(ranges.last().unwrap().end, file_size - 1);
         for pair in ranges.windows(2) {
             assert_eq!(pair[0].end + 1, pair[1].start);
-            assert!(pair[0].end - pair[0].start + 1 <= range_size);
+            assert!(pair[0].end - pair[0].start < range_size);
         }
         assert_eq!(
             ranges.iter().map(|r| r.end - r.start + 1).sum::<u64>(),
