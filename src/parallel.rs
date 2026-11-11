@@ -1,11 +1,16 @@
 use anyhow::{Context, Result};
-use reqwest::Client;
+use futures_util::StreamExt;
+use reqwest::{Client, StatusCode, header};
+use std::collections::HashMap;
+use std::fmt;
+use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::fs;
-use tokio::sync::Mutex;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
+use tokio::sync::{Mutex, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -15,6 +20,8 @@ use crate::range_download::{self, DownloadStatus};
 use crate::resume::{self, IdentityCheck, ResumeMetadata};
 use crate::retry::{self, RetryConfig};
 use crate::safe_file::{self, Access, Existing};
+
+type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// Groups all parameters needed for a parallel download session.
 pub struct ParallelDownloadCtx<'a> {
@@ -41,6 +48,31 @@ pub async fn download_parallel<F>(
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
+    download_parallel_with_strategy(ctx, progress_callback, false).await
+}
+
+/// Downloads known-size range resources with an experimental, continuous
+/// response scheduler. Logical pieces are used for ownership and resume state;
+/// a worker's open-ended response may cross up to its piece budget of adjacent
+/// pieces when it can safely claim them.
+pub async fn download_parallel_adaptive_stream<F>(
+    ctx: &ParallelDownloadCtx<'_>,
+    progress_callback: Option<F>,
+) -> Result<u64>
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
+    download_parallel_with_strategy(ctx, progress_callback, true).await
+}
+
+async fn download_parallel_with_strategy<F>(
+    ctx: &ParallelDownloadCtx<'_>,
+    progress_callback: Option<F>,
+    adaptive_stream: bool,
+) -> Result<u64>
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
     if ctx.chunks.is_empty() {
         anyhow::bail!("No chunks provided for parallel download");
     }
@@ -54,7 +86,58 @@ where
     // that decision, and the rename below will not take it.
     let destination_existed = fs::symlink_metadata(ctx.output_path).await.is_ok();
 
-    match parallel_inner(ctx, &temp_path, &meta_path, progress_callback).await {
+    // The stream path can discover that the server ignored Range after some
+    // workers have already started. Keep the callback shareable so a safe,
+    // clean single-request fallback can retain the same progress sink.
+    let progress_callback: Option<ProgressCallback> =
+        progress_callback.map(|callback| Arc::new(callback) as ProgressCallback);
+    let transfer_result = if adaptive_stream {
+        parallel_inner_adaptive_stream(ctx, &temp_path, &meta_path, progress_callback.clone()).await
+    } else {
+        parallel_inner(ctx, &temp_path, &meta_path, progress_callback.clone()).await
+    };
+
+    let transfer_result = match transfer_result {
+        Err(error) if adaptive_stream && error.downcast_ref::<RangeUnsupported>().is_some() => {
+            eprintln!("  [Range] Server ignored byte ranges; restarting with one full response");
+            // The adaptive workers may have safely written different owned
+            // pieces before another response exposed the lack of range
+            // support. Discard that mixed partial state and start the proven
+            // one-request path from byte zero.
+            resume::delete(&meta_path).await?;
+            match fs::remove_file(&temp_path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).context("Failed to discard ranged partial file for fallback");
+                }
+            }
+
+            let fallback_chunks = [Chunk {
+                id: 1,
+                start: 0,
+                end: ctx.file_size - 1,
+            }];
+            let fallback_ctx = ParallelDownloadCtx {
+                client: ctx.client,
+                url: ctx.url,
+                fetch_url: ctx.fetch_url,
+                output_path: ctx.output_path,
+                file_size: ctx.file_size,
+                workers: 1,
+                chunks: &fallback_chunks,
+                retry_config: ctx.retry_config,
+                cancel: ctx.cancel.clone(),
+                identity: ctx.identity.clone(),
+                etag: ctx.etag.clone(),
+                last_modified: ctx.last_modified.clone(),
+            };
+            parallel_inner(&fallback_ctx, &temp_path, &meta_path, progress_callback).await
+        }
+        other => other,
+    };
+
+    match transfer_result {
         Ok(total) => {
             resume::delete(&meta_path).await?;
             let temp = Path::new(&temp_path);
@@ -89,15 +172,12 @@ fn chunks_from_metadata(meta: &ResumeMetadata) -> Vec<Chunk> {
         .collect()
 }
 
-async fn parallel_inner<F>(
+async fn parallel_inner(
     ctx: &ParallelDownloadCtx<'_>,
     temp_path: &str,
     meta_path: &str,
-    progress_callback: Option<F>,
-) -> Result<u64>
-where
-    F: Fn(u64, u64) + Send + Sync + 'static,
-{
+    progress_callback: Option<ProgressCallback>,
+) -> Result<u64> {
     use std::collections::VecDeque;
 
     let meta = load_or_create_metadata(
@@ -266,6 +346,1060 @@ where
         save_progress(meta_path, &shared_meta, &chunk_counters).await;
     }
     result
+}
+
+#[derive(Debug)]
+struct RangeUnsupported;
+
+impl fmt::Display for RangeUnsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("server ignored the byte range request")
+    }
+}
+
+impl std::error::Error for RangeUnsupported {}
+
+/// Logical pieces have independent resume counters and a single owner at a
+/// time. The owner map is only locked when a response crosses a piece boundary
+/// or a worker claims/releases work, never for every network buffer.
+struct AdaptiveScheduler {
+    pieces: Vec<Chunk>,
+    progress: Vec<Arc<AtomicU64>>,
+    owners: Mutex<Vec<Option<usize>>>,
+    changed: Notify,
+}
+
+/// Maximum number of logical pieces one open response may acquire before it
+/// yields. This leaves large unclaimed spans available to faster idle workers
+/// while still amortizing requests across adjacent 16 MiB pieces.
+const ADAPTIVE_RESPONSE_PIECE_LIMIT: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PieceClaim {
+    Owned,
+    Acquired,
+    Blocked,
+    Yield,
+}
+
+impl AdaptiveScheduler {
+    fn new(pieces: Vec<Chunk>, progress: Vec<Arc<AtomicU64>>) -> Self {
+        let owners = vec![None; pieces.len()];
+        Self {
+            pieces,
+            progress,
+            owners: Mutex::new(owners),
+            changed: Notify::new(),
+        }
+    }
+
+    async fn seed_workers(&self, worker_limit: usize) -> Vec<(usize, usize)> {
+        let mut owners = self.owners.lock().await;
+        let available: Vec<usize> = self
+            .pieces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, piece)| {
+                (self.progress[index].load(Ordering::SeqCst) < piece_len(piece)).then_some(index)
+            })
+            .collect();
+        let count = available.len().min(worker_limit.max(1));
+        if count == 0 {
+            return Vec::new();
+        }
+
+        // Seed at evenly spaced points through the remaining file. As each
+        // response proceeds, the worker claims adjacent pieces until it meets
+        // another owner. This prevents all connections from starting at byte
+        // zero while keeping the policy deterministic across runs.
+        (0..count)
+            .map(|worker| {
+                let position = if count == 1 {
+                    0
+                } else {
+                    worker * (available.len() - 1) / (count - 1)
+                };
+                let piece_index = available[position];
+                owners[piece_index] = Some(worker);
+                (worker, piece_index)
+            })
+            .collect()
+    }
+
+    async fn claim_for_response(
+        &self,
+        worker: usize,
+        index: usize,
+        response_owned_pieces: usize,
+        response_piece_limit: usize,
+    ) -> PieceClaim {
+        let Some(piece) = self.pieces.get(index) else {
+            return PieceClaim::Blocked;
+        };
+        let mut owners = self.owners.lock().await;
+        if self.progress[index].load(Ordering::SeqCst) >= piece_len(piece) {
+            return PieceClaim::Blocked;
+        }
+        match owners[index] {
+            Some(owner) if owner == worker => PieceClaim::Owned,
+            Some(_) => PieceClaim::Blocked,
+            None => {
+                if response_owned_pieces >= response_piece_limit {
+                    return PieceClaim::Yield;
+                }
+                owners[index] = Some(worker);
+                PieceClaim::Acquired
+            }
+        }
+    }
+
+    async fn claim_largest_region(
+        &self,
+        worker: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Option<usize>> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+
+            let mut owners = self.owners.lock().await;
+            let mut best: Option<(usize, usize, u64)> = None;
+            let mut index = 0;
+
+            while index < self.pieces.len() {
+                let is_available = |index: usize| {
+                    owners[index].is_none()
+                        && self.progress[index].load(Ordering::SeqCst)
+                            < piece_len(&self.pieces[index])
+                };
+                if !is_available(index) {
+                    index += 1;
+                    continue;
+                }
+
+                let start = index;
+                while index < self.pieces.len() && is_available(index) {
+                    index += 1;
+                }
+                let end = index;
+                let span_bytes = self.pieces[end - 1].end - self.pieces[start].start + 1;
+                if best.is_none_or(|(_, _, best_bytes)| span_bytes > best_bytes) {
+                    best = Some((start, end, span_bytes));
+                }
+            }
+
+            if let Some((start, end, span_bytes)) = best {
+                // Starting near the middle leaves work on both sides for
+                // other idle workers. The response claims forward through
+                // this gap, up to its per-response piece budget.
+                let midpoint = self.pieces[start].start + span_bytes / 2;
+                let selected = (start..end)
+                    .find(|index| midpoint <= self.pieces[*index].end)
+                    .unwrap_or(end - 1);
+                owners[selected] = Some(worker);
+                drop(owners);
+                self.changed.notify_waiters();
+                return Ok(Some(selected));
+            }
+
+            let work_is_owned = owners.iter().any(Option::is_some);
+            drop(owners);
+            if !work_is_owned {
+                return Ok(None);
+            }
+
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    anyhow::bail!("Cancelled while waiting for an adaptive work region");
+                }
+                _ = &mut changed => {}
+            }
+        }
+    }
+
+    async fn checkpoint_piece(&self, worker: usize, index: usize, completed: u64) -> Result<()> {
+        let piece = &self.pieces[index];
+        let mut owners = self.owners.lock().await;
+        if owners[index] != Some(worker) {
+            anyhow::bail!(
+                "Adaptive piece #{} lost its owner before checkpoint",
+                piece.id
+            );
+        }
+        let completed = completed.min(piece_len(piece));
+        self.progress[index].store(completed, Ordering::SeqCst);
+        if completed == piece_len(piece) {
+            owners[index] = None;
+            drop(owners);
+            self.changed.notify_waiters();
+        }
+        Ok(())
+    }
+
+    async fn retain_first_incomplete(&self, worker: usize) -> Option<usize> {
+        let mut owners = self.owners.lock().await;
+        let keep = self
+            .pieces
+            .iter()
+            .enumerate()
+            .find(|(index, piece)| {
+                owners[*index] == Some(worker)
+                    && self.progress[*index].load(Ordering::SeqCst) < piece_len(piece)
+            })
+            .map(|(index, _)| index);
+        for (index, owner) in owners.iter_mut().enumerate() {
+            if *owner == Some(worker) && Some(index) != keep {
+                *owner = None;
+            }
+        }
+        drop(owners);
+        self.changed.notify_waiters();
+        keep
+    }
+
+    async fn release_worker(&self, worker: usize) {
+        let mut owners = self.owners.lock().await;
+        for owner in owners.iter_mut() {
+            if *owner == Some(worker) {
+                *owner = None;
+            }
+        }
+        drop(owners);
+        self.changed.notify_waiters();
+    }
+
+    fn counter_list(&self) -> Vec<(u32, Arc<AtomicU64>)> {
+        self.pieces
+            .iter()
+            .zip(&self.progress)
+            .map(|(piece, progress)| (piece.id, Arc::clone(progress)))
+            .collect()
+    }
+}
+
+fn piece_len(piece: &Chunk) -> u64 {
+    piece.end - piece.start + 1
+}
+
+struct RequestGate {
+    active: AtomicUsize,
+    changed: Notify,
+    pressure: Arc<PressureController>,
+}
+
+impl RequestGate {
+    fn new(pressure: Arc<PressureController>) -> Arc<Self> {
+        Arc::new(Self {
+            active: AtomicUsize::new(0),
+            changed: Notify::new(),
+            pressure,
+        })
+    }
+
+    async fn enter(self: &Arc<Self>, cancel: &CancellationToken) -> Result<RequestPermit> {
+        loop {
+            self.pressure.wait_while_paused(cancel).await;
+            let changed = self.changed.notified();
+            if cancel.is_cancelled() {
+                anyhow::bail!("Cancelled while waiting for an adaptive request slot");
+            }
+
+            let active = self.active.load(Ordering::Acquire);
+            if active < self.pressure.limit()
+                && self
+                    .active
+                    .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                if self.active.load(Ordering::Acquire) <= self.pressure.limit()
+                    && !self.pressure.is_paused()
+                {
+                    return Ok(RequestPermit(Arc::clone(self)));
+                }
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                self.changed.notify_one();
+                continue;
+            }
+
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    anyhow::bail!("Cancelled while waiting for an adaptive request slot");
+                }
+                _ = changed => {}
+            }
+        }
+    }
+}
+
+struct RequestPermit(Arc<RequestGate>);
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed.notify_one();
+    }
+}
+
+#[derive(Default)]
+struct AdaptiveStats {
+    received_but_discarded: AtomicU64,
+}
+
+async fn parallel_inner_adaptive_stream(
+    ctx: &ParallelDownloadCtx<'_>,
+    temp_path: &str,
+    meta_path: &str,
+    progress_callback: Option<ProgressCallback>,
+) -> Result<u64> {
+    let meta = load_or_create_metadata(
+        meta_path,
+        temp_path,
+        ctx.url,
+        ctx.identity.as_deref(),
+        ctx.file_size,
+        ctx.chunks,
+        ctx.etag.as_deref(),
+        ctx.last_modified.as_deref(),
+    )
+    .await?;
+    let pieces = chunks_from_metadata(&meta);
+    ensure_file_allocated(temp_path, ctx.file_size, &pieces, &meta).await?;
+
+    let progress: Vec<Arc<AtomicU64>> = meta
+        .chunks
+        .iter()
+        .map(|piece| Arc::new(AtomicU64::new(piece.completed)))
+        .collect();
+    let scheduler = Arc::new(AdaptiveScheduler::new(pieces, progress));
+    let counters = scheduler.counter_list();
+    let initial_completed: u64 = counters
+        .iter()
+        .map(|(_, counter)| counter.load(Ordering::SeqCst))
+        .sum();
+    let seeds = scheduler.seed_workers(ctx.workers).await;
+
+    let pressure = Arc::new(PressureController::new(seeds.len().max(1)));
+    let gate = RequestGate::new(Arc::clone(&pressure));
+    let stats = Arc::new(AdaptiveStats::default());
+    // A worker failure must stop its siblings without cancelling the caller's
+    // token. Caller cancellation still propagates into this child token.
+    let worker_cancel = ctx.cancel.child_token();
+    let background_stop = CancellationToken::new();
+    let _stop_on_drop = background_stop.clone().drop_guard();
+    let shared_meta = Arc::new(Mutex::new(meta));
+
+    let autosave_handle = spawn_autosave(
+        meta_path.to_owned(),
+        Arc::clone(&shared_meta),
+        counters.clone(),
+        background_stop.clone(),
+    );
+    let monitor_handle = spawn_progress_monitor(
+        progress_callback,
+        counters.clone(),
+        background_stop.clone(),
+        ctx.file_size,
+    );
+
+    let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+    for (worker, seed) in seeds {
+        let client = ctx.client.clone();
+        let url = ctx.fetch_url.to_owned();
+        let path = temp_path.to_owned();
+        let identity = ctx.etag.clone();
+        let last_modified = ctx.last_modified.clone();
+        let config = ctx.retry_config.clone();
+        let scheduler = Arc::clone(&scheduler);
+        let pressure = Arc::clone(&pressure);
+        let gate = Arc::clone(&gate);
+        let cancel = worker_cancel.clone();
+        let stats = Arc::clone(&stats);
+        let file_size = ctx.file_size;
+
+        join_set.spawn(async move {
+            adaptive_worker(
+                &client,
+                &url,
+                &path,
+                file_size,
+                identity.as_deref(),
+                last_modified.as_deref(),
+                &config,
+                scheduler,
+                worker,
+                seed,
+                cancel,
+                pressure,
+                gate,
+                stats,
+            )
+            .await
+        });
+    }
+
+    let mut first_error = None;
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                    worker_cancel.cancel();
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!("Adaptive worker panic: {error}"));
+                    worker_cancel.cancel();
+                }
+            }
+        }
+    }
+
+    background_stop.cancel();
+    if let Some(handle) = monitor_handle {
+        let _ = handle.await;
+    }
+    let _ = autosave_handle.await;
+
+    let total_completed: u64 = counters
+        .iter()
+        .map(|(_, counter)| counter.load(Ordering::SeqCst))
+        .sum();
+
+    if let Some(error) = first_error {
+        save_progress(meta_path, &shared_meta, &counters).await;
+        return Err(error);
+    }
+    if total_completed != ctx.file_size {
+        save_progress(meta_path, &shared_meta, &counters).await;
+        anyhow::bail!(
+            "Adaptive schedule stopped with {} of {} bytes complete",
+            total_completed,
+            ctx.file_size
+        );
+    }
+
+    let discarded = stats.received_but_discarded.load(Ordering::Relaxed);
+    if discarded > 0 {
+        eprintln!(
+            "  [Adaptive] Discarded {} already-received bytes at ownership boundaries",
+            crate::ui::format_size(discarded)
+        );
+    }
+    debug_assert!(total_completed >= initial_completed);
+    Ok(total_completed)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn adaptive_worker(
+    client: &Client,
+    url: &str,
+    file_path: &str,
+    file_size: u64,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    config: &RetryConfig,
+    scheduler: Arc<AdaptiveScheduler>,
+    worker: usize,
+    initial_piece: usize,
+    cancel: CancellationToken,
+    pressure: Arc<PressureController>,
+    gate: Arc<RequestGate>,
+    stats: Arc<AdaptiveStats>,
+) -> Result<()> {
+    let file = safe_file::open_guarded(
+        Path::new(file_path),
+        Existing::OpenExisting,
+        Access::ReadWrite,
+        safe_file::DEFAULT_FILE_MODE,
+    )
+    .with_context(|| format!("Failed to open adaptive partial file: {file_path}"))?;
+    let mut writer = BufWriter::with_capacity(512 * 1024, tokio::fs::File::from_std(file));
+
+    let mut next_piece = Some(initial_piece);
+    while let Some(piece) = next_piece {
+        if cancel.is_cancelled() {
+            scheduler.release_worker(worker).await;
+            anyhow::bail!("Adaptive worker cancelled before claiming more work");
+        }
+        let request_result = adaptive_request_with_retry(
+            client,
+            url,
+            file_size,
+            etag,
+            last_modified,
+            config,
+            &scheduler,
+            &mut writer,
+            worker,
+            piece,
+            &cancel,
+            &pressure,
+            &gate,
+            &stats,
+        )
+        .await;
+        if let Err(error) = request_result {
+            scheduler.release_worker(worker).await;
+            return Err(error);
+        }
+
+        if cancel.is_cancelled() {
+            scheduler.release_worker(worker).await;
+            anyhow::bail!("Adaptive worker cancelled after its response");
+        }
+        next_piece = scheduler.claim_largest_region(worker, &cancel).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn adaptive_request_with_retry(
+    client: &Client,
+    url: &str,
+    file_size: u64,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    config: &RetryConfig,
+    scheduler: &AdaptiveScheduler,
+    writer: &mut BufWriter<tokio::fs::File>,
+    worker: usize,
+    initial_piece: usize,
+    cancel: &CancellationToken,
+    pressure: &PressureController,
+    gate: &Arc<RequestGate>,
+    stats: &AdaptiveStats,
+) -> Result<()> {
+    let mut anchor = initial_piece;
+    for attempt in 0..=config.max_retries {
+        pressure.wait_while_paused(cancel).await;
+        if cancel.is_cancelled() {
+            scheduler.release_worker(worker).await;
+            anyhow::bail!(
+                "Adaptive range request cancelled before attempt {}",
+                attempt + 1
+            );
+        }
+
+        let piece = &scheduler.pieces[anchor];
+        let completed = scheduler.progress[anchor].load(Ordering::SeqCst);
+        if completed >= piece_len(piece) {
+            scheduler.release_worker(worker).await;
+            return Ok(());
+        }
+        let request_start = piece.start + completed;
+        let permit = match gate.enter(cancel).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                scheduler.release_worker(worker).await;
+                return Err(error);
+            }
+        };
+
+        let range_value = format!("bytes={request_start}-");
+        let if_range = resume::strong_validator(etag, last_modified);
+        let mut request = client.get(url).header(header::RANGE, &range_value);
+        if let Some(validator) = if_range {
+            request = request.header(header::IF_RANGE, validator);
+        }
+
+        let response = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                drop(permit);
+                scheduler.release_worker(worker).await;
+                anyhow::bail!("Adaptive range request cancelled before response");
+            }
+            result = request.send() => match result {
+                Ok(response) => response,
+                Err(error) => {
+                    drop(permit);
+                    let error = anyhow::Error::new(error.without_url())
+                        .context(format!("Range GET failed for {range_value}"));
+                    if retry_adaptive_request(
+                        &error,
+                        attempt,
+                        config,
+                        cancel,
+                        pressure,
+                        scheduler.pieces[anchor].id,
+                    )
+                    .await?
+                    {
+                        anchor = scheduler.retain_first_incomplete(worker).await.unwrap_or(anchor);
+                        continue;
+                    }
+                    scheduler.release_worker(worker).await;
+                    return Err(error);
+                }
+            }
+        };
+
+        let status = response.status();
+        let response_headers = response.headers();
+        if status == StatusCode::OK {
+            let validator_matches = response_validator_matches(response_headers, if_range);
+            drop(response);
+            drop(permit);
+            scheduler.release_worker(worker).await;
+            if if_range.is_some() && !validator_matches {
+                anyhow::bail!(
+                    "Server returned a full response after If-Range; the representation may have changed"
+                );
+            }
+            return Err(anyhow::Error::new(RangeUnsupported));
+        }
+        if status != StatusCode::PARTIAL_CONTENT {
+            if retry::is_transient_status(status) {
+                let retry_after = response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| retry::parse_retry_after(value, unix_now()));
+                drop(response);
+                drop(permit);
+                let error = anyhow::Error::new(retry::TransientError::after(
+                    format!(
+                        "Transient HTTP {} for range {}",
+                        status.as_u16(),
+                        range_value
+                    ),
+                    retry_after,
+                ));
+                if retry_adaptive_request(
+                    &error,
+                    attempt,
+                    config,
+                    cancel,
+                    pressure,
+                    scheduler.pieces[anchor].id,
+                )
+                .await?
+                {
+                    anchor = scheduler
+                        .retain_first_incomplete(worker)
+                        .await
+                        .unwrap_or(anchor);
+                    continue;
+                }
+                scheduler.release_worker(worker).await;
+                return Err(error);
+            }
+            drop(response);
+            drop(permit);
+            scheduler.release_worker(worker).await;
+            anyhow::bail!(
+                "Permanent HTTP error for range {}: {} {}",
+                range_value,
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Unknown")
+            );
+        }
+
+        if if_range
+            .is_some_and(|expected| !response_validator_matches(response.headers(), Some(expected)))
+        {
+            drop(response);
+            drop(permit);
+            scheduler.release_worker(worker).await;
+            anyhow::bail!(
+                "Server returned a range without the expected If-Range validator; representation continuity is unproven"
+            );
+        }
+
+        let (response_end, response_total) =
+            match parse_open_content_range(response.headers(), request_start, file_size) {
+                Ok(range) => range,
+                Err(error) => {
+                    drop(response);
+                    drop(permit);
+                    scheduler.release_worker(worker).await;
+                    return Err(error);
+                }
+            };
+        debug_assert_eq!(response_total, file_size);
+        if let Some(value) = response.headers().get(header::CONTENT_LENGTH) {
+            let length = value
+                .to_str()
+                .context("Content-Length is not valid UTF-8")?
+                .parse::<u64>()
+                .context("Content-Length is not a valid byte count")?;
+            if length != response_end - request_start + 1 {
+                drop(response);
+                drop(permit);
+                scheduler.release_worker(worker).await;
+                anyhow::bail!("Range Content-Length disagrees with Content-Range");
+            }
+        }
+
+        let body_result = process_adaptive_body(
+            response,
+            scheduler,
+            writer,
+            worker,
+            anchor,
+            request_start,
+            response_end,
+            cancel,
+            stats,
+        )
+        .await;
+        drop(permit);
+
+        match body_result {
+            Ok(AdaptiveBodyEnd::Cancelled) => {
+                scheduler.release_worker(worker).await;
+                anyhow::bail!("Adaptive range response cancelled");
+            }
+            Ok(AdaptiveBodyEnd::Boundary | AdaptiveBodyEnd::ResponseComplete) => {
+                scheduler.release_worker(worker).await;
+                if let Some(restored) = pressure.record_success() {
+                    eprintln!(
+                        "  \u{2713} Server steady again \u{2014} parallel connections back to {}",
+                        restored
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                let keep = scheduler.retain_first_incomplete(worker).await;
+                if keep.is_none() {
+                    scheduler.release_worker(worker).await;
+                    if retry::is_retryable(&error) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                anchor = keep.unwrap();
+                if retry_adaptive_request(
+                    &error,
+                    attempt,
+                    config,
+                    cancel,
+                    pressure,
+                    scheduler.pieces[anchor].id,
+                )
+                .await?
+                {
+                    continue;
+                }
+                scheduler.release_worker(worker).await;
+                return Err(error.context(format!(
+                    "Adaptive piece #{} failed permanently after {} attempt(s)",
+                    scheduler.pieces[anchor].id,
+                    attempt + 1
+                )));
+            }
+        }
+    }
+
+    scheduler.release_worker(worker).await;
+    anyhow::bail!("Adaptive range exhausted its retry attempts")
+}
+
+#[derive(Debug)]
+enum AdaptiveBodyEnd {
+    Boundary,
+    ResponseComplete,
+    Cancelled,
+}
+
+async fn process_adaptive_body(
+    response: reqwest::Response,
+    scheduler: &AdaptiveScheduler,
+    writer: &mut BufWriter<tokio::fs::File>,
+    worker: usize,
+    anchor_piece: usize,
+    request_start: u64,
+    response_end: u64,
+    cancel: &CancellationToken,
+    stats: &AdaptiveStats,
+) -> Result<AdaptiveBodyEnd> {
+    let expected_len = response_end - request_start + 1;
+    writer
+        .seek(SeekFrom::Start(request_start))
+        .await
+        .with_context(|| format!("Failed to seek to adaptive offset {request_start}"))?;
+
+    let mut stream = response.bytes_stream();
+    let mut cursor = request_start;
+    let mut received = 0u64;
+    let mut touched = HashMap::<usize, u64>::new();
+    let mut response_owned = HashMap::from([(anchor_piece, ())]);
+    let mut stopped_at_boundary = false;
+    let mut was_cancelled = false;
+    let mut body_error = None;
+
+    'body: loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                was_cancelled = true;
+                break;
+            }
+            next = stream.next() => next,
+        };
+
+        match next {
+            Some(Ok(data)) => {
+                let remaining = expected_len.saturating_sub(received);
+                let allowed = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(data.len());
+                let mut buffer_offset = 0usize;
+                while buffer_offset < allowed {
+                    let piece_index = scheduler.pieces.partition_point(|piece| piece.end < cursor);
+                    if piece_index >= scheduler.pieces.len() {
+                        stats
+                            .received_but_discarded
+                            .fetch_add((data.len() - buffer_offset) as u64, Ordering::Relaxed);
+                        stopped_at_boundary = true;
+                        break 'body;
+                    }
+
+                    let claim = scheduler
+                        .claim_for_response(
+                            worker,
+                            piece_index,
+                            response_owned.len(),
+                            ADAPTIVE_RESPONSE_PIECE_LIMIT,
+                        )
+                        .await;
+                    match claim {
+                        PieceClaim::Owned => {}
+                        PieceClaim::Acquired => {
+                            response_owned.insert(piece_index, ());
+                        }
+                        PieceClaim::Blocked | PieceClaim::Yield => {
+                            stats
+                                .received_but_discarded
+                                .fetch_add((data.len() - buffer_offset) as u64, Ordering::Relaxed);
+                            stopped_at_boundary = true;
+                            break 'body;
+                        }
+                    }
+
+                    let piece = &scheduler.pieces[piece_index];
+                    let available_in_piece = piece.end + 1 - cursor;
+                    let segment_len = (allowed - buffer_offset)
+                        .min(usize::try_from(available_in_piece).unwrap_or(usize::MAX));
+                    let segment_end = cursor + segment_len as u64;
+                    if let Err(error) = writer
+                        .write_all(&data[buffer_offset..buffer_offset + segment_len])
+                        .await
+                    {
+                        body_error = Some(
+                            anyhow::Error::new(error)
+                                .context(format!("Write failed at adaptive offset {cursor}")),
+                        );
+                        break 'body;
+                    }
+
+                    touched
+                        .entry(piece_index)
+                        .and_modify(|completed| {
+                            *completed = (*completed).max(segment_end - piece.start)
+                        })
+                        .or_insert(segment_end - piece.start);
+                    cursor = segment_end;
+                    received += segment_len as u64;
+                    buffer_offset += segment_len;
+
+                    if cursor == piece.end + 1 {
+                        touched.insert(piece_index, piece_len(piece));
+                        checkpoint_touched(writer, scheduler, worker, &mut touched).await?;
+                        if response_owned.len() >= ADAPTIVE_RESPONSE_PIECE_LIMIT
+                            && cursor <= response_end
+                        {
+                            stats
+                                .received_but_discarded
+                                .fetch_add((data.len() - buffer_offset) as u64, Ordering::Relaxed);
+                            stopped_at_boundary = true;
+                            break 'body;
+                        }
+                    }
+                }
+
+                if data.len() > allowed {
+                    body_error = Some(anyhow::Error::msg(format!(
+                        "Server sent excess data for adaptive range beginning at {request_start}"
+                    )));
+                    break;
+                }
+            }
+            Some(Err(error)) => {
+                body_error = Some(anyhow::Error::new(error.without_url()).context(format!(
+                    "Adaptive response stream failed at byte {}",
+                    cursor - request_start
+                )));
+                break;
+            }
+            None if received == expected_len => break,
+            None => {
+                body_error = Some(anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "Truncated adaptive response: expected {expected_len} bytes, received {received}"
+                    ),
+                )));
+                break;
+            }
+        }
+    }
+
+    // Dropping the stream stops the response before releasing ownership. Any
+    // bytes already accepted by the buffered writer are flushed and synced
+    // before their per-piece progress reaches the resume manifest.
+    drop(stream);
+    checkpoint_touched(writer, scheduler, worker, &mut touched).await?;
+
+    if was_cancelled {
+        return Ok(AdaptiveBodyEnd::Cancelled);
+    }
+    if let Some(error) = body_error {
+        return Err(error);
+    }
+    if stopped_at_boundary {
+        return Ok(AdaptiveBodyEnd::Boundary);
+    }
+    Ok(AdaptiveBodyEnd::ResponseComplete)
+}
+
+async fn checkpoint_touched(
+    writer: &mut BufWriter<tokio::fs::File>,
+    scheduler: &AdaptiveScheduler,
+    worker: usize,
+    touched: &mut HashMap<usize, u64>,
+) -> Result<()> {
+    if touched.is_empty() {
+        return Ok(());
+    }
+    writer
+        .flush()
+        .await
+        .context("Failed to flush adaptive piece data")?;
+    writer
+        .get_ref()
+        .sync_data()
+        .await
+        .context("Failed to sync adaptive piece data before checkpoint")?;
+
+    for (index, completed) in touched.drain() {
+        scheduler.checkpoint_piece(worker, index, completed).await?;
+    }
+    Ok(())
+}
+
+async fn retry_adaptive_request(
+    error: &anyhow::Error,
+    attempt: u32,
+    config: &RetryConfig,
+    cancel: &CancellationToken,
+    pressure: &PressureController,
+    piece_id: u32,
+) -> Result<bool> {
+    if !retry::is_retryable(error) || attempt >= config.max_retries {
+        return Ok(false);
+    }
+
+    let asked_for = retry::retry_after(error);
+    let reaction = pressure.record_retryable(asked_for);
+    if let Some(from) = reaction.reduced_from {
+        eprintln!(
+            "  \u{26a0} Server overloaded \u{2014} reducing parallel connections: {} \u{2192} {}",
+            from, reaction.limit
+        );
+    }
+    if let Some(pause) = reaction.pause {
+        eprintln!(
+            "  \u{23f8} Server asked for {:.0}s \u{2014} holding every connection",
+            pause.as_secs_f64()
+        );
+    }
+    let backoff = config.delay_for_attempt(attempt);
+    let delay = asked_for.map_or(backoff, |wait| wait.max(backoff));
+    eprintln!(
+        "   \u{26a0} Adaptive piece #{}: {}/{} failed, retry in {:.1}s \u{2014} {}",
+        piece_id,
+        attempt + 1,
+        config.max_retries + 1,
+        delay.as_secs_f64(),
+        short_error(error),
+    );
+
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => anyhow::bail!("Adaptive range cancelled during retry backoff"),
+        _ = tokio::time::sleep(delay) => Ok(true),
+    }
+}
+
+fn parse_open_content_range(
+    headers: &header::HeaderMap,
+    expected_start: u64,
+    expected_total: u64,
+) -> Result<(u64, u64)> {
+    let value = headers
+        .get(header::CONTENT_RANGE)
+        .context("Server returned 206 without Content-Range")?
+        .to_str()
+        .context("Content-Range is not valid UTF-8")?;
+    let range = value
+        .strip_prefix("bytes ")
+        .with_context(|| format!("Unexpected Content-Range format: '{value}'"))?;
+    let (bounds, total) = range
+        .split_once('/')
+        .with_context(|| format!("Content-Range missing '/': '{value}'"))?;
+    let (start, end) = bounds
+        .split_once('-')
+        .with_context(|| format!("Content-Range missing '-': '{value}'"))?;
+    let start = start
+        .parse::<u64>()
+        .with_context(|| format!("Invalid start in Content-Range: '{value}'"))?;
+    let end = end
+        .parse::<u64>()
+        .with_context(|| format!("Invalid end in Content-Range: '{value}'"))?;
+    let total = total
+        .parse::<u64>()
+        .with_context(|| format!("Invalid total in Content-Range: '{value}'"))?;
+
+    if start != expected_start || end < start || total != expected_total || end >= total {
+        anyhow::bail!(
+            "Content-Range mismatch: requested {}- through {}, got '{}'",
+            expected_start,
+            expected_total - 1,
+            value
+        );
+    }
+    Ok((end, total))
+}
+
+fn response_validator_matches(headers: &header::HeaderMap, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    response_validator(headers).is_some_and(|actual| actual == expected)
+}
+
+fn response_validator(headers: &header::HeaderMap) -> Option<&str> {
+    let etag = headers
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok());
+    let last_modified = headers
+        .get(header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok());
+    resume::strong_validator(etag, last_modified)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -633,15 +1767,12 @@ fn short_error(err: &anyhow::Error) -> String {
     }
 }
 
-fn spawn_progress_monitor<F>(
-    callback: Option<F>,
+fn spawn_progress_monitor(
+    callback: Option<ProgressCallback>,
     counters: Vec<(u32, Arc<AtomicU64>)>,
     stop: CancellationToken,
     total: u64,
-) -> Option<JoinHandle<()>>
-where
-    F: Fn(u64, u64) + Send + Sync + 'static,
-{
+) -> Option<JoinHandle<()>> {
     let cb = callback?;
     Some(tokio::spawn(async move {
         loop {
@@ -732,7 +1863,9 @@ mod tests {
         let reports = Arc::new(StdMutex::new(Vec::new()));
         let captured = Arc::clone(&reports);
         let task = spawn_progress_monitor(
-            Some(move |current, total| captured.lock().unwrap().push((current, total))),
+            Some(Arc::new(move |current: u64, total: u64| {
+                captured.lock().unwrap().push((current, total))
+            }) as ProgressCallback),
             vec![(0, Arc::clone(&counter))],
             stop.clone(),
             10,
@@ -757,7 +1890,9 @@ mod tests {
         let reports = Arc::new(StdMutex::new(Vec::new()));
         let captured = Arc::clone(&reports);
         let task = spawn_progress_monitor(
-            Some(move |current, total| captured.lock().unwrap().push((current, total))),
+            Some(Arc::new(move |current: u64, total: u64| {
+                captured.lock().unwrap().push((current, total))
+            }) as ProgressCallback),
             vec![(0, Arc::new(AtomicU64::new(10)))],
             stop,
             10,
@@ -898,7 +2033,10 @@ mod tests {
                         .and_then(|v| v.strip_prefix("bytes="))
                         .and_then(|v| v.split_once('-'))
                         .map(|(start, end)| {
-                            (start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap())
+                            (
+                                start.parse::<usize>().unwrap(),
+                                end.parse::<usize>().unwrap(),
+                            )
                         })
                         .unwrap();
                     let payload = b"abcdefgh";
@@ -918,6 +2056,271 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{address}/file"), maximum)
+    }
+
+    async fn serve_adaptive_payload(
+        payload: Arc<Vec<u8>>,
+        ignore_ranges: bool,
+    ) -> (String, Arc<StdMutex<Vec<u64>>>) {
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Response, StatusCode, header};
+        use axum::routing::get;
+
+        let starts = Arc::new(StdMutex::new(Vec::new()));
+        let starts_for_route = Arc::clone(&starts);
+        let payload_for_route = Arc::clone(&payload);
+        let app = axum::Router::new().route(
+            "/file",
+            get(move |headers: HeaderMap| {
+                let starts = Arc::clone(&starts_for_route);
+                let payload = Arc::clone(&payload_for_route);
+                async move {
+                    if ignore_ranges {
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::ETAG, "\"v1\"")
+                            .body(Body::from(payload.as_ref().clone()))
+                            .unwrap();
+                    }
+
+                    let start = headers
+                        .get(header::RANGE)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.strip_prefix("bytes="))
+                        .and_then(|value| value.strip_suffix('-'))
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap();
+                    starts.lock().unwrap().push(start);
+                    let end = payload.len() as u64 - 1;
+                    let body = payload[start as usize..].to_vec();
+                    Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(
+                            header::CONTENT_RANGE,
+                            format!("bytes {start}-{end}/{}", payload.len()),
+                        )
+                        .header(header::ETAG, "\"v1\"")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/file"), starts)
+    }
+
+    fn adaptive_test_pieces() -> Vec<Chunk> {
+        (0..4)
+            .map(|index| Chunk {
+                id: index + 1,
+                start: index as u64 * 20,
+                end: index as u64 * 20 + 19,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn adaptive_content_range_requires_the_requested_start_and_inspected_size() {
+        use reqwest::header::HeaderValue;
+
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 17-99/100"),
+        );
+        assert_eq!(
+            parse_open_content_range(&headers, 17, 100).unwrap(),
+            (99, 100)
+        );
+        assert!(parse_open_content_range(&headers, 18, 100).is_err());
+        assert!(parse_open_content_range(&headers, 17, 101).is_err());
+    }
+
+    #[test]
+    fn adaptive_if_range_requires_a_matching_response_validator() {
+        use reqwest::header::HeaderValue;
+
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::ETAG, HeaderValue::from_static("\"v1\""));
+        assert!(response_validator_matches(&headers, Some("\"v1\"")));
+        assert!(!response_validator_matches(&headers, Some("\"v2\"")));
+        assert!(response_validator_matches(&header::HeaderMap::new(), None));
+        assert!(!response_validator_matches(
+            &header::HeaderMap::new(),
+            Some("\"v1\"")
+        ));
+    }
+
+    async fn run_adaptive_test_download(
+        url: &str,
+        output: &str,
+        chunks: &[Chunk],
+        file_size: u64,
+    ) -> Result<u64> {
+        let client = Client::builder().no_proxy().build().unwrap();
+        let retry_config = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let ctx = ParallelDownloadCtx {
+            client: &client,
+            url,
+            fetch_url: url,
+            output_path: output,
+            file_size,
+            workers: 2,
+            chunks,
+            retry_config: &retry_config,
+            cancel: CancellationToken::new(),
+            identity: None,
+            etag: Some("\"v1\"".to_owned()),
+            last_modified: None,
+        };
+        download_parallel_adaptive_stream(&ctx, None::<fn(u64, u64)>).await
+    }
+
+    #[tokio::test]
+    async fn adaptive_response_crosses_owned_pieces_and_stops_at_another_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("adaptive.bin");
+        let output = output.to_str().unwrap();
+        let payload = Arc::new((0..80).map(|byte| byte as u8).collect::<Vec<_>>());
+        let (url, starts) = serve_adaptive_payload(Arc::clone(&payload), false).await;
+        let pieces = adaptive_test_pieces();
+
+        assert_eq!(
+            run_adaptive_test_download(&url, output, &pieces, payload.len() as u64)
+                .await
+                .unwrap(),
+            payload.len() as u64
+        );
+        assert_eq!(
+            fs::read(output).await.unwrap().as_slice(),
+            payload.as_slice()
+        );
+        let request_starts = starts.lock().unwrap().clone();
+        assert!(request_starts.contains(&0));
+        assert!(request_starts.contains(&60));
+        assert!(request_starts.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn adaptive_mode_restarts_safely_when_server_ignores_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("fallback.bin");
+        let output = output.to_str().unwrap();
+        let payload = Arc::new((0..80).map(|byte| (byte * 3) as u8).collect::<Vec<_>>());
+        let (url, _) = serve_adaptive_payload(Arc::clone(&payload), true).await;
+        let pieces = adaptive_test_pieces();
+
+        assert_eq!(
+            run_adaptive_test_download(&url, output, &pieces, payload.len() as u64)
+                .await
+                .unwrap(),
+            payload.len() as u64
+        );
+        assert_eq!(
+            fs::read(output).await.unwrap().as_slice(),
+            payload.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_resume_requests_from_the_saved_partial_piece_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("resumed.bin");
+        let output = output.to_str().unwrap();
+        let payload = Arc::new((0..80).map(|byte| (byte + 7) as u8).collect::<Vec<_>>());
+        let (url, starts) = serve_adaptive_payload(Arc::clone(&payload), false).await;
+        let pieces = adaptive_test_pieces();
+        let mut meta = resume::create_new(url.clone(), payload.len() as u64, &pieces);
+        meta.etag = Some("\"v1\"".to_owned());
+        resume::update_progress(&mut meta, 1, 5);
+        resume::save_atomic(&ResumeMetadata::meta_path(output), &meta)
+            .await
+            .unwrap();
+
+        let partial = format!("{output}.part");
+        fs::write(&partial, &payload[..5]).await.unwrap();
+        let file = safe_file::open_guarded(
+            Path::new(&partial),
+            Existing::OpenExisting,
+            Access::ReadWrite,
+            safe_file::DEFAULT_FILE_MODE,
+        )
+        .unwrap();
+        file.set_len(payload.len() as u64).unwrap();
+        drop(file);
+
+        assert_eq!(
+            run_adaptive_test_download(&url, output, &pieces, payload.len() as u64)
+                .await
+                .unwrap(),
+            payload.len() as u64
+        );
+        assert_eq!(
+            fs::read(output).await.unwrap().as_slice(),
+            payload.as_slice()
+        );
+        assert!(starts.lock().unwrap().contains(&5));
+    }
+
+    #[tokio::test]
+    async fn adaptive_scheduler_spreads_seeds_and_never_steals_owned_pieces() {
+        let pieces = (0..12)
+            .map(|index| Chunk {
+                id: index + 1,
+                start: index as u64 * 10,
+                end: index as u64 * 10 + 9,
+            })
+            .collect::<Vec<_>>();
+        let progress = pieces.iter().map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let scheduler = AdaptiveScheduler::new(pieces, progress);
+        let seeds = scheduler.seed_workers(3).await;
+        assert_eq!(seeds, vec![(0, 0), (1, 5), (2, 11)]);
+
+        assert_eq!(
+            scheduler.claim_for_response(0, 1, 1, 2).await,
+            PieceClaim::Acquired
+        );
+        assert_eq!(
+            scheduler.claim_for_response(1, 1, 1, 2).await,
+            PieceClaim::Blocked
+        );
+        assert_eq!(
+            scheduler.claim_for_response(0, 2, 2, 2).await,
+            PieceClaim::Yield
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_adaptive_worker_waits_for_and_claims_released_work() {
+        let pieces = (0..4)
+            .map(|index| Chunk {
+                id: index + 1,
+                start: index as u64 * 10,
+                end: index as u64 * 10 + 9,
+            })
+            .collect::<Vec<_>>();
+        let progress = pieces.iter().map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let scheduler = Arc::new(AdaptiveScheduler::new(pieces, progress));
+        assert_eq!(scheduler.seed_workers(4).await.len(), 4);
+
+        let worker_scheduler = Arc::clone(&scheduler);
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let waiting_worker = tokio::spawn(async move {
+            worker_scheduler
+                .claim_largest_region(4, &worker_cancel)
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        scheduler.release_worker(1).await;
+
+        assert_eq!(waiting_worker.await.unwrap(), Some(1));
     }
 
     async fn try_resume_with_partial(output: &str, partial_len: Option<u64>) -> Result<u64> {
@@ -1035,7 +2438,10 @@ mod tests {
             .expect_err("truncated partial file must not be padded and resumed");
 
         assert!(format!("{err:#}").contains("requires at least 5 bytes"));
-        assert_eq!(fs::metadata(format!("{output}.part")).await.unwrap().len(), 2);
+        assert_eq!(
+            fs::metadata(format!("{output}.part")).await.unwrap().len(),
+            2
+        );
         assert!(!Path::new(output).exists());
     }
 
@@ -1136,7 +2542,10 @@ mod tests {
             last_modified: None,
         };
 
-        assert_eq!(download_parallel(&ctx, None::<fn(u64, u64)>).await.unwrap(), 8);
+        assert_eq!(
+            download_parallel(&ctx, None::<fn(u64, u64)>).await.unwrap(),
+            8
+        );
         assert_eq!(fs::read(output).await.unwrap(), b"abcdefgh");
         assert_eq!(maximum.load(Ordering::SeqCst), 2);
     }

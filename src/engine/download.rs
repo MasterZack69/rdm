@@ -50,7 +50,7 @@ pub async fn download(
     };
 
     let user_explicitly_renamed = output_path != original_path;
-    let connections = req.connections.max(1);
+    let requested_connections = req.connections.max(1);
 
     // A hoster that had to authenticate hands us its own session and does its
     // own addressing. Everything else — every URL a listing handed us — is
@@ -176,10 +176,20 @@ pub async fn download(
     };
 
     // Small files gain nothing from parallel connections.
-    let connections = if file_size < 4 * 1024 * 1024 {
+    let adaptive_stream = file_size >= 4 * 1024 * 1024
+        && info.supports_range
+        && requested_connections > 1
+        && adaptive_stream_enabled();
+
+    let connections = if adaptive_stream {
+        // This experimental mode is intended to compare the eight-worker
+        // schedule from the R2 investigation. It remains opt-in and does not
+        // change the requested count for the normal downloader.
+        8
+    } else if file_size < 4 * 1024 * 1024 {
         1
     } else {
-        connections
+        requested_connections
     };
 
     sink.detail(&format!("File size : {}", ui::format_size(file_size)));
@@ -198,11 +208,12 @@ pub async fn download(
     // Keep the fixed connection-sized layout as the default/control. Existing
     // partial files always stay on their saved layout; changing the chunk
     // plan would make their per-chunk resume offsets ambiguous.
-    let adaptive_ranges = info.supports_range
-        && connections > 1
-        && adaptive_ranges_enabled();
+    let adaptive_ranges =
+        !adaptive_stream && info.supports_range && connections > 1 && adaptive_ranges_enabled();
 
-    let chunks = if adaptive_ranges {
+    let chunks = if adaptive_stream {
+        plan_chunks_with_piece_size(file_size, 16 * 1024 * 1024)
+    } else if adaptive_ranges {
         plan_chunks_with_max_size(file_size, 64 * 1024 * 1024, connections)
     } else if info.supports_range && connections > 1 {
         plan_chunks_with_count(file_size, connections as u32)
@@ -224,7 +235,13 @@ pub async fn download(
     sink.detail(&format!(
         "Ranges    : {}{}",
         chunks.len(),
-        if adaptive_ranges { " (adaptive schedule)" } else { "" }
+        if adaptive_stream {
+            " (adaptive stream schedule, 16 MiB pieces)"
+        } else if adaptive_ranges {
+            " (adaptive schedule)"
+        } else {
+            ""
+        }
     ));
 
     sink.total(Some(file_size));
@@ -257,7 +274,11 @@ pub async fn download(
         last_modified: info.last_modified.clone(),
     };
 
-    let download_result = parallel::download_parallel(&ctx, Some(progress_callback)).await;
+    let download_result = if adaptive_stream {
+        parallel::download_parallel_adaptive_stream(&ctx, Some(progress_callback)).await
+    } else {
+        parallel::download_parallel(&ctx, Some(progress_callback)).await
+    };
 
     sink.state(SlotState::Finishing);
     sink.finish();
@@ -282,6 +303,39 @@ fn adaptive_ranges_enabled() -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
+}
+
+/// `RDM_ADAPTIVE_STREAM=1` opts into the experimental eight-worker schedule
+/// that keeps each open-ended byte-range response alive across safely claimed
+/// adjacent pieces. It is separate from the bounded queued-range experiment.
+fn adaptive_stream_enabled() -> bool {
+    std::env::var("RDM_ADAPTIVE_STREAM")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+/// Plans fixed-size logical pieces for ownership and resume progress. The
+/// final piece may be shorter; HTTP responses are not bounded to one piece.
+fn plan_chunks_with_piece_size(file_size: u64, piece_size: u64) -> Vec<Chunk> {
+    debug_assert!(piece_size > 0);
+    let count = file_size.div_ceil(piece_size);
+    let mut chunks = Vec::with_capacity(count as usize);
+    let mut start: u64 = 0;
+    for id in 0..count {
+        let end = start.saturating_add(piece_size).min(file_size) - 1;
+        chunks.push(Chunk {
+            id: id as u32 + 1,
+            start,
+            end,
+        });
+        start = end + 1;
+    }
+    chunks
 }
 
 /// Creates contiguous ranges no larger than `max_size`. The parallel runner
@@ -426,8 +480,12 @@ mod tests {
         let output = dir.path().join("empty.txt").to_string_lossy().into_owned();
 
         let outcome = download(
-            DownloadRequest::new(format!("http://{}/empty.txt", addr), Some(output.clone()), 4)
-                .with_allow_private(true),
+            DownloadRequest::new(
+                format!("http://{}/empty.txt", addr),
+                Some(output.clone()),
+                4,
+            )
+            .with_allow_private(true),
             CancellationToken::new(),
             crate::ui::silent(),
         )
@@ -530,7 +588,8 @@ mod tests {
             get(move |headers: HeaderMap| {
                 let count = Arc::clone(&count);
                 async move {
-                    if headers.get(header::RANGE).and_then(|v| v.to_str().ok()) == Some("bytes=0-0") {
+                    if headers.get(header::RANGE).and_then(|v| v.to_str().ok()) == Some("bytes=0-0")
+                    {
                         count.fetch_add(1, Ordering::SeqCst);
                         (
                             StatusCode::PARTIAL_CONTENT,
@@ -722,7 +781,10 @@ mod tests {
             assert_eq!(pair[0].end + 1, pair[1].start);
             assert!(pair[0].end - pair[0].start + 1 <= range_size);
         }
-        assert_eq!(ranges.iter().map(|r| r.end - r.start + 1).sum::<u64>(), file_size);
+        assert_eq!(
+            ranges.iter().map(|r| r.end - r.start + 1).sum::<u64>(),
+            file_size
+        );
     }
 
     #[test]
@@ -731,6 +793,31 @@ mod tests {
         assert_eq!(ranges.len(), 8);
         assert_eq!(ranges.first().unwrap().start, 0);
         assert_eq!(ranges.last().unwrap().end, 32 * 1024 * 1024 - 1);
+    }
+
+    #[test]
+    fn adaptive_stream_piece_plan_uses_fixed_16_mib_logical_pieces() {
+        let piece_size = 16 * 1024 * 1024;
+        let file_size = piece_size * 2 + 17;
+        let pieces = plan_chunks_with_piece_size(file_size, piece_size);
+
+        assert_eq!(pieces.len(), 3);
+        assert_eq!((pieces[0].start, pieces[0].end), (0, piece_size - 1));
+        assert_eq!(
+            (pieces[1].start, pieces[1].end),
+            (piece_size, piece_size * 2 - 1)
+        );
+        assert_eq!(
+            (pieces[2].start, pieces[2].end),
+            (piece_size * 2, file_size - 1)
+        );
+        assert_eq!(
+            pieces
+                .iter()
+                .map(|piece| piece.end - piece.start + 1)
+                .sum::<u64>(),
+            file_size
+        );
     }
 
     #[test]

@@ -146,9 +146,11 @@ All optional, there are other hoster specific env variables which can find in th
 | `RDM_ALLOW_PRIVATE` | Same as `--allow-private` |
 | `RDM_ALLOW_PROXY` | Let `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` apply to RDM's requests |
 | `RDM_ADAPTIVE_RANGES` | Experimental range schedule using queued ranges up to 64 MiB; defaults off |
+| `RDM_ADAPTIVE_STREAM` | Experimental scheduler with up to eight workers and open-ended responses across owned 16 MiB pieces; defaults off |
 
 - `RDM_ALLOW_PRIVATE` and `RDM_ALLOW_PROXY` are off unless set to `1`, `true`, `yes` or `on`. Setting either to nothing, or to `false`, leaves the protection on.
 - `RDM_ADAPTIVE_RANGES` is off unless set to `1`, `true`, `yes` or `on`. It only affects known-size HTTP(S) files with range support and more than one connection. Existing partial downloads continue with the range layout saved in their resume metadata.
+- `RDM_ADAPTIVE_STREAM` is off unless set to `1`, `true`, `yes` or `on`. For known-size HTTP(S) files of at least 4 MiB with range support, and when more than one connection was requested, it uses up to eight workers and 16 MiB logical pieces. A response can cross adjacent pieces only after that worker owns them; each response yields after four pieces so idle workers can claim large unclaimed spans. Existing partial downloads keep their saved piece layout. If a server ignores ranges, RDM discards the adaptive partial state and restarts through its single-response path.
 - `RDM_MAX_FILE_BYTES` only bites when a server refuses to say how big a file is.
 
 # Release
