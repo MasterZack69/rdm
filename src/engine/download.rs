@@ -709,6 +709,31 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_ranges_cover_the_file_with_bounded_work_units() {
+        let range_size = 64 * 1024 * 1024;
+        let file_size = 200 * 1024 * 1024;
+        let ranges = plan_chunks_with_max_size(file_size, range_size, 2);
+
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges[0].start, 0);
+        assert_eq!(ranges[0].end + 1, range_size);
+        assert_eq!(ranges.last().unwrap().end, file_size - 1);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].end + 1, pair[1].start);
+            assert!(pair[0].end - pair[0].start + 1 <= range_size);
+        }
+        assert_eq!(ranges.iter().map(|r| r.end - r.start + 1).sum::<u64>(), file_size);
+    }
+
+    #[test]
+    fn adaptive_ranges_never_start_with_fewer_ranges_than_workers() {
+        let ranges = plan_chunks_with_max_size(32 * 1024 * 1024, 64 * 1024 * 1024, 8);
+        assert_eq!(ranges.len(), 8);
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, 32 * 1024 * 1024 - 1);
+    }
+
+    #[test]
     fn a_suggested_name_lands_beside_the_path_we_already_resolved() {
         assert_eq!(
             suggested_output_path("/tmp/dl/download", &suggesting(Some("movie.mkv")), false)

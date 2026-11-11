@@ -271,6 +271,10 @@ pub enum Existing {
     /// The right choice for a freshly created temp file: it means we know we
     /// created it, so nothing else can have prepared it for us.
     Reject,
+    /// Open an existing file but never create one. Useful when saved state
+    /// claims bytes already exist and creating an empty replacement would
+    /// make that claim unsafe to trust.
+    OpenExisting,
     /// Open the existing file, or create it if absent. Never follows a
     /// symlink either way.
     Open,
@@ -993,6 +997,7 @@ fn open_flags(existing: Existing, access: Access) -> libc::c_int {
 
     flags |= match existing {
         Existing::Reject => libc::O_CREAT | libc::O_EXCL,
+        Existing::OpenExisting => 0,
         Existing::Open => libc::O_CREAT,
         Existing::Truncate => 0,
     };
@@ -2122,6 +2127,7 @@ fn open_impl(path: &Path, existing: Existing, access: Access, _mode: u32) -> io:
         Existing::Reject => {
             opts.create_new(true);
         }
+        Existing::OpenExisting => {}
         Existing::Open => {
             opts.create(true);
         }
@@ -2294,6 +2300,33 @@ mod tests {
         drop(file);
 
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn open_existing_never_creates_a_missing_file() {
+        let dir = tmpdir();
+        let path = dir.path().join("resume.part");
+
+        assert!(open_guarded(
+            &path,
+            Existing::OpenExisting,
+            Access::ReadWrite,
+            DEFAULT_FILE_MODE,
+        )
+        .is_err());
+        assert!(!path.exists());
+
+        std::fs::write(&path, b"saved bytes").unwrap();
+        let file = open_guarded(
+            &path,
+            Existing::OpenExisting,
+            Access::ReadWrite,
+            DEFAULT_FILE_MODE,
+        )
+        .unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 11);
+        drop(file);
+        assert_eq!(std::fs::read(path).unwrap(), b"saved bytes");
     }
 
     #[test]
