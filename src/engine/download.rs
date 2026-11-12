@@ -540,19 +540,14 @@ mod tests {
                 let count = Arc::clone(&count);
                 async move {
                     match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-                        Some("bytes=0-0") => {
+                        Some(range) if range.starts_with("bytes=0-") => {
                             count.fetch_add(1, Ordering::SeqCst);
                             (
                                 StatusCode::PARTIAL_CONTENT,
-                                [(header::CONTENT_RANGE, "bytes 0-0/5")],
-                                "h",
+                                [(header::CONTENT_RANGE, "bytes 0-4/5")],
+                                "hello",
                             )
                         }
-                        Some("bytes=0-4") => (
-                            StatusCode::PARTIAL_CONTENT,
-                            [(header::CONTENT_RANGE, "bytes 0-4/5")],
-                            "hello",
-                        ),
                         _ => (
                             StatusCode::OK,
                             [(header::CONTENT_RANGE, "bytes 0-4/5")],
@@ -603,13 +598,16 @@ mod tests {
             get(move |headers: HeaderMap| {
                 let count = Arc::clone(&count);
                 async move {
-                    if headers.get(header::RANGE).and_then(|v| v.to_str().ok()) == Some("bytes=0-0")
+                    if headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|range| range.starts_with("bytes=0-"))
                     {
                         count.fetch_add(1, Ordering::SeqCst);
                         (
                             StatusCode::PARTIAL_CONTENT,
-                            [(header::CONTENT_RANGE, "bytes 0-0/5")],
-                            "h",
+                            [(header::CONTENT_RANGE, "bytes 0-4/5")],
+                            "hello",
                         )
                     } else {
                         (
@@ -672,8 +670,10 @@ mod tests {
                 get(move |headers: HeaderMap| {
                     let ranged_count = Arc::clone(&ranged_count);
                     async move {
-                        if headers.get(header::RANGE).and_then(|v| v.to_str().ok())
-                            == Some("bytes=0-0")
+                        if headers
+                            .get(header::RANGE)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("bytes=0-65535")
                         {
                             ranged_count.fetch_add(1, Ordering::SeqCst);
                             (StatusCode::METHOD_NOT_ALLOWED, "")
