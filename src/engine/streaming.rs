@@ -367,6 +367,7 @@ pub(super) async fn download_streaming(
     id: StreamIdentity<'_>,
     cancel: CancellationToken,
     sink: Arc<dyn ProgressSink>,
+    initial_response: Option<reqwest::Response>,
 ) -> Result<u64> {
     let temp_path = format!("{}.part", output_path);
     let meta_path = ResumeMetadata::meta_path(output_path);
@@ -396,16 +397,16 @@ pub(super) async fn download_streaming(
     // manifest beside it is what says which resource those bytes came from,
     // and it is the same manifest the segmented path writes.
     let saved = resume::load(&meta_path).await.ok();
-    let (existing_bytes, if_range) =
-        match plan_streaming_resume(bytes_on_disk, saved.as_ref(), &id) {
-            StreamStart::Resume { offset, if_range } => (offset, Some(if_range)),
-            StreamStart::Fresh { discarded } => {
-                if let Some(reason) = discarded {
-                    sink.note(&format!("Restarting from zero: {}", reason));
-                }
-                (0, None)
+    let (existing_bytes, if_range) = match plan_streaming_resume(bytes_on_disk, saved.as_ref(), &id)
+    {
+        StreamStart::Resume { offset, if_range } => (offset, Some(if_range)),
+        StreamStart::Fresh { discarded } => {
+            if let Some(reason) = discarded {
+                sink.note(&format!("Restarting from zero: {}", reason));
             }
-        };
+            (0, None)
+        }
+    };
 
     // Phase 1: Build and send (possibly ranged, possibly conditional) request
     //
@@ -413,11 +414,21 @@ pub(super) async fn download_streaming(
     // into its own error Display, `context` keeps that error in the chain, and
     // `{:#}` prints the chain. The URL is the fetch URL, which is where the
     // gdrive `key=` and every signed parameter live.
-    let resp = build_streaming_request(client, url, existing_bytes, if_range.as_deref())
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)
-        .context("GET request failed")?;
+    // A 200 response means the server ignored the initial range and sent the
+    // whole representation. It is already the fresh body the streaming path
+    // would request, including when a prior partial file must restart. A 206
+    // response starts at zero and cannot serve a nonzero resume offset.
+    let initial_is_full = initial_response
+        .as_ref()
+        .is_some_and(|response| response.status() == reqwest::StatusCode::OK);
+    let resp = match initial_response.filter(|_| initial_is_full) {
+        Some(response) => response,
+        None => build_streaming_request(client, url, existing_bytes, if_range.as_deref())
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("GET request failed")?,
+    };
 
     let status = resp.status();
     let content_range = resp
@@ -440,7 +451,9 @@ pub(super) async fn download_streaming(
             // that answers anyway does not get to decide.
             ResumeAction::Resume(_) => {
                 drop(resp);
-                sink.note("Server answered with a different version of the file, restarting from zero");
+                sink.note(
+                    "Server answered with a different version of the file, restarting from zero",
+                );
                 let fresh_resp = client
                     .get(url)
                     .send()
@@ -459,30 +472,38 @@ pub(super) async fn download_streaming(
                 (0u64, false, fresh_resp)
             }
             ResumeAction::Restart => {
-                // Drop the unusable response and issue a fresh non-range GET
-                drop(resp);
-                if existing_bytes > 0 {
-                    sink.note("Server response unusable for resume, restarting from zero");
-                }
-                let fresh_resp = client
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(reqwest::Error::without_url)
-                    .context("Fresh GET request failed")?;
+                if initial_is_full {
+                    if existing_bytes > 0 {
+                        sink.note("Server response unusable for resume, restarting from zero");
+                    }
+                    validate_whole_body(&resp)?;
+                    (0u64, false, resp)
+                } else {
+                    // Drop the unusable response and issue a fresh non-range GET.
+                    drop(resp);
+                    if existing_bytes > 0 {
+                        sink.note("Server response unusable for resume, restarting from zero");
+                    }
+                    let fresh_resp = client
+                        .get(url)
+                        .send()
+                        .await
+                        .map_err(reqwest::Error::without_url)
+                        .context("Fresh GET request failed")?;
 
-                if !fresh_resp.status().is_success() {
-                    anyhow::bail!(
-                        "Restart request failed with status {} {}",
-                        fresh_resp.status().as_u16(),
-                        fresh_resp.status().canonical_reason().unwrap_or("Unknown"),
-                    );
+                    if !fresh_resp.status().is_success() {
+                        anyhow::bail!(
+                            "Restart request failed with status {} {}",
+                            fresh_resp.status().as_u16(),
+                            fresh_resp.status().canonical_reason().unwrap_or("Unknown"),
+                        );
+                    }
+                    // The restart was triggered by a server that answered the
+                    // ranged request badly. Accepting whatever it sends next
+                    // without looking hands the same trick a second chance.
+                    validate_whole_body(&fresh_resp)?;
+                    (0u64, false, fresh_resp)
                 }
-                // The restart was triggered by a server that answered the
-                // ranged request badly. Accepting whatever it sends next
-                // without looking hands the same trick a second chance.
-                validate_whole_body(&fresh_resp)?;
-                (0u64, false, fresh_resp)
             }
             ResumeAction::Fresh => {
                 // No `.part`, so no Range header was sent -- which makes a 206
@@ -975,9 +996,7 @@ mod tests {
     fn a_partial_file_with_no_manifest_is_never_appended_to() {
         assert!(matches!(
             plan_streaming_resume(4096, None, &identity(Some("\"v1\""), None)),
-            StreamStart::Fresh {
-                discarded: Some(_)
-            }
+            StreamStart::Fresh { discarded: Some(_) }
         ));
     }
 
@@ -1000,9 +1019,7 @@ mod tests {
         let saved = streaming_manifest(Some("\"v1\""), None);
         assert!(matches!(
             plan_streaming_resume(4096, Some(&saved), &identity(Some("\"v2\""), None)),
-            StreamStart::Fresh {
-                discarded: Some(_)
-            }
+            StreamStart::Fresh { discarded: Some(_) }
         ));
     }
 
@@ -1013,17 +1030,13 @@ mod tests {
         let saved = streaming_manifest(Some("\"v1\""), None);
         assert!(matches!(
             plan_streaming_resume(4096, Some(&saved), &identity(None, None)),
-            StreamStart::Fresh {
-                discarded: Some(_)
-            }
+            StreamStart::Fresh { discarded: Some(_) }
         ));
 
         let no_validator = streaming_manifest(None, None);
         assert!(matches!(
             plan_streaming_resume(4096, Some(&no_validator), &identity(Some("\"v1\""), None)),
-            StreamStart::Fresh {
-                discarded: Some(_)
-            }
+            StreamStart::Fresh { discarded: Some(_) }
         ));
     }
 
@@ -1037,9 +1050,7 @@ mod tests {
         );
         assert!(matches!(
             plan_streaming_resume(4096, Some(&saved), &identity(Some("\"v1\""), None)),
-            StreamStart::Fresh {
-                discarded: Some(_)
-            }
+            StreamStart::Fresh { discarded: Some(_) }
         ));
     }
 
@@ -1052,9 +1063,7 @@ mod tests {
         saved.transfer = TransferKind::Segmented;
         assert!(matches!(
             plan_streaming_resume(4096, Some(&saved), &identity(Some("\"v1\""), None)),
-            StreamStart::Fresh {
-                discarded: Some(_)
-            }
+            StreamStart::Fresh { discarded: Some(_) }
         ));
     }
 
@@ -1064,7 +1073,8 @@ mod tests {
     fn a_206_that_carries_another_version_is_not_a_continuation() {
         fn response(etag: Option<&'static str>) -> reqwest::Response {
             use axum::http;
-            let mut builder = http::Response::builder().status(reqwest::StatusCode::PARTIAL_CONTENT);
+            let mut builder =
+                http::Response::builder().status(reqwest::StatusCode::PARTIAL_CONTENT);
             if let Some(etag) = etag {
                 builder = builder.header("etag", etag);
             }
@@ -1072,14 +1082,20 @@ mod tests {
         }
 
         let expected = Some("\"v1\"".to_owned());
-        assert!(body_continues_the_same_file(&response(Some("\"v1\"")), &expected));
+        assert!(body_continues_the_same_file(
+            &response(Some("\"v1\"")),
+            &expected
+        ));
         assert!(!body_continues_the_same_file(
             &response(Some("\"v2\"")),
             &expected
         ));
         // Nothing to compare against is not a pass.
         assert!(!body_continues_the_same_file(&response(None), &expected));
-        assert!(!body_continues_the_same_file(&response(Some("\"v1\"")), &None));
+        assert!(!body_continues_the_same_file(
+            &response(Some("\"v1\"")),
+            &None
+        ));
     }
 
     // ---------- End to end ----------
@@ -1157,6 +1173,7 @@ mod tests {
             },
             CancellationToken::new(),
             crate::ui::silent(),
+            None,
         )
         .await
         .expect("the download itself should succeed, from zero");
@@ -1239,6 +1256,7 @@ mod tests {
             },
             CancellationToken::new(),
             crate::ui::silent(),
+            None,
         )
         .await
         .expect("an unchanged file should resume");

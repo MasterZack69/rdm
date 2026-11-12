@@ -82,15 +82,35 @@ pub async fn inspect_url(client: &Client, url: &str) -> Result<FileInfo> {
         .await
         .map_err(reqwest::Error::without_url)
         .context("Request failed \u{2014} check the URL and your network connection")?;
-    inspect_response(client, url, resp).await
+    inspect_response(client, url, &resp).await
 }
 
-/// Parse a response from the same one-byte GET used by `inspect_url`.
-/// This lets callers reuse a response obtained while safely resolving redirects.
+/// Inspects a download while retaining the ranged response when its body is
+/// useful to the transfer. This saves the first response's bytes instead of
+/// discarding them and issuing another request for byte zero.
+pub(crate) async fn inspect_download_url(
+    client: &Client,
+    url: &str,
+) -> Result<(FileInfo, Option<reqwest::Response>)> {
+    let range = format!("bytes=0-{}", crate::net::DOWNLOAD_PROBE_BYTES - 1);
+    let resp = client
+        .get(url)
+        .header(header::RANGE, range)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("Request failed \u{2014} check the URL and your network connection")?;
+
+    let retain = matches!(resp.status(), StatusCode::OK | StatusCode::PARTIAL_CONTENT);
+    let info = inspect_response(client, url, &resp).await?;
+    Ok((info, retain.then_some(resp)))
+}
+
+/// Parse a ranged response from a caller that may retain it for the transfer.
 pub(crate) async fn inspect_response(
     client: &Client,
     url: &str,
-    resp: reqwest::Response,
+    resp: &reqwest::Response,
 ) -> Result<FileInfo> {
     let status = resp.status();
     let suggested_filename = filename_from_content_disposition(resp.headers());
@@ -98,8 +118,9 @@ pub(crate) async fn inspect_response(
     let last_modified = extract_last_modified(resp.headers());
 
     if status == StatusCode::PARTIAL_CONTENT {
-        let size = extract_size_from_content_range(resp.headers())
-            .or_else(|| extract_content_length(resp.headers()));
+        // Content-Length on a partial response is only the length of the
+        // returned range. It is not the size of the whole file.
+        let size = extract_size_from_content_range(resp.headers());
         return Ok(FileInfo {
             size,
             supports_range: true,
@@ -167,6 +188,22 @@ pub(crate) async fn inspect_response(
         etag: head_etag,
         last_modified: head_last_modified,
     })
+}
+
+/// The byte interval returned by a successful initial range response.
+pub(crate) fn initial_range(resp: &reqwest::Response) -> Option<(u64, u64)> {
+    let value = resp
+        .headers()
+        .get(header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    let total: u64 = total.parse().ok()?;
+    (start == 0 && end < total).then_some((start, end))
 }
 
 /// The stated body length, including a stated length of zero.

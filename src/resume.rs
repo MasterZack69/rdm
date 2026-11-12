@@ -256,8 +256,9 @@ pub async fn save_atomic(path: &str, meta: &ResumeMetadata) -> Result<()> {
 
     let (dir, prefix) = temp_home(path);
 
-    let (temp_file, tmp_path) = safe_file::create_temp_in(&dir, &prefix, safe_file::PRIVATE_FILE_MODE)
-        .with_context(|| format!("Failed to create temp file beside: {}", path))?;
+    let (temp_file, tmp_path) =
+        safe_file::create_temp_in(&dir, &prefix, safe_file::PRIVATE_FILE_MODE)
+            .with_context(|| format!("Failed to create temp file beside: {}", path))?;
 
     let write_result = async {
         let mut file = fs::File::from_std(temp_file);
@@ -306,8 +307,9 @@ pub async fn save_best_effort(path: &str, meta: &ResumeMetadata) -> Result<()> {
 
     let (dir, prefix) = temp_home(path);
 
-    let (temp_file, tmp_path) = safe_file::create_temp_in(&dir, &prefix, safe_file::PRIVATE_FILE_MODE)
-        .with_context(|| format!("Failed to create temp file beside: {}", path))?;
+    let (temp_file, tmp_path) =
+        safe_file::create_temp_in(&dir, &prefix, safe_file::PRIVATE_FILE_MODE)
+            .with_context(|| format!("Failed to create temp file beside: {}", path))?;
 
     let mut file = fs::File::from_std(temp_file);
 
@@ -321,7 +323,8 @@ pub async fn save_best_effort(path: &str, meta: &ResumeMetadata) -> Result<()> {
     // two is the payload `fsync`, not how the name is handed over.
     let written = file.into_std().await;
 
-    if let Err(e) = safe_file::publish_open_file(&written, &tmp_path, std::path::Path::new(path), true)
+    if let Err(e) =
+        safe_file::publish_open_file(&written, &tmp_path, std::path::Path::new(path), true)
     {
         let _ = fs::remove_file(&tmp_path).await;
         return Err(e);
@@ -386,6 +389,89 @@ pub fn validate_against(
             && state.end == chunk.end
             && state.completed <= state.total_bytes()
     })
+}
+
+/// Changes the persisted range layout without discarding trustworthy progress.
+/// Each old chunk records a completed prefix, so progress can be projected onto
+/// a new contiguous layout by preserving only the completed prefix of each new
+/// range. A gap in the old completed bytes stops that new prefix.
+pub fn repartition(meta: &ResumeMetadata, chunks: &[Chunk]) -> Option<ResumeMetadata> {
+    if meta.transfer != TransferKind::Segmented
+        || !valid_layout(meta.file_size, &meta.chunks)
+        || !valid_chunks(meta.file_size, chunks)
+    {
+        return None;
+    }
+
+    let mut next = meta.clone();
+    next.chunks = chunks
+        .iter()
+        .map(|chunk| {
+            let end_exclusive = chunk.end + 1;
+            let mut cursor = chunk.start;
+
+            for saved in &meta.chunks {
+                let saved_end = saved.start + saved.completed;
+                if saved_end <= cursor {
+                    continue;
+                }
+                if saved.start > cursor {
+                    break;
+                }
+                cursor = saved_end.min(end_exclusive);
+                if cursor == end_exclusive {
+                    break;
+                }
+            }
+
+            ChunkState {
+                id: chunk.id,
+                start: chunk.start,
+                end: chunk.end,
+                completed: cursor - chunk.start,
+            }
+        })
+        .collect();
+    Some(next)
+}
+
+fn valid_layout(file_size: u64, chunks: &[ChunkState]) -> bool {
+    if file_size == 0 || chunks.is_empty() {
+        return false;
+    }
+
+    let mut expected_start = 0;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.id != index as u32 + 1
+            || chunk.start != expected_start
+            || chunk.end < chunk.start
+            || chunk.end >= file_size
+            || chunk.completed > chunk.total_bytes()
+        {
+            return false;
+        }
+        expected_start = chunk.end + 1;
+    }
+    expected_start == file_size
+}
+
+fn valid_chunks(file_size: u64, chunks: &[Chunk]) -> bool {
+    if file_size == 0 || chunks.is_empty() {
+        return false;
+    }
+
+    let mut expected_start = 0;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.id != index as u32 + 1
+            || chunk.start != expected_start
+            || chunk.end < chunk.start
+            || chunk.end >= file_size
+        {
+            return false;
+        }
+        expected_start = chunk.end + 1;
+    }
+    expected_start == file_size
 }
 
 #[cfg(test)]
@@ -686,7 +772,11 @@ mod tests {
     // ---------- Validator continuity ----------
 
     fn with_validators(etag: Option<&str>, last_modified: Option<&str>) -> ResumeMetadata {
-        let mut meta = create_new("https://example.com/file.bin".into(), 2000, &sample_chunks());
+        let mut meta = create_new(
+            "https://example.com/file.bin".into(),
+            2000,
+            &sample_chunks(),
+        );
         meta.etag = etag.map(str::to_owned);
         meta.last_modified = last_modified.map(str::to_owned);
         meta

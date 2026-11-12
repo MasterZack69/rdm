@@ -36,6 +36,11 @@ pub const MAX_REDIRECTS: usize = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The first range is useful download data as well as a check that the server
+/// supports byte ranges. Keeping it small limits the work before the size and
+/// output path are known, while avoiding a separate one-byte request.
+pub const DOWNLOAD_PROBE_BYTES: u64 = 64 * 1024;
+
 /// A destination whose every hop has been resolved and judged, and the client
 /// that is permitted to talk to it.
 #[derive(Clone)]
@@ -66,7 +71,9 @@ impl std::fmt::Debug for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Redacted, because `{:?}` on a struct holding this ends up in error
         // reports and log lines like anything else.
-        f.debug_struct("Target").field("url", &self.display_url()).finish_non_exhaustive()
+        f.debug_struct("Target")
+            .field("url", &self.display_url())
+            .finish_non_exhaustive()
     }
 }
 
@@ -96,6 +103,17 @@ impl Policy {
     /// wants headers — sync's verification pass — reads them from this instead
     /// of asking twice.
     pub async fn probe(&self, url: &str) -> Result<(Target, reqwest::Response)> {
+        self.probe_range(url, 0).await
+    }
+
+    /// Probes a download with a small range whose response can also supply the
+    /// first bytes of the transfer. The usual one-byte probe made every fresh
+    /// download wait for another request before transferring useful data.
+    pub async fn probe_download(&self, url: &str) -> Result<(Target, reqwest::Response)> {
+        self.probe_range(url, DOWNLOAD_PROBE_BYTES - 1).await
+    }
+
+    async fn probe_range(&self, url: &str, range_end: u64) -> Result<(Target, reqwest::Response)> {
         let mut current = parse_and_validate_url(url, self.allow_private)?;
         let mut hops = 0usize;
 
@@ -105,18 +123,24 @@ impl Policy {
             let addrs = self.guard.resolve(&current).await?;
             let client = self.client_for(&current, &addrs)?;
 
-            // The same one-byte ranged GET the download itself opens with, so a
-            // server that redirects only for real range requests is followed
-            // here as well.
-            let response = client
-                .get(current.clone())
-                .header(header::RANGE, "bytes=0-0")
-                .timeout(PROBE_TIMEOUT)
-                .send()
-                .await
-                // Redacted: a failure to reach a signed CDN URL would
-                // otherwise print the signature, and this error is displayed.
-                .with_context(|| format!("Failed to reach {}", secret_url::redact(current.as_str())))?;
+            // A ranged GET, including for servers that redirect only on range
+            // requests.
+            // Bound time to response headers, not the body: a download probe's
+            // body is consumed by the transfer and can legitimately take hours.
+            let range = format!("bytes=0-{range_end}");
+            let response = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                client
+                    .get(current.clone())
+                    .header(header::RANGE, range)
+                    .send(),
+            )
+            .await
+            .context("Timed out waiting for the server response")?
+            // Redacted: a failure to reach a signed CDN URL would
+            // otherwise print the signature, and this error is displayed.
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("Failed to reach {}", secret_url::redact(current.as_str())))?;
 
             let Some(location) = redirect_location(&response) else {
                 return Ok((
@@ -139,15 +163,12 @@ impl Policy {
             // The policy below answers a hop off the authority with `stop`, so
             // this redirect was not followed and `response.url()` is the hop
             // that answered it.
-            let mut next = response
-                .url()
-                .join(&location)
-                .with_context(|| {
-                    format!(
-                        "Unparseable redirect from {}",
-                        secret_url::redact(response.url().as_str())
-                    )
-                })?;
+            let mut next = response.url().join(&location).with_context(|| {
+                format!(
+                    "Unparseable redirect from {}",
+                    secret_url::redact(response.url().as_str())
+                )
+            })?;
             next.set_fragment(None);
 
             match next.scheme() {
@@ -276,7 +297,12 @@ pub fn probed_size(response: &reqwest::Response) -> Option<u64> {
     }
 
     if status.is_success() {
-        return headers.get(header::CONTENT_LENGTH)?.to_str().ok()?.parse().ok();
+        return headers
+            .get(header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok();
     }
 
     None
@@ -381,7 +407,11 @@ mod tests {
             .expect("the first answer is honest");
 
         let response = target.client.get(target.url.clone()).send().await.unwrap();
-        assert_eq!(response.status().as_u16(), 307, "the hop must not be followed");
+        assert_eq!(
+            response.status().as_u16(),
+            307,
+            "the hop must not be followed"
+        );
     }
 
     /// Pinning a name to judged addresses decides nothing if the connection is

@@ -38,6 +38,18 @@ pub async fn download_parallel<F>(
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
+    download_parallel_with_initial(ctx, ctx.chunks.len().max(1), None, progress_callback).await
+}
+
+pub(crate) async fn download_parallel_with_initial<F>(
+    ctx: &ParallelDownloadCtx<'_>,
+    max_workers: usize,
+    initial_response: Option<reqwest::Response>,
+    progress_callback: Option<F>,
+) -> Result<u64>
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
     if ctx.chunks.is_empty() {
         anyhow::bail!("No chunks provided for parallel download");
     }
@@ -51,7 +63,16 @@ where
     // that decision, and the rename below will not take it.
     let destination_existed = fs::symlink_metadata(ctx.output_path).await.is_ok();
 
-    match parallel_inner(ctx, &temp_path, &meta_path, progress_callback).await {
+    match parallel_inner(
+        ctx,
+        &temp_path,
+        &meta_path,
+        max_workers,
+        initial_response,
+        progress_callback,
+    )
+    .await
+    {
         Ok(total) => {
             resume::delete(&meta_path).await?;
             let temp = Path::new(&temp_path);
@@ -90,6 +111,8 @@ async fn parallel_inner<F>(
     ctx: &ParallelDownloadCtx<'_>,
     temp_path: &str,
     meta_path: &str,
+    max_workers: usize,
+    initial_response: Option<reqwest::Response>,
     progress_callback: Option<F>,
 ) -> Result<u64>
 where
@@ -115,8 +138,6 @@ where
 
     let shared_meta = Arc::new(Mutex::new(meta));
 
-    let mut queue: VecDeque<Chunk> = chunks.iter().cloned().collect();
-
     let chunk_counters: Vec<(u32, Arc<AtomicU64>)> = {
         let meta_guard = shared_meta.lock().await;
         chunks
@@ -138,9 +159,22 @@ where
         .map(|(_, c)| c.load(Ordering::Relaxed))
         .sum();
 
+    let mut queue: VecDeque<Chunk> = chunks
+        .iter()
+        .filter(|chunk| {
+            let completed = chunk_counters
+                .iter()
+                .find(|(id, _)| *id == chunk.id)
+                .map(|(_, progress)| progress.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            completed < chunk.end - chunk.start + 1
+        })
+        .cloned()
+        .collect();
+
     // One view of how the server is coping, shared by every worker and by
     // the loop that hands out ranges.
-    let pressure = Arc::new(PressureController::new(chunks.len().max(1)));
+    let pressure = Arc::new(PressureController::new(max_workers.max(1)));
     let background_stop = CancellationToken::new();
     // If the caller drops this future, do not leave the background loops alive.
     let _stop_on_drop = background_stop.clone().drop_guard();
@@ -164,8 +198,56 @@ where
 
     let mut join_set: JoinSet<Result<u64>> = JoinSet::new();
     let mut total_bytes: u64 = initial_completed;
+    let mut initial_response = initial_response;
 
     let worker_result: Result<()> = async {
+        if let Some(response) = initial_response.take() {
+            let first = chunks
+                .first()
+                .context("Initial response has no assigned range")?;
+            let progress = chunk_counters
+                .iter()
+                .find(|(id, _)| *id == first.id)
+                .map(|(_, progress)| Arc::clone(progress))
+                .context("Initial response range has no progress counter")?;
+            let previous = progress.load(Ordering::Relaxed);
+            let first_len = first.end - first.start + 1;
+
+            // A fully completed first range is already on disk and belongs to
+            // the validated resume state. The probe response is then discarded
+            // without touching those bytes.
+            if previous < first_len {
+                // The retained response always starts at byte zero and covers
+                // this whole first work unit. Restart its counter while that
+                // body is written so a short response cannot leave stale
+                // progress claiming bytes beyond what was just verified.
+                progress.store(0, Ordering::Release);
+                match range_download::download_response(
+                    response,
+                    temp_path,
+                    first.start,
+                    first.end,
+                    0,
+                    Arc::clone(&progress),
+                    ctx.cancel.clone(),
+                )
+                .await?
+                {
+                    DownloadStatus::Complete { .. } => {
+                        total_bytes += first_len - previous;
+                        queue.retain(|chunk| chunk.id != first.id);
+                    }
+                    DownloadStatus::Cancelled { bytes_on_disk } => {
+                        anyhow::bail!(
+                            "Initial response cancelled after {} of {} bytes",
+                            bytes_on_disk,
+                            first_len
+                        );
+                    }
+                }
+            }
+        }
+
         while !queue.is_empty() || !join_set.is_empty() {
             // A server that asked for a pause gets one before any further range
             // is assigned. With nothing in flight there is nothing else to wait
@@ -287,6 +369,23 @@ async fn load_or_create_metadata(
                 existing.chunks.len()
             );
             return Ok(existing);
+        }
+
+        // A newer range plan may have more work units than the saved one.
+        // When the source and its validator still match, translate each
+        // completed prefix into the new layout instead of throwing away a
+        // resumable partial file because its chunk boundaries changed.
+        if identity_check == IdentityCheck::Match
+            && existing.describes_same_source(url, identity.as_deref())
+            && existing.file_size == file_size
+            && let Some(repartitioned) = resume::repartition(&existing, chunks)
+        {
+            resume::save_atomic(meta_path, &repartitioned).await?;
+            eprintln!(
+                "  [Resume] Preserved progress while updating the range layout ({} chunks)",
+                repartitioned.chunks.len()
+            );
+            return Ok(repartitioned);
         }
 
         match identity_check {
