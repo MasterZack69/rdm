@@ -376,7 +376,7 @@ async fn load_or_create_metadata(
         // completed prefix into the new layout instead of throwing away a
         // resumable partial file because its chunk boundaries changed.
         if identity_check == IdentityCheck::Match
-            && existing.describes_same_source(url, identity.as_deref())
+            && existing.describes_same_source(url, identity)
             && existing.file_size == file_size
             && let Some(repartitioned) = resume::repartition(&existing, chunks)
         {
