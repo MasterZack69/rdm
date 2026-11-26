@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio_util::sync::CancellationToken;
 
+use crate::dynamic_range::RangeLimit;
 use crate::retry::{TransientError, is_transient_status};
 use crate::safe_file::{self, Access, Existing};
 
@@ -35,6 +36,58 @@ pub async fn download_range(
     resume_from: u64,
     chunk_progress: Arc<AtomicU64>,
     cancel: CancellationToken,
+) -> Result<DownloadStatus> {
+    download_range_inner(
+        client,
+        url,
+        file_path,
+        start,
+        end,
+        resume_from,
+        chunk_progress,
+        cancel,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn download_range_dynamic(
+    client: &Client,
+    url: &str,
+    file_path: &str,
+    start: u64,
+    end: u64,
+    resume_from: u64,
+    chunk_progress: Arc<AtomicU64>,
+    cancel: CancellationToken,
+    limit: Arc<RangeLimit>,
+) -> Result<DownloadStatus> {
+    download_range_inner(
+        client,
+        url,
+        file_path,
+        start,
+        end,
+        resume_from,
+        chunk_progress,
+        cancel,
+        Some(limit),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_range_inner(
+    client: &Client,
+    url: &str,
+    file_path: &str,
+    start: u64,
+    end: u64,
+    resume_from: u64,
+    chunk_progress: Arc<AtomicU64>,
+    cancel: CancellationToken,
+    limit: Option<Arc<RangeLimit>>,
 ) -> Result<DownloadStatus> {
     if end < start {
         anyhow::bail!("Invalid byte range: start ({}) > end ({})", start, end);
@@ -75,7 +128,7 @@ pub async fn download_range(
         }
     };
 
-    download_response(
+    download_response_inner(
         response,
         file_path,
         start,
@@ -83,6 +136,7 @@ pub async fn download_range(
         resume_from,
         chunk_progress,
         cancel,
+        limit,
     )
     .await
 }
@@ -98,6 +152,30 @@ pub async fn download_response(
     resume_from: u64,
     chunk_progress: Arc<AtomicU64>,
     cancel: CancellationToken,
+) -> Result<DownloadStatus> {
+    download_response_inner(
+        response,
+        file_path,
+        start,
+        end,
+        resume_from,
+        chunk_progress,
+        cancel,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_response_inner(
+    response: reqwest::Response,
+    file_path: &str,
+    start: u64,
+    end: u64,
+    resume_from: u64,
+    chunk_progress: Arc<AtomicU64>,
+    cancel: CancellationToken,
+    limit: Option<Arc<RangeLimit>>,
 ) -> Result<DownloadStatus> {
     if end < start {
         anyhow::bail!("Invalid byte range: start ({}) > end ({})", start, end);
@@ -174,16 +252,25 @@ pub async fn download_response(
     let mut stream = response.bytes_stream();
     let mut bytes_written: u64 = 0;
     let mut bytes_since_flush: u64 = 0;
+    let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    flush_tick.tick().await;
 
     loop {
         let chunk = tokio::select! {
             c = stream.next() => c,
             _ = cancel.cancelled() => {
-                file.flush().await.ok();
+                file.flush().await.context("Failed to flush cancelled range")?;
                 chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
                 return Ok(DownloadStatus::Cancelled {
                     bytes_on_disk: resume_from + bytes_written,
                 });
+            }
+            _ = flush_tick.tick(), if bytes_since_flush > 0 => {
+                file.flush().await.context("Periodic range flush failed")?;
+                chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
+                bytes_since_flush = 0;
+                continue;
             }
         };
 
@@ -192,7 +279,9 @@ pub async fn download_response(
                 let data_len: u64 = data.len() as u64;
 
                 if bytes_written + data_len > expected_len {
-                    file.flush().await.ok();
+                    file.flush()
+                        .await
+                        .context("Failed to flush valid response prefix")?;
                     chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
                     drop(stream);
                     anyhow::bail!(
@@ -203,7 +292,10 @@ pub async fn download_response(
                     );
                 }
 
-                file.write_all(&data).await.with_context(|| {
+                let granted = limit.as_ref().map_or(data.len(), |limit| {
+                    limit.claim(effective_start + bytes_written, data.len())
+                });
+                file.write_all(&data[..granted]).await.with_context(|| {
                     format!(
                         "Write failed at offset {} in {}",
                         effective_start + bytes_written,
@@ -211,8 +303,8 @@ pub async fn download_response(
                     )
                 })?;
 
-                bytes_written += data_len;
-                bytes_since_flush += data_len;
+                bytes_written += granted as u64;
+                bytes_since_flush += granted as u64;
 
                 if bytes_since_flush >= 16 * 1024 * 1024 {
                     file.flush().await.with_context(|| {
@@ -221,13 +313,25 @@ pub async fn download_response(
                             effective_start + bytes_written
                         )
                     })?;
+                    chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
                     bytes_since_flush = 0;
                 }
 
-                chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
+                // The response was requested before a tail was split away.
+                // Stop at the new boundary and discard the rest of the body.
+                if limit.as_ref().is_some_and(|limit| {
+                    let current_end = limit.end();
+                    current_end < end && effective_start + bytes_written > current_end
+                }) {
+                    file.flush().await.context("Failed to flush split range")?;
+                    chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
+                    return Ok(DownloadStatus::Complete { bytes_written });
+                }
             }
             Some(Err(e)) => {
-                file.flush().await.ok();
+                file.flush()
+                    .await
+                    .context("Failed to flush interrupted range")?;
                 chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
                 // The stream error names the URL as well.
                 return Err(e.without_url()).context(format!(
@@ -243,8 +347,8 @@ pub async fn download_response(
         .await
         .context("Failed to flush file after range write")?;
 
+    chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
     if bytes_written != expected_len {
-        chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
         anyhow::bail!(
             "Truncated range {}: expected {} bytes, wrote {}",
             range_value,

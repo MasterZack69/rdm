@@ -10,6 +10,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::chunk::Chunk;
+use crate::dynamic_range::RangeLimit;
 use crate::pressure::PressureController;
 use crate::range_download::{self, DownloadStatus};
 use crate::resume::{self, IdentityCheck, ResumeMetadata};
@@ -38,13 +39,21 @@ pub async fn download_parallel<F>(
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
-    download_parallel_with_initial(ctx, ctx.chunks.len().max(1), None, progress_callback).await
+    download_parallel_with_initial(
+        ctx,
+        ctx.chunks.len().max(1),
+        None,
+        ctx.chunks.len() > 1,
+        progress_callback,
+    )
+    .await
 }
 
 pub(crate) async fn download_parallel_with_initial<F>(
     ctx: &ParallelDownloadCtx<'_>,
     max_workers: usize,
     initial_response: Option<reqwest::Response>,
+    allow_split: bool,
     progress_callback: Option<F>,
 ) -> Result<u64>
 where
@@ -69,6 +78,7 @@ where
         &meta_path,
         max_workers,
         initial_response,
+        allow_split,
         progress_callback,
     )
     .await
@@ -113,6 +123,7 @@ async fn parallel_inner<F>(
     meta_path: &str,
     max_workers: usize,
     initial_response: Option<reqwest::Response>,
+    allow_split: bool,
     progress_callback: Option<F>,
 ) -> Result<u64>
 where
@@ -136,42 +147,15 @@ where
 
     ensure_file_allocated(temp_path, ctx.file_size, &chunks, &meta).await?;
 
-    let shared_meta = Arc::new(Mutex::new(meta));
-
-    let chunk_counters: Vec<(u32, Arc<AtomicU64>)> = {
-        let meta_guard = shared_meta.lock().await;
-        chunks
-            .iter()
-            .map(|c| {
-                let completed = meta_guard
-                    .chunks
-                    .iter()
-                    .find(|s| s.id == c.id)
-                    .map(|s| s.completed)
-                    .unwrap_or(0);
-                (c.id, Arc::new(AtomicU64::new(completed)))
-            })
-            .collect()
-    };
-
-    let initial_completed: u64 = chunk_counters
-        .iter()
-        .map(|(_, c)| c.load(Ordering::Relaxed))
-        .sum();
-
     let mut queue: VecDeque<Chunk> = chunks
         .iter()
         .filter(|chunk| {
-            let completed = chunk_counters
-                .iter()
-                .find(|(id, _)| *id == chunk.id)
-                .map(|(_, progress)| progress.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            completed < chunk.end - chunk.start + 1
+            let state = meta.chunks.iter().find(|s| s.id == chunk.id).unwrap();
+            state.completed < state.total_bytes()
         })
         .cloned()
         .collect();
-
+    let shared = Arc::new(Mutex::new(DynamicState::new(meta)));
     // One view of how the server is coping, shared by every worker and by
     // the loop that hands out ranges.
     let pressure = Arc::new(PressureController::new(max_workers.max(1)));
@@ -179,25 +163,19 @@ where
     // If the caller drops this future, do not leave the background loops alive.
     let _stop_on_drop = background_stop.clone().drop_guard();
 
-    let autosave_handle = spawn_autosave(
+    let autosave_handle = spawn_dynamic_autosave(
         meta_path.to_owned(),
-        Arc::clone(&shared_meta),
-        chunk_counters
-            .iter()
-            .map(|(id, c)| (*id, Arc::clone(c)))
-            .collect(),
+        Arc::clone(&shared),
         background_stop.clone(),
     );
-
-    let monitor_handle = spawn_progress_monitor(
+    let monitor_handle = spawn_dynamic_monitor(
         progress_callback,
-        chunk_counters.clone(),
+        Arc::clone(&shared),
         background_stop.clone(),
         ctx.file_size,
     );
-
-    let mut join_set: JoinSet<Result<u64>> = JoinSet::new();
-    let mut total_bytes: u64 = initial_completed;
+    let mut join_set: JoinSet<Result<(u32, u64)>> = JoinSet::new();
+    let mut active = std::collections::HashSet::new();
     let mut initial_response = initial_response;
 
     let worker_result: Result<()> = async {
@@ -205,18 +183,23 @@ where
             let first = chunks
                 .first()
                 .context("Initial response has no assigned range")?;
-            let progress = chunk_counters
-                .iter()
-                .find(|(id, _)| *id == first.id)
-                .map(|(_, progress)| Arc::clone(progress))
+            let progress = shared
+                .lock()
+                .await
+                .progress(first.id)
                 .context("Initial response range has no progress counter")?;
+            let matches_saved = if response.status() == reqwest::StatusCode::OK {
+                first.start == 0 && first.end == ctx.file_size - 1
+            } else {
+                crate::inspect::initial_range(&response) == Some((first.start, first.end))
+            };
             let previous = progress.load(Ordering::Relaxed);
             let first_len = first.end - first.start + 1;
 
             // A fully completed first range is already on disk and belongs to
             // the validated resume state. The probe response is then discarded
             // without touching those bytes.
-            if previous < first_len {
+            if matches_saved && previous < first_len {
                 // The retained response always starts at byte zero and covers
                 // this whole first work unit. Restart its counter while that
                 // body is written so a short response cannot leave stale
@@ -234,7 +217,6 @@ where
                 .await?
                 {
                     DownloadStatus::Complete { .. } => {
-                        total_bytes += first_len - previous;
                         queue.retain(|chunk| chunk.id != first.id);
                     }
                     DownloadStatus::Cancelled { bytes_on_disk } => {
@@ -268,24 +250,35 @@ where
             // while these workers were running.
             let active_workers = pressure.limit();
 
-            while join_set.len() < active_workers && !queue.is_empty() && !pressure.is_paused() {
-                let chunk = queue.pop_front().unwrap();
+            while join_set.len() < active_workers && !pressure.is_paused() {
+                // Assign saved/unstarted ranges first. Once they are gone,
+                // every idle slot may split the largest in-flight tail.
+                if queue.is_empty()
+                    && allow_split
+                    && let Some(tail) = shared.lock().await.split_largest(&active, 1024 * 1024)
+                {
+                    queue.push_back(tail);
+                }
+                let Some(chunk) = queue.pop_front() else {
+                    break;
+                };
 
                 let client = ctx.client.clone();
                 let url = ctx.fetch_url.to_owned();
                 let path = temp_path.to_owned();
                 let cancel = ctx.cancel.clone();
                 let config = ctx.retry_config.clone();
-                let chunk_progress = chunk_counters
-                    .iter()
-                    .find(|(id, _)| *id == chunk.id)
-                    .unwrap()
-                    .1
-                    .clone();
+                let (chunk_progress, limit) = shared
+                    .lock()
+                    .await
+                    .entry(chunk.id)
+                    .context("Missing chunk state")?;
+                active.insert(chunk.id);
 
                 let pressure = Arc::clone(&pressure);
 
                 join_set.spawn(async move {
+                    let id = chunk.id;
                     download_chunk_with_retry(
                         &client,
                         &url,
@@ -295,8 +288,10 @@ where
                         chunk_progress,
                         cancel,
                         &pressure,
+                        limit,
                     )
                     .await
+                    .map(|bytes| (id, bytes))
                 });
             }
 
@@ -306,7 +301,9 @@ where
             }
 
             match join_set.join_next().await {
-                Some(Ok(Ok(bytes))) => total_bytes += bytes,
+                Some(Ok(Ok((id, _bytes)))) => {
+                    active.remove(&id);
+                }
                 Some(Ok(Err(e))) => return Err(e),
                 Some(Err(e)) => return Err(anyhow::anyhow!("Worker panic: {}", e)),
                 None => break,
@@ -331,6 +328,7 @@ where
     // or the final failure snapshot is written.
     let _ = autosave_handle.await;
 
+    let total_bytes = shared.lock().await.snapshot().total_completed();
     let result = worker_result.and_then(|()| {
         if total_bytes != ctx.file_size {
             anyhow::bail!(
@@ -342,7 +340,7 @@ where
         Ok(total_bytes)
     });
     if result.is_err() {
-        save_progress(meta_path, &shared_meta, &chunk_counters).await;
+        save_dynamic_progress(meta_path, &shared).await;
     }
     result
 }
@@ -519,25 +517,95 @@ async fn ensure_file_allocated(
     Ok(())
 }
 
-async fn save_progress(
-    meta_path: &str,
-    shared_meta: &Mutex<ResumeMetadata>,
-    counters: &[(u32, Arc<AtomicU64>)],
-) {
-    let snapshot = {
-        let mut meta = shared_meta.lock().await;
-        for (id, counter) in counters {
-            resume::update_progress(&mut meta, *id, counter.load(Ordering::Relaxed));
+// All layout changes and snapshots share this lock. Workers reserve bytes on
+// their own limit before writing, and publish only flushed progress.
+struct TrackedRange {
+    id: u32,
+    progress: Arc<AtomicU64>,
+    limit: Arc<RangeLimit>,
+}
+struct DynamicState {
+    meta: ResumeMetadata,
+    entries: Vec<TrackedRange>,
+}
+impl DynamicState {
+    fn new(meta: ResumeMetadata) -> Self {
+        let entries = meta
+            .chunks
+            .iter()
+            .map(|c| TrackedRange {
+                id: c.id,
+                progress: Arc::new(AtomicU64::new(c.completed)),
+                limit: Arc::new(RangeLimit::new(c.end, c.start + c.completed)),
+            })
+            .collect();
+        Self { meta, entries }
+    }
+    fn entry(&self, id: u32) -> Option<(Arc<AtomicU64>, Arc<RangeLimit>)> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| (Arc::clone(&e.progress), Arc::clone(&e.limit)))
+    }
+    fn progress(&self, id: u32) -> Option<Arc<AtomicU64>> {
+        self.entry(id).map(|e| e.0)
+    }
+    fn snapshot(&self) -> ResumeMetadata {
+        let mut meta = self.meta.clone();
+        for (index, chunk) in meta.chunks.iter_mut().enumerate() {
+            chunk.completed = self
+                .progress(chunk.id)
+                .expect("chunk state")
+                .load(Ordering::SeqCst);
+            // Persistent layouts use consecutive IDs; runtime IDs stay stable.
+            chunk.id = index as u32 + 1;
         }
-        meta.clone()
-    };
-    let _ = resume::save_best_effort(meta_path, &snapshot).await;
+        meta
+    }
+    fn split_largest(
+        &mut self,
+        active: &std::collections::HashSet<u32>,
+        min_piece: u64,
+    ) -> Option<Chunk> {
+        // Bound manifest growth even for transfers which last a very long time.
+        if self.meta.chunks.len() >= 4096 {
+            return None;
+        }
+        let picked = self
+            .entries
+            .iter()
+            .filter(|e| active.contains(&e.id))
+            .max_by_key(|e| e.limit.remaining())?;
+        let parent_id = picked.id;
+        let id = self.entries.iter().map(|e| e.id).max()?.checked_add(1)?;
+        let index = self.meta.chunks.iter().position(|c| c.id == parent_id)?;
+        let (start, end) = picked.limit.split(min_piece)?;
+        self.meta.chunks[index].end = start - 1;
+        self.meta.chunks.insert(
+            index + 1,
+            resume::ChunkState {
+                id,
+                start,
+                end,
+                completed: 0,
+            },
+        );
+        self.entries.push(TrackedRange {
+            id,
+            progress: Arc::new(AtomicU64::new(0)),
+            limit: Arc::new(RangeLimit::new(end, start)),
+        });
+        Some(Chunk { id, start, end })
+    }
 }
 
-fn spawn_autosave(
-    meta_path: String,
-    shared_meta: Arc<Mutex<ResumeMetadata>>,
-    counters: Vec<(u32, Arc<AtomicU64>)>,
+async fn save_dynamic_progress(path: &str, shared: &Mutex<DynamicState>) {
+    let snapshot = shared.lock().await.snapshot();
+    let _ = resume::save_best_effort(path, &snapshot).await;
+}
+fn spawn_dynamic_autosave(
+    path: String,
+    shared: Arc<Mutex<DynamicState>>,
     stop: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -547,9 +615,36 @@ fn spawn_autosave(
                 _ = stop.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
-            save_progress(&meta_path, &shared_meta, &counters).await;
+            save_dynamic_progress(&path, &shared).await;
         }
     })
+}
+fn spawn_dynamic_monitor<F>(
+    callback: Option<F>,
+    shared: Arc<Mutex<DynamicState>>,
+    stop: CancellationToken,
+    total: u64,
+) -> Option<JoinHandle<()>>
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
+    let cb = callback?;
+    Some(tokio::spawn(async move {
+        loop {
+            if stop.is_cancelled() {
+                break;
+            }
+            let current = shared.lock().await.snapshot().total_completed();
+            cb(current, total);
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+        }
+        let current = shared.lock().await.snapshot().total_completed();
+        cb(current, total);
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -562,11 +657,12 @@ async fn download_chunk_with_retry(
     chunk_progress: Arc<AtomicU64>,
     cancel: CancellationToken,
     pressure: &PressureController,
+    limit: Arc<RangeLimit>,
 ) -> Result<u64> {
-    let full_chunk_size = chunk.end - chunk.start + 1;
     let initial_completed = chunk_progress.load(Ordering::SeqCst);
 
     for attempt in 0..=config.max_retries {
+        let full_chunk_size = limit.end() - chunk.start + 1;
         // A pause another worker was told about applies here too.
         pressure.wait_while_paused(&cancel).await;
 
@@ -583,18 +679,21 @@ async fn download_chunk_with_retry(
 
         let resume_from = chunk_progress.load(Ordering::SeqCst);
         if resume_from >= full_chunk_size {
-            return Ok(full_chunk_size - initial_completed);
+            return Ok(full_chunk_size.saturating_sub(initial_completed));
         }
 
-        match range_download::download_range(
+        limit.reset(chunk.start + resume_from);
+        let request_end = limit.end();
+        match range_download::download_range_dynamic(
             client,
             url,
             file_path,
             chunk.start,
-            chunk.end,
+            request_end,
             resume_from,
             Arc::clone(&chunk_progress),
             cancel.clone(),
+            Arc::clone(&limit),
         )
         .await
         {
@@ -605,7 +704,9 @@ async fn download_chunk_with_retry(
                         restored
                     );
                 }
-                return Ok(chunk_progress.load(Ordering::SeqCst) - initial_completed);
+                return Ok(chunk_progress
+                    .load(Ordering::SeqCst)
+                    .saturating_sub(initial_completed));
             }
 
             Ok(DownloadStatus::Cancelled { .. }) => {
@@ -691,6 +792,7 @@ async fn download_chunk_with_retry(
 
     cancel.cancel();
     let written = chunk_progress.load(Ordering::SeqCst);
+    let full_chunk_size = limit.end() - chunk.start + 1;
     anyhow::bail!(
         "Chunk #{}: exhausted {} retries ({}/{} bytes on disk)",
         chunk.id,
@@ -717,44 +819,301 @@ fn short_error(err: &anyhow::Error) -> String {
     }
 }
 
-fn spawn_progress_monitor<F>(
-    callback: Option<F>,
-    counters: Vec<(u32, Arc<AtomicU64>)>,
-    stop: CancellationToken,
-    total: u64,
-) -> Option<JoinHandle<()>>
-where
-    F: Fn(u64, u64) + Send + Sync + 'static,
-{
-    let cb = callback?;
-    Some(tokio::spawn(async move {
-        loop {
-            if stop.is_cancelled() {
-                break;
-            }
-            let current: u64 = counters
-                .iter()
-                .map(|(_, c)| c.load(Ordering::Relaxed))
-                .sum();
-            cb(current, total);
-            tokio::select! {
-                biased;
-                _ = stop.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
-            }
-        }
-        let current: u64 = counters
-            .iter()
-            .map(|(_, c)| c.load(Ordering::Relaxed))
-            .sum();
-        cb(current, total);
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    const DYNAMIC_SIZE: usize = 8 * 1024 * 1024;
+    async fn skewed_server(
+        mode: Arc<std::sync::atomic::AtomicUsize>,
+        split_seen: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        payload: Arc<Vec<u8>>,
+    ) -> String {
+        use axum::{
+            Router,
+            body::{Body, Bytes},
+            http::{HeaderMap, Response, StatusCode, header},
+            routing::get,
+        };
+        use futures_util::stream::{self, StreamExt};
+        let app = Router::new().route(
+            "/file",
+            get(move |headers: HeaderMap| {
+                let mode = Arc::clone(&mode);
+                let split_seen = Arc::clone(&split_seen);
+                let release = Arc::clone(&release);
+                let payload = Arc::clone(&payload);
+                async move {
+                    let text = headers.get(header::RANGE).unwrap().to_str().unwrap();
+                    let (from, to) = text
+                        .strip_prefix("bytes=")
+                        .unwrap()
+                        .split_once('-')
+                        .unwrap();
+                    let start: usize = from.parse().unwrap();
+                    let end: usize = to.parse().unwrap();
+                    let phase = mode.load(Ordering::SeqCst);
+                    let is_tail = start > 0 && (start != DYNAMIC_SIZE / 2 || phase == 3);
+                    if is_tail && phase != 2 {
+                        split_seen.notify_one();
+                        release.notify_one();
+                    }
+                    let bytes = Bytes::copy_from_slice(&payload[start..=end]);
+                    let body = if start < DYNAMIC_SIZE / 2 && phase == 1 {
+                        let n = bytes.len().min(65536);
+                        let first = bytes.slice(..n);
+                        Body::from_stream(
+                            stream::once(async move { Ok::<_, std::io::Error>(first) })
+                                .chain(stream::pending()),
+                        )
+                    } else if start == 0 && (phase == 0 || phase == 3) {
+                        let n = bytes.len().min(65536);
+                        let first = bytes.slice(..n);
+                        let rest = bytes.slice(n..);
+                        let first = stream::once(async move { Ok::<_, std::io::Error>(first) });
+                        let rest = stream::once(async move {
+                            release.notified().await;
+                            Ok::<_, std::io::Error>(rest)
+                        });
+                        Body::from_stream(first.chain(rest))
+                    } else {
+                        Body::from(bytes)
+                    };
+                    Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(
+                            header::CONTENT_RANGE,
+                            format!("bytes {start}-{end}/{DYNAMIC_SIZE}"),
+                        )
+                        .header(header::ETAG, "\"stable\"")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/file")
+    }
+
+    fn dynamic_chunks() -> Vec<Chunk> {
+        vec![
+            Chunk {
+                id: 1,
+                start: 0,
+                end: DYNAMIC_SIZE as u64 / 2 - 1,
+            },
+            Chunk {
+                id: 2,
+                start: DYNAMIC_SIZE as u64 / 2,
+                end: DYNAMIC_SIZE as u64 - 1,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn idle_worker_splits_a_live_slow_range_without_corruption() {
+        use std::sync::atomic::AtomicUsize;
+        let mode = Arc::new(AtomicUsize::new(0));
+        let split = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let payload = Arc::new(
+            (0..DYNAMIC_SIZE)
+                .map(|i| (i.wrapping_mul(31) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let url = skewed_server(mode, Arc::clone(&split), release, Arc::clone(&payload)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("file");
+        let client = Client::builder().no_proxy().build().unwrap();
+        let chunks = dynamic_chunks();
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let ctx = ParallelDownloadCtx {
+            client: &client,
+            url: &url,
+            fetch_url: &url,
+            output_path: output.to_str().unwrap(),
+            file_size: DYNAMIC_SIZE as u64,
+            chunks: &chunks,
+            retry_config: &retry,
+            cancel: CancellationToken::new(),
+            identity: None,
+            etag: Some("\"stable\"".into()),
+            last_modified: None,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            download_parallel_with_initial(&ctx, 2, None, true, None::<fn(u64, u64)>),
+        )
+        .await
+        .expect("worker did not steal slow range")
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), split.notified())
+            .await
+            .expect("no split request was made");
+        assert_eq!(result, DYNAMIC_SIZE as u64);
+        assert_eq!(fs::read(output).await.unwrap(), *payload);
+    }
+
+    #[tokio::test]
+    async fn idle_workers_can_split_a_single_saved_layout_at_start() {
+        use std::sync::atomic::AtomicUsize;
+        let split = Arc::new(tokio::sync::Notify::new());
+        let payload = Arc::new(
+            (0..DYNAMIC_SIZE)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let url = skewed_server(
+            Arc::new(AtomicUsize::new(3)),
+            Arc::clone(&split),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::clone(&payload),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("file");
+        let client = Client::builder().no_proxy().build().unwrap();
+        let chunks = vec![Chunk {
+            id: 1,
+            start: 0,
+            end: DYNAMIC_SIZE as u64 - 1,
+        }];
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let ctx = ParallelDownloadCtx {
+            client: &client,
+            url: &url,
+            fetch_url: &url,
+            output_path: output.to_str().unwrap(),
+            file_size: DYNAMIC_SIZE as u64,
+            chunks: &chunks,
+            retry_config: &retry,
+            cancel: CancellationToken::new(),
+            identity: None,
+            etag: Some("\"stable\"".into()),
+            last_modified: None,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            download_parallel_with_initial(&ctx, 2, None, true, None::<fn(u64, u64)>),
+        )
+        .await
+        .expect("idle worker did not split the sole range")
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), split.notified())
+            .await
+            .expect("no split request was made");
+        assert_eq!(result, DYNAMIC_SIZE as u64);
+        assert_eq!(fs::read(output).await.unwrap(), *payload);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_live_split_saves_and_resumes_each_prefix() {
+        use std::sync::atomic::AtomicUsize;
+        let mode = Arc::new(AtomicUsize::new(1));
+        let split = Arc::new(tokio::sync::Notify::new());
+        let payload = Arc::new(
+            (0..DYNAMIC_SIZE)
+                .map(|i| (i.wrapping_mul(17) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let url = skewed_server(
+            Arc::clone(&mode),
+            Arc::clone(&split),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::clone(&payload),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("file");
+        let output = output.to_str().unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        let chunks = dynamic_chunks();
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let checkpoint_path = ResumeMetadata::meta_path(output);
+        let waiter = tokio::spawn(async move {
+            split.notified().await;
+            // Cross an autosave tick while split workers are still active.
+            tokio::time::sleep(Duration::from_millis(850)).await;
+            let checkpoint = resume::load(&checkpoint_path).await;
+            trigger.cancel();
+            checkpoint
+        });
+        let ctx = ParallelDownloadCtx {
+            client: &client,
+            url: &url,
+            fetch_url: &url,
+            output_path: output,
+            file_size: DYNAMIC_SIZE as u64,
+            chunks: &chunks,
+            retry_config: &retry,
+            cancel,
+            identity: None,
+            etag: Some("\"stable\"".into()),
+            last_modified: None,
+        };
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(10),
+            download_parallel_with_initial(&ctx, 2, None, true, None::<fn(u64, u64)>),
+        )
+        .await
+        .expect("split or cancellation stalled");
+        assert!(stopped.is_err());
+        let live = waiter.await.unwrap().unwrap();
+        assert!(live.chunks.len() >= 3, "autosave did not capture the split");
+        assert!(valid_saved_layout(
+            &live,
+            &url,
+            None,
+            DYNAMIC_SIZE as u64,
+            &chunks_from_metadata(&live)
+        ));
+        let meta = resume::load(&ResumeMetadata::meta_path(output))
+            .await
+            .unwrap();
+        assert!(meta.chunks.len() >= 3, "the split must be persisted");
+        assert!(valid_saved_layout(
+            &meta,
+            &url,
+            None,
+            DYNAMIC_SIZE as u64,
+            &chunks_from_metadata(&meta)
+        ));
+        let part = fs::read(format!("{output}.part")).await.unwrap();
+        for c in &meta.chunks {
+            let lo = c.start as usize;
+            let hi = lo + c.completed as usize;
+            assert_eq!(&part[lo..hi], &payload[lo..hi]);
+        }
+        mode.store(2, Ordering::SeqCst);
+        let ctx = ParallelDownloadCtx {
+            cancel: CancellationToken::new(),
+            ..ctx
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            download_parallel_with_initial(&ctx, 2, None, true, None::<fn(u64, u64)>),
+        )
+        .await
+        .expect("resume stalled")
+        .unwrap();
+        assert_eq!(result, DYNAMIC_SIZE as u64);
+        assert_eq!(fs::read(output).await.unwrap(), *payload);
+    }
 
     fn single_chunk() -> Vec<Chunk> {
         vec![Chunk {
@@ -768,10 +1127,9 @@ mod tests {
     async fn autosave_sleep_is_interrupted_by_shutdown() {
         let stop = CancellationToken::new();
         let meta = resume::create_new("https://example.com/file".into(), 10, &single_chunk());
-        let task = spawn_autosave(
+        let task = spawn_dynamic_autosave(
             "unused.rdm".into(),
-            Arc::new(Mutex::new(meta)),
-            Vec::new(),
+            Arc::new(Mutex::new(DynamicState::new(meta))),
             stop.clone(),
         );
         tokio::task::yield_now().await;
@@ -791,12 +1149,14 @@ mod tests {
         let path = path.to_str().unwrap();
         let meta = resume::create_new("https://example.com/file".into(), 10, &single_chunk());
         let stop = CancellationToken::new();
-        let task = spawn_autosave(
-            path.to_owned(),
-            Arc::new(Mutex::new(meta)),
-            vec![(0, Arc::new(AtomicU64::new(5)))],
-            stop.clone(),
-        );
+        let shared = Arc::new(Mutex::new(DynamicState::new(meta)));
+        shared
+            .lock()
+            .await
+            .progress(0)
+            .unwrap()
+            .store(5, Ordering::SeqCst);
+        let task = spawn_dynamic_autosave(path.to_owned(), shared, stop.clone());
         tokio::time::timeout(Duration::from_secs(5), async {
             while !Path::new(path).exists() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -812,12 +1172,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn progress_monitor_wakes_and_reports_final_progress() {
         let stop = CancellationToken::new();
-        let counter = Arc::new(AtomicU64::new(2));
+        let meta = resume::create_new("https://example.com/file".into(), 10, &single_chunk());
+        let shared = Arc::new(Mutex::new(DynamicState::new(meta)));
+        let counter = shared.lock().await.progress(0).unwrap();
+        counter.store(2, Ordering::SeqCst);
         let reports = Arc::new(StdMutex::new(Vec::new()));
         let captured = Arc::clone(&reports);
-        let task = spawn_progress_monitor(
+        let task = spawn_dynamic_monitor(
             Some(move |current, total| captured.lock().unwrap().push((current, total))),
-            vec![(0, Arc::clone(&counter))],
+            shared,
             stop.clone(),
             10,
         )
@@ -840,9 +1203,17 @@ mod tests {
         stop.cancel();
         let reports = Arc::new(StdMutex::new(Vec::new()));
         let captured = Arc::clone(&reports);
-        let task = spawn_progress_monitor(
+        let meta = resume::create_new("https://example.com/file".into(), 10, &single_chunk());
+        let shared = Arc::new(Mutex::new(DynamicState::new(meta)));
+        shared
+            .lock()
+            .await
+            .progress(0)
+            .unwrap()
+            .store(10, Ordering::SeqCst);
+        let task = spawn_dynamic_monitor(
             Some(move |current, total| captured.lock().unwrap().push((current, total))),
-            vec![(0, Arc::new(AtomicU64::new(10)))],
+            shared,
             stop,
             10,
         )
@@ -1066,7 +1437,10 @@ mod tests {
             .expect_err("truncated partial file must not be padded and resumed");
 
         assert!(format!("{err:#}").contains("requires at least 5 bytes"));
-        assert_eq!(fs::metadata(format!("{output}.part")).await.unwrap().len(), 2);
+        assert_eq!(
+            fs::metadata(format!("{output}.part")).await.unwrap().len(),
+            2
+        );
         assert!(!Path::new(output).exists());
     }
 

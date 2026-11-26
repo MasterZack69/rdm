@@ -280,6 +280,7 @@ pub async fn download(
         &ctx,
         connections,
         initial_response,
+        info.supports_range && connections > 1,
         Some(progress_callback),
     )
     .await;

@@ -1,6 +1,7 @@
 pub mod args;
 pub mod chunk;
 pub mod config;
+mod dynamic_range;
 pub mod engine;
 pub mod hoster;
 pub mod inspect;
