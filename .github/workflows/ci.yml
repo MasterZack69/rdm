@@ -52,3 +52,6 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-targets
+
+      - name: benchmark harness tests
+        run: python3 -m unittest discover -s benchmarks -p "test_*.py" -v
