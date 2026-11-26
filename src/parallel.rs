@@ -289,6 +289,24 @@ async fn load_or_create_metadata(
             return Ok(existing);
         }
 
+        // A newer range plan may have more or fewer work units than the saved
+        // one (for example, a different connection count). When the source and
+        // its validator still match, translate each completed prefix into the
+        // new layout instead of throwing away a resumable partial file because
+        // its chunk boundaries changed.
+        if identity_check == IdentityCheck::Match
+            && existing.describes_same_source(url, identity)
+            && existing.file_size == file_size
+            && let Some(repartitioned) = resume::repartition(&existing, chunks)
+        {
+            resume::save_atomic(meta_path, &repartitioned).await?;
+            eprintln!(
+                "  [Resume] Preserved progress while updating the range layout ({} chunks)",
+                repartitioned.chunks.len()
+            );
+            return Ok(repartitioned);
+        }
+
         match identity_check {
             IdentityCheck::Changed => {
                 eprintln!(
@@ -602,6 +620,56 @@ where
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    #[tokio::test]
+    async fn resume_repartitions_saved_progress_onto_a_changed_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("download");
+        let output = output.to_str().unwrap();
+        let url = "https://example.com/file";
+
+        let saved_layout = vec![Chunk {
+            id: 1,
+            start: 0,
+            end: 9,
+        }];
+        let mut meta = resume::create_new(url.to_owned(), 10, &saved_layout);
+        meta.etag = Some("\"v1\"".to_owned());
+        resume::update_progress(&mut meta, 1, 6);
+        resume::save_atomic(&ResumeMetadata::meta_path(output), &meta)
+            .await
+            .unwrap();
+
+        // The new invocation plans two chunks; the source validator matches.
+        let planned = vec![
+            Chunk {
+                id: 1,
+                start: 0,
+                end: 4,
+            },
+            Chunk {
+                id: 2,
+                start: 5,
+                end: 9,
+            },
+        ];
+        let meta = load_or_create_metadata(
+            &ResumeMetadata::meta_path(output),
+            &format!("{output}.part"),
+            url,
+            None,
+            10,
+            &planned,
+            Some("\"v1\""),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.chunks.len(), 2);
+        assert_eq!(meta.chunks[0].completed, 5);
+        assert_eq!(meta.chunks[1].completed, 1);
+    }
 
     fn single_chunk() -> Vec<Chunk> {
         vec![Chunk {

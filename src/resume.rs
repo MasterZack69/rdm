@@ -388,6 +388,89 @@ pub fn validate_against(
     })
 }
 
+/// Changes the persisted range layout without discarding trustworthy progress.
+/// Each old chunk records a completed prefix, so progress can be projected onto
+/// a new contiguous layout by preserving only the completed prefix of each new
+/// range. A gap in the old completed bytes stops that new prefix.
+pub fn repartition(meta: &ResumeMetadata, chunks: &[Chunk]) -> Option<ResumeMetadata> {
+    if meta.transfer != TransferKind::Segmented
+        || !valid_layout(meta.file_size, &meta.chunks)
+        || !valid_chunks(meta.file_size, chunks)
+    {
+        return None;
+    }
+
+    let mut next = meta.clone();
+    next.chunks = chunks
+        .iter()
+        .map(|chunk| {
+            let end_exclusive = chunk.end + 1;
+            let mut cursor = chunk.start;
+
+            for saved in &meta.chunks {
+                let saved_end = saved.start + saved.completed;
+                if saved_end <= cursor {
+                    continue;
+                }
+                if saved.start > cursor {
+                    break;
+                }
+                cursor = saved_end.min(end_exclusive);
+                if cursor == end_exclusive {
+                    break;
+                }
+            }
+
+            ChunkState {
+                id: chunk.id,
+                start: chunk.start,
+                end: chunk.end,
+                completed: cursor - chunk.start,
+            }
+        })
+        .collect();
+    Some(next)
+}
+
+fn valid_layout(file_size: u64, chunks: &[ChunkState]) -> bool {
+    if file_size == 0 || chunks.is_empty() {
+        return false;
+    }
+
+    let mut expected_start = 0;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.id != index as u32 + 1
+            || chunk.start != expected_start
+            || chunk.end < chunk.start
+            || chunk.end >= file_size
+            || chunk.completed > chunk.total_bytes()
+        {
+            return false;
+        }
+        expected_start = chunk.end + 1;
+    }
+    expected_start == file_size
+}
+
+fn valid_chunks(file_size: u64, chunks: &[Chunk]) -> bool {
+    if file_size == 0 || chunks.is_empty() {
+        return false;
+    }
+
+    let mut expected_start = 0;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.id != index as u32 + 1
+            || chunk.start != expected_start
+            || chunk.end < chunk.start
+            || chunk.end >= file_size
+        {
+            return false;
+        }
+        expected_start = chunk.end + 1;
+    }
+    expected_start == file_size
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +499,88 @@ mod tests {
                 end: 1999,
             },
         ]
+    }
+
+    fn two_chunk_layout() -> Vec<Chunk> {
+        vec![
+            Chunk {
+                id: 1,
+                start: 0,
+                end: 999,
+            },
+            Chunk {
+                id: 2,
+                start: 1000,
+                end: 1999,
+            },
+        ]
+    }
+
+    #[test]
+    fn repartition_preserves_completed_prefixes_on_a_new_layout() {
+        let old_chunks = sample_chunks();
+        let mut meta = create_new("https://example.com/file.bin".into(), 2000, &old_chunks);
+        // Old layout: chunk 1 complete (500), chunk 2 half done (250).
+        update_progress(&mut meta, 1, 500);
+        update_progress(&mut meta, 2, 250);
+
+        let next = repartition(&meta, &two_chunk_layout()).unwrap();
+        // New chunk 1 (0-999) gets the old 750-byte contiguous prefix.
+        assert_eq!(next.chunks[0].completed, 750);
+        assert_eq!(next.chunks[1].completed, 0);
+        assert_eq!(next.total_completed(), 750);
+    }
+
+    #[test]
+    fn repartition_stops_a_new_prefix_at_an_old_gap() {
+        let old_chunks = sample_chunks();
+        let mut meta = create_new("https://example.com/file.bin".into(), 2000, &old_chunks);
+        // A gap: chunk 1 incomplete, chunk 2 empty, but chunk 3 fully done.
+        update_progress(&mut meta, 1, 100);
+        update_progress(&mut meta, 3, 500);
+
+        let next = repartition(&meta, &two_chunk_layout()).unwrap();
+        // New chunk 1's prefix stops at the gap; the missing bytes after it
+        // are not claimed.
+        assert_eq!(next.chunks[0].completed, 100);
+        // New chunk 2 covers only the fully complete old chunk 3's span, so
+        // its prefix is legitimately complete.
+        assert_eq!(next.chunks[1].completed, 500);
+    }
+
+    #[test]
+    fn repartition_projects_forward_when_the_old_prefix_spans_new_boundaries() {
+        // Old: one chunk for the whole file, 1200 bytes done.
+        let old_chunks = vec![Chunk {
+            id: 1,
+            start: 0,
+            end: 1999,
+        }];
+        let mut meta = create_new("https://example.com/file.bin".into(), 2000, &old_chunks);
+        update_progress(&mut meta, 1, 1200);
+
+        let next = repartition(&meta, &two_chunk_layout()).unwrap();
+        assert_eq!(next.chunks[0].completed, 1000);
+        assert_eq!(next.chunks[1].completed, 200);
+    }
+
+    #[test]
+    fn repartition_rejects_non_segmented_and_invalid_layouts() {
+        let old_chunks = sample_chunks();
+        let mut streaming = create_new("https://example.com/file.bin".into(), 2000, &old_chunks);
+        streaming.transfer = TransferKind::Streaming;
+        assert!(repartition(&streaming, &two_chunk_layout()).is_none());
+
+        // Old layout with a hole is not a valid tiling.
+        let mut broken = create_new("https://example.com/file.bin".into(), 2000, &old_chunks);
+        broken.chunks[1].start = 501;
+        assert!(repartition(&broken, &two_chunk_layout()).is_none());
+
+        // New layout that does not tile the file is rejected too.
+        let mut bad_new = two_chunk_layout();
+        bad_new[1].end = 1998;
+        let meta = create_new("https://example.com/file.bin".into(), 2000, &old_chunks);
+        assert!(repartition(&meta, &bad_new).is_none());
     }
 
     #[test]
