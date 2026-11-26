@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, header};
-use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio_util::sync::CancellationToken;
 
+use crate::range_writer::RangeWriter;
 use crate::retry::{TransientError, is_transient_status};
 use crate::safe_file::{self, Access, Existing};
 
@@ -165,25 +164,32 @@ pub async fn download_response(
     )
     .with_context(|| format!("Failed to open file: {}", file_path))?;
 
-    let mut file = BufWriter::with_capacity(2 * 512 * 1024, tokio::fs::File::from_std(file));
-
-    file.seek(SeekFrom::Start(effective_start))
-        .await
-        .with_context(|| format!("Failed to seek to offset {}", effective_start))?;
-
+    let mut file = RangeWriter::new(
+        file,
+        effective_start,
+        resume_from,
+        Arc::clone(&chunk_progress),
+    );
+    // Flush small, slow responses too, so their saved progress does not wait
+    // indefinitely for a full batch.
+    let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    flush_tick.tick().await;
     let mut stream = response.bytes_stream();
     let mut bytes_written: u64 = 0;
-    let mut bytes_since_flush: u64 = 0;
 
     loop {
         let chunk = tokio::select! {
             c = stream.next() => c,
             _ = cancel.cancelled() => {
-                file.flush().await.ok();
-                chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
+                file.flush().await.context("Failed to flush cancelled range")?;
                 return Ok(DownloadStatus::Cancelled {
-                    bytes_on_disk: resume_from + bytes_written,
+                    bytes_on_disk: chunk_progress.load(Ordering::SeqCst),
                 });
+            }
+            _ = flush_tick.tick(), if file.has_buffered() => {
+                file.flush().await.context("Periodic range flush failed")?;
+                continue;
             }
         };
 
@@ -192,8 +198,9 @@ pub async fn download_response(
                 let data_len: u64 = data.len() as u64;
 
                 if bytes_written + data_len > expected_len {
-                    file.flush().await.ok();
-                    chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
+                    file.flush()
+                        .await
+                        .context("Failed to flush valid prefix of excess response")?;
                     drop(stream);
                     anyhow::bail!(
                         "Server sent excess data for range {}: expected {} bytes, got at least {}",
@@ -212,23 +219,11 @@ pub async fn download_response(
                 })?;
 
                 bytes_written += data_len;
-                bytes_since_flush += data_len;
-
-                if bytes_since_flush >= 16 * 1024 * 1024 {
-                    file.flush().await.with_context(|| {
-                        format!(
-                            "Periodic flush failed at offset {}",
-                            effective_start + bytes_written
-                        )
-                    })?;
-                    bytes_since_flush = 0;
-                }
-
-                chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
             }
             Some(Err(e)) => {
-                file.flush().await.ok();
-                chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
+                file.flush()
+                    .await
+                    .context("Failed to flush interrupted range")?;
                 // The stream error names the URL as well.
                 return Err(e.without_url()).context(format!(
                     "Stream error at byte {} of range {}",
@@ -244,7 +239,6 @@ pub async fn download_response(
         .context("Failed to flush file after range write")?;
 
     if bytes_written != expected_len {
-        chunk_progress.store(resume_from + bytes_written, Ordering::SeqCst);
         anyhow::bail!(
             "Truncated range {}: expected {} bytes, wrote {}",
             range_value,
@@ -357,6 +351,156 @@ mod tests {
             HeaderValue::from_static("octets 0-99/100"),
         );
         assert!(validate_content_range(&h, 0, 99).is_err());
+    }
+
+    async fn range_server(body: axum::body::Body, content_range: &'static str) -> String {
+        use axum::{Router, http::StatusCode, routing::get};
+        use std::sync::Mutex;
+        // The test makes one request; retaining the body behind a mutex lets
+        // axum's reusable handler take it without requiring Body: Clone.
+        let body = Arc::new(Mutex::new(Some(body)));
+        let app = Router::new().route(
+            "/file",
+            get(move || {
+                let body = body.lock().unwrap().take().unwrap();
+                async move {
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        [(header::CONTENT_RANGE, content_range)],
+                        body,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/file")
+    }
+
+    #[tokio::test]
+    async fn short_response_flushes_only_the_real_prefix() {
+        let url = range_server(axum::body::Body::from("abc"), "bytes 0-9/10").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part");
+        std::fs::write(&path, [0; 10]).unwrap();
+        let progress = Arc::new(AtomicU64::new(0));
+        let err = download_range(
+            &Client::builder().no_proxy().build().unwrap(),
+            &url,
+            path.to_str().unwrap(),
+            0,
+            9,
+            0,
+            Arc::clone(&progress),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("Truncated range"));
+        assert_eq!(progress.load(Ordering::SeqCst), 3);
+        assert_eq!(&std::fs::read(path).unwrap(), b"abc\0\0\0\0\0\0\0");
+    }
+
+    #[tokio::test]
+    async fn resumed_range_writes_at_the_correct_offset() {
+        let url = range_server(axum::body::Body::from("3456789"), "bytes 3-9/10").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part");
+        std::fs::write(&path, b"012\0\0\0\0\0\0\0").unwrap();
+        let progress = Arc::new(AtomicU64::new(3));
+        let result = download_range(
+            &Client::builder().no_proxy().build().unwrap(),
+            &url,
+            path.to_str().unwrap(),
+            0,
+            9,
+            3,
+            Arc::clone(&progress),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, DownloadStatus::Complete { .. }));
+        assert_eq!(progress.load(Ordering::SeqCst), 10);
+        assert_eq!(&std::fs::read(path).unwrap(), b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn excess_response_does_not_overwrite_adjacent_range() {
+        let url = range_server(axum::body::Body::from("123456"), "bytes 0-3/8").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part");
+        std::fs::write(&path, b"0000KEEP").unwrap();
+        let progress = Arc::new(AtomicU64::new(0));
+        let result = download_range(
+            &Client::builder().no_proxy().build().unwrap(),
+            &url,
+            path.to_str().unwrap(),
+            0,
+            3,
+            0,
+            Arc::clone(&progress),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(progress.load(Ordering::SeqCst) <= 4);
+        assert_eq!(&std::fs::read(path).unwrap()[4..], b"KEEP");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_slow_range_flushes_its_partial_batch() {
+        use axum::body::{Body, Bytes};
+        use futures_util::stream::{self, StreamExt};
+        use std::time::Duration;
+        let first =
+            stream::once(async { Ok::<Bytes, std::io::Error>(Bytes::from(vec![0x73; 8192])) });
+        let body = Body::from_stream(first.chain(stream::pending()));
+        let url = range_server(body, "bytes 0-2097151/2097152").await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part");
+        std::fs::write(&path, vec![0; 2 * 1024 * 1024]).unwrap();
+        let progress = Arc::new(AtomicU64::new(0));
+        let cancel = CancellationToken::new();
+        let task_progress = Arc::clone(&progress);
+        let task_cancel = cancel.clone();
+        let task_path = path.clone();
+        let task = tokio::spawn(async move {
+            download_range(
+                &Client::builder().no_proxy().build().unwrap(),
+                &url,
+                task_path.to_str().unwrap(),
+                0,
+                2 * 1024 * 1024 - 1,
+                0,
+                task_progress,
+                task_cancel,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while progress.load(Ordering::SeqCst) < 8192 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slow partial batch was not flushed");
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            DownloadStatus::Cancelled {
+                bytes_on_disk: 8192
+            }
+        ));
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes[..8192].iter().all(|b| *b == 0x73));
+        assert!(bytes[8192..].iter().all(|b| *b == 0));
     }
 
     /// See the note in `inspect.rs`: a free-then-closed port rather than a

@@ -9,6 +9,7 @@ pub mod parallel;
 pub mod pressure;
 pub mod queue;
 pub mod range_download;
+mod range_writer;
 pub mod resume;
 pub mod retry;
 pub mod safe_file;
