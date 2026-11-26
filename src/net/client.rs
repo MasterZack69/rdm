@@ -188,7 +188,15 @@ impl Policy {
 
         // No total timeout: this client carries multi-hour transfers. The probe
         // puts its leash on the request instead.
+        //
+        // HTTP/1.1 only: over HTTP/2, reqwest multiplexes every request to one
+        // host onto a single TCP connection, which collapses RDM's parallel
+        // range downloads into one congestion window (and one source of
+        // head-of-line blocking). Measured against an HTTP/2 CDN: eight
+        // "connections" shared one socket. Each range request needs its own
+        // TCP connection for parallelism to be real.
         let mut builder = reqwest::Client::builder()
+            .http1_only()
             .user_agent("rdm")
             .connect_timeout(CONNECT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
