@@ -47,7 +47,6 @@ pub async fn download_range(
     }
 
     let effective_start = start + resume_from;
-    let expected_len = end - effective_start + 1;
     let range_value = format!("bytes={}-{}", effective_start, end);
 
     let response = tokio::select! {
@@ -76,6 +75,42 @@ pub async fn download_range(
         }
     };
 
+    download_response(
+        response,
+        file_path,
+        start,
+        end,
+        resume_from,
+        chunk_progress,
+        cancel,
+    )
+    .await
+}
+
+/// Writes an already-open response into its assigned byte interval. The
+/// response may be the useful body returned by the initial download probe.
+#[allow(clippy::too_many_arguments)]
+pub async fn download_response(
+    response: reqwest::Response,
+    file_path: &str,
+    start: u64,
+    end: u64,
+    resume_from: u64,
+    chunk_progress: Arc<AtomicU64>,
+    cancel: CancellationToken,
+) -> Result<DownloadStatus> {
+    if end < start {
+        anyhow::bail!("Invalid byte range: start ({}) > end ({})", start, end);
+    }
+
+    let full_chunk_len = end - start + 1;
+    if resume_from >= full_chunk_len {
+        return Ok(DownloadStatus::Complete { bytes_written: 0 });
+    }
+
+    let effective_start = start + resume_from;
+    let expected_len = end - effective_start + 1;
+    let range_value = format!("bytes={}-{}", effective_start, end);
     let status = response.status();
 
     if status == StatusCode::OK && effective_start == 0 {
@@ -325,35 +360,34 @@ mod tests {
     }
 
     /// See the note in `inspect.rs`: a free-then-closed port rather than a
-/// hardcoded low one, and `.no_proxy()`, so that a system proxy cannot
-/// answer for the unreachable address and let the send succeed.
-fn refused_url(query: &str) -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    format!("http://127.0.0.1:{port}/f?{query}")
-}
+    /// hardcoded low one, and `.no_proxy()`, so that a system proxy cannot
+    /// answer for the unreachable address and let the send succeed.
+    fn refused_url(query: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}/f?{query}")
+    }
 
-/// The chunk path retries, so this error text is printed once per attempt.
-#[tokio::test]
-async fn a_failed_range_request_does_not_name_the_url_it_failed_on() {
-    let progress = Arc::new(AtomicU64::new(0));
-    let error = download_range(
-        &Client::builder().no_proxy().build().unwrap(),
-        &refused_url("key=SUPERSECRETKEY"),
-        "/nonexistent-directory-for-rdm-test/x.part",
-        0,
-        1023,
-        0,
-        progress,
-        CancellationToken::new(),
-    )
-    .await
-    .expect_err("a closed loopback port must not answer");
+    /// The chunk path retries, so this error text is printed once per attempt.
+    #[tokio::test]
+    async fn a_failed_range_request_does_not_name_the_url_it_failed_on() {
+        let progress = Arc::new(AtomicU64::new(0));
+        let error = download_range(
+            &Client::builder().no_proxy().build().unwrap(),
+            &refused_url("key=SUPERSECRETKEY"),
+            "/nonexistent-directory-for-rdm-test/x.part",
+            0,
+            1023,
+            0,
+            progress,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a closed loopback port must not answer");
 
-    let chain = format!("{error:#}");
-    assert!(!chain.contains("SUPERSECRETKEY"), "leaked: {chain}");
-    assert!(!chain.contains("127.0.0.1"), "leaked: {chain}");
-}
-
+        let chain = format!("{error:#}");
+        assert!(!chain.contains("SUPERSECRETKEY"), "leaked: {chain}");
+        assert!(!chain.contains("127.0.0.1"), "leaked: {chain}");
+    }
 }
