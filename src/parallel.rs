@@ -111,7 +111,7 @@ where
 
     let chunks = chunks_from_metadata(&meta);
 
-    ensure_file_allocated(temp_path, ctx.file_size, chunks.len()).await?;
+    ensure_file_allocated(temp_path, ctx.file_size, &chunks, &meta).await?;
 
     let shared_meta = Arc::new(Mutex::new(meta));
 
@@ -279,7 +279,12 @@ async fn load_or_create_metadata(
     if let Ok(existing) = resume::load(meta_path).await {
         let identity_check = existing.compare_server_identity(etag, last_modified);
 
-        if resume::validate_against(&existing, url, identity, file_size, chunks)
+        let saved_chunks = chunks_from_metadata(&existing);
+
+        // The saved ranges are the resume contract. Do not discard a valid
+        // manifest just because this invocation would plan a different layout
+        // (for example, a different connection count).
+        if valid_saved_layout(&existing, url, identity, file_size, &saved_chunks)
             && identity_check == IdentityCheck::Match
         {
             eprintln!(
@@ -322,6 +327,35 @@ async fn load_or_create_metadata(
     Ok(meta)
 }
 
+/// Validates the saved manifest against its own recorded layout: contiguous,
+/// in-order ranges that tile the whole file, with per-chunk progress in
+/// bounds. The planned layout is irrelevant here; the saved ranges are the
+/// resume contract.
+fn valid_saved_layout(
+    meta: &ResumeMetadata,
+    url: &str,
+    identity: Option<&str>,
+    file_size: u64,
+    chunks: &[Chunk],
+) -> bool {
+    if !resume::validate_against(meta, url, identity, file_size, chunks) || chunks.is_empty() {
+        return false;
+    }
+
+    let mut next_start = 0u64;
+    for (index, (state, chunk)) in meta.chunks.iter().zip(chunks).enumerate() {
+        if state.id != index as u32 + 1
+            || chunk.start != next_start
+            || chunk.end < chunk.start
+            || chunk.end >= file_size
+        {
+            return false;
+        }
+        next_start = chunk.end + 1;
+    }
+    next_start == file_size
+}
+
 /// Brings the `.part` file to the right length, in a single open.
 ///
 /// This used to stat the path, decide from the answer, and then open the path
@@ -333,19 +367,56 @@ async fn load_or_create_metadata(
 /// descriptor to confirm a regular file this process owns. The size is then
 /// read and set through that same descriptor, so there is no second lookup for
 /// anything to get in front of.
-async fn ensure_file_allocated(path: &str, size: u64, chunk_count: usize) -> Result<()> {
+async fn ensure_file_allocated(
+    path: &str,
+    size: u64,
+    chunks: &[Chunk],
+    meta: &ResumeMetadata,
+) -> Result<()> {
+    let has_recorded_progress = meta.total_completed() > 0;
     let file = safe_file::open_guarded(
         Path::new(path),
-        Existing::Open,
+        if has_recorded_progress {
+            Existing::OpenExisting
+        } else {
+            Existing::Open
+        },
         Access::ReadWrite,
         safe_file::DEFAULT_FILE_MODE,
     )
-    .with_context(|| format!("Failed to open file: {}", path))?;
+    .with_context(|| {
+        if has_recorded_progress {
+            format!(
+                "Cannot resume: saved progress exists but the partial file '{}' is missing or unavailable",
+                path
+            )
+        } else {
+            format!("Failed to open file: {}", path)
+        }
+    })?;
 
     let current = file
         .metadata()
         .with_context(|| format!("Failed to stat file: {}", path))?
         .len();
+
+    if has_recorded_progress {
+        let required_len = meta
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.completed > 0)
+            .filter_map(|chunk| chunk.start.checked_add(chunk.completed))
+            .max()
+            .unwrap_or(0);
+        if current < required_len {
+            anyhow::bail!(
+                "Cannot resume: partial file '{}' is {} bytes, but saved progress requires at least {} bytes; remove the partial file and its resume metadata to restart",
+                path,
+                current,
+                required_len
+            );
+        }
+    }
 
     // Already the right length.
     if current == size {
@@ -354,7 +425,7 @@ async fn ensure_file_allocated(path: &str, size: u64, chunk_count: usize) -> Res
 
     // Single chunk starting from nothing: the file starts at 0 bytes and the
     // sequential write extends it naturally, exactly as before.
-    if current == 0 && chunk_count <= 1 {
+    if current == 0 && chunks.len() <= 1 {
         return Ok(());
     }
 
@@ -775,6 +846,264 @@ mod tests {
             last_modified: None,
         };
         download_parallel(&ctx, Some(|_, _| {})).await
+    }
+
+    async fn serve_saved_range() -> String {
+        use axum::http::{StatusCode, header};
+        use axum::routing::get;
+
+        let app = axum::Router::new().route(
+            "/file",
+            get(|| async {
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        (header::CONTENT_RANGE, "bytes 5-9/10"),
+                        (header::ETAG, "\"v1\""),
+                    ],
+                    "56789",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}/file")
+    }
+
+    async fn try_resume_with_partial(output: &str, partial_len: Option<u64>) -> Result<u64> {
+        let url = serve_saved_range().await;
+        let chunks = vec![Chunk {
+            id: 1,
+            start: 0,
+            end: 9,
+        }];
+        let mut meta = resume::create_new(url.clone(), 10, &chunks);
+        meta.etag = Some("\"v1\"".to_owned());
+        resume::update_progress(&mut meta, 1, 5);
+        resume::save_atomic(&ResumeMetadata::meta_path(output), &meta)
+            .await
+            .unwrap();
+
+        if let Some(len) = partial_len {
+            let part = format!("{output}.part");
+            let file = safe_file::open_guarded(
+                Path::new(&part),
+                Existing::Reject,
+                Access::ReadWrite,
+                safe_file::DEFAULT_FILE_MODE,
+            )
+            .unwrap();
+            file.set_len(len).unwrap();
+        }
+
+        let client = Client::builder().no_proxy().build().unwrap();
+        let retry_config = RetryConfig::default();
+        let ctx = ParallelDownloadCtx {
+            client: &client,
+            url: &url,
+            fetch_url: &url,
+            output_path: output,
+            file_size: 10,
+            chunks: &chunks,
+            retry_config: &retry_config,
+            cancel: CancellationToken::new(),
+            identity: None,
+            etag: Some("\"v1\"".to_owned()),
+            last_modified: None,
+        };
+        download_parallel(&ctx, None::<fn(u64, u64)>).await
+    }
+
+    async fn resume_with_saved_layout(
+        output: &str,
+        saved_chunks: Vec<Chunk>,
+        requested_chunks: &[Chunk],
+    ) -> Result<u64> {
+        let url = serve_saved_range().await;
+        let mut meta = resume::create_new(url.clone(), 10, &saved_chunks);
+        meta.etag = Some("\"v1\"".to_owned());
+        resume::update_progress(&mut meta, saved_chunks[0].id, 5);
+        resume::save_atomic(&ResumeMetadata::meta_path(output), &meta)
+            .await
+            .unwrap();
+
+        let part = format!("{output}.part");
+        fs::write(&part, b"01234").await.unwrap();
+        let file = safe_file::open_guarded(
+            Path::new(&part),
+            Existing::OpenExisting,
+            Access::ReadWrite,
+            safe_file::DEFAULT_FILE_MODE,
+        )
+        .unwrap();
+        file.set_len(10).unwrap();
+        drop(file);
+
+        let client = Client::builder().no_proxy().build().unwrap();
+        let retry_config = RetryConfig::default();
+        let ctx = ParallelDownloadCtx {
+            client: &client,
+            url: &url,
+            fetch_url: &url,
+            output_path: output,
+            file_size: 10,
+            chunks: requested_chunks,
+            retry_config: &retry_config,
+            cancel: CancellationToken::new(),
+            identity: None,
+            etag: Some("\"v1\"".to_owned()),
+            last_modified: None,
+        };
+        download_parallel(&ctx, None::<fn(u64, u64)>).await
+    }
+
+    #[tokio::test]
+    async fn saved_progress_with_a_missing_part_is_never_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("download");
+        let output = output.to_str().unwrap();
+
+        let err = try_resume_with_partial(output, None)
+            .await
+            .expect_err("missing partial file must not be recreated and resumed");
+
+        assert!(format!("{err:#}").contains("saved progress exists"));
+        assert!(!Path::new(&format!("{output}.part")).exists());
+        assert!(!Path::new(output).exists());
+    }
+
+    #[tokio::test]
+    async fn saved_progress_beyond_a_truncated_part_is_never_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("download");
+        let output = output.to_str().unwrap();
+
+        let err = try_resume_with_partial(output, Some(2))
+            .await
+            .expect_err("truncated partial file must not be padded and resumed");
+
+        assert!(format!("{err:#}").contains("requires at least 5 bytes"));
+        assert_eq!(fs::metadata(format!("{output}.part")).await.unwrap().len(), 2);
+        assert!(!Path::new(output).exists());
+    }
+
+    #[tokio::test]
+    async fn resume_uses_the_saved_adaptive_layout_when_default_layout_is_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("download");
+        let output = output.to_str().unwrap();
+        let adaptive_layout = vec![
+            Chunk {
+                id: 1,
+                start: 0,
+                end: 4,
+            },
+            Chunk {
+                id: 2,
+                start: 5,
+                end: 9,
+            },
+        ];
+        let default_layout = vec![Chunk {
+            id: 1,
+            start: 0,
+            end: 9,
+        }];
+
+        assert_eq!(
+            resume_with_saved_layout(output, adaptive_layout, &default_layout)
+                .await
+                .unwrap(),
+            10
+        );
+        assert_eq!(fs::read(output).await.unwrap(), b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn resume_uses_the_saved_default_layout_when_adaptive_layout_is_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("download");
+        let output = output.to_str().unwrap();
+        let default_layout = vec![Chunk {
+            id: 1,
+            start: 0,
+            end: 9,
+        }];
+        let adaptive_layout = vec![
+            Chunk {
+                id: 1,
+                start: 0,
+                end: 4,
+            },
+            Chunk {
+                id: 2,
+                start: 5,
+                end: 9,
+            },
+        ];
+
+        assert_eq!(
+            resume_with_saved_layout(output, default_layout, &adaptive_layout)
+                .await
+                .unwrap(),
+            10
+        );
+        assert_eq!(fs::read(output).await.unwrap(), b"0123456789");
+    }
+
+    #[test]
+    fn saved_layout_validation_rejects_gaps_overlaps_and_bad_progress() {
+        let chunks = vec![
+            Chunk {
+                id: 1,
+                start: 0,
+                end: 49,
+            },
+            Chunk {
+                id: 2,
+                start: 50,
+                end: 99,
+            },
+        ];
+        let url = "https://example.com/file";
+        let mut meta = resume::create_new(url.to_owned(), 100, &chunks);
+        meta.etag = Some("\"v1\"".to_owned());
+        assert!(valid_saved_layout(
+            &meta,
+            url,
+            None,
+            100,
+            &chunks_from_metadata(&meta)
+        ));
+
+        meta.chunks[1].start = 49;
+        assert!(!valid_saved_layout(
+            &meta,
+            url,
+            None,
+            100,
+            &chunks_from_metadata(&meta)
+        ));
+
+        meta.chunks[1].start = 51;
+        assert!(!valid_saved_layout(
+            &meta,
+            url,
+            None,
+            100,
+            &chunks_from_metadata(&meta)
+        ));
+
+        meta.chunks[1].start = 50;
+        meta.chunks[0].completed = 51;
+        assert!(!valid_saved_layout(
+            &meta,
+            url,
+            None,
+            100,
+            &chunks_from_metadata(&meta)
+        ));
     }
 
     #[tokio::test]
