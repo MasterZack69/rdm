@@ -61,7 +61,7 @@ pub async fn download(
     // the resume state. Only the fetching moves to `fetch_url`, because a
     // redirect target is a poor filename and a worse identity.
     let resolved;
-    let (fetch_url, client, initial_probe) = match req.client.as_ref() {
+    let (fetch_url, client, probe_response) = match req.client.as_ref() {
         Some(session) => (url.clone(), session, None),
         None => {
             let policy = net::Policy::new(req.allow_private);
@@ -71,7 +71,7 @@ pub async fn download(
                     sink.finish();
                     return Ok(Outcome::Cancelled);
                 }
-                result = policy.probe(&url) => result?,
+                result = policy.probe_download(&url) => result?,
             };
             resolved = target;
             (resolved.url.to_string(), &resolved.client, Some(response))
@@ -85,13 +85,24 @@ pub async fn download(
     // up in scrollback, CI output and support captures.
     sink.detail(&format!("Inspecting: {}", secret_url::redact(&url)));
 
-    // Policy::probe already made the same bytes=0-0 request after enforcing
-    // redirect and address safety. Use its final response rather than asking
-    // the same server a second time; externally supplied clients still probe.
-    let info = match initial_probe {
-        Some(response) => inspect::inspect_response(client, &fetch_url, response).await?,
-        None => inspect::inspect_url(client, &fetch_url).await?,
+    // Keep the safe probe's response: a partial range is the first work unit,
+    // and a server that ignores Range has already returned the full body.
+    // Hoster clients use the same data-bearing inspection request.
+    let (info, mut initial_response) = match probe_response {
+        Some(response) => {
+            let info = inspect::inspect_response(client, &fetch_url, &response).await?;
+            (info, Some(response))
+        }
+        None => inspect::inspect_download_url(client, &fetch_url).await?,
     };
+    if initial_response.as_ref().is_some_and(|response| {
+        !matches!(
+            response.status(),
+            reqwest::StatusCode::OK | reqwest::StatusCode::PARTIAL_CONTENT
+        )
+    }) {
+        initial_response = None;
+    }
 
     // Use the server-suggested filename when the URL has no extension, but
     // only if the user didn't explicitly choose a name (via rename or -o).
@@ -161,6 +172,7 @@ pub async fn download(
                 },
                 cancel,
                 Arc::clone(&sink),
+                initial_response.filter(|response| response.status() == reqwest::StatusCode::OK),
             )
             .await;
             sink.finish();
@@ -193,8 +205,31 @@ pub async fn download(
     ));
     sink.detail(&format!("Output    : {}", ui::terminal_safe(&output_path)));
 
-    let chunks = if info.supports_range && connections > 1 {
-        plan_chunks_with_count(file_size, connections as u32)
+    let mut initial_range = initial_response.as_ref().and_then(inspect::initial_range);
+    if initial_response
+        .as_ref()
+        .is_some_and(|response| response.status() == reqwest::StatusCode::PARTIAL_CONTENT)
+        && initial_range.is_none()
+    {
+        // A malformed or incomplete Content-Range cannot safely describe the
+        // bytes that the response body contains. Let ordinary range requests
+        // validate their own answers instead.
+        initial_response = None;
+        initial_range = None;
+    }
+
+    let chunks = if info.supports_range {
+        match initial_range {
+            // The retained probe body always starts at byte zero and its end
+            // is below the file size (see inspect::initial_range).
+            Some((0, end)) => plan_chunks_with_initial_range(file_size, connections, end),
+            _ if connections > 1 => plan_chunks_with_count(file_size, connections as u32),
+            _ => vec![Chunk {
+                id: 1,
+                start: 0,
+                end: file_size - 1,
+            }],
+        }
     } else {
         vec![Chunk {
             id: 1,
@@ -241,7 +276,13 @@ pub async fn download(
         last_modified: info.last_modified.clone(),
     };
 
-    let download_result = parallel::download_parallel(&ctx, Some(progress_callback)).await;
+    let download_result = parallel::download_parallel_with_initial(
+        &ctx,
+        connections,
+        initial_response,
+        Some(progress_callback),
+    )
+    .await;
 
     sink.state(SlotState::Finishing);
     sink.finish();
@@ -346,6 +387,49 @@ fn plan_chunks_with_count(file_size: u64, count: u32) -> Vec<Chunk> {
     chunks
 }
 
+/// The initial response covers byte zero through `initial_end`, so make it a
+/// complete first work unit and divide only the remaining bytes. The
+/// remainder still gets `connections` ranges: the retained range is small, so
+/// every worker stays busy instead of idling one connection short.
+fn plan_chunks_with_initial_range(
+    file_size: u64,
+    connections: usize,
+    initial_end: u64,
+) -> Vec<Chunk> {
+    if file_size == 0 || initial_end >= file_size {
+        return Vec::new();
+    }
+
+    let mut chunks = vec![Chunk {
+        id: 1,
+        start: 0,
+        end: initial_end,
+    }];
+    if initial_end + 1 == file_size {
+        return chunks;
+    }
+
+    let remaining_start = initial_end + 1;
+    let remaining_len = file_size - remaining_start;
+    let remaining_count = (connections as u64).max(1).min(remaining_len);
+    let base = remaining_len / remaining_count;
+    let extra = remaining_len % remaining_count;
+    let mut offset = remaining_start;
+
+    for index in 0..remaining_count {
+        let size = base + u64::from(index < extra);
+        let end = offset + size - 1;
+        chunks.push(Chunk {
+            id: index as u32 + 2,
+            start: offset,
+            end,
+        });
+        offset = end + 1;
+    }
+
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,8 +459,12 @@ mod tests {
         let output = dir.path().join("empty.txt").to_string_lossy().into_owned();
 
         let outcome = download(
-            DownloadRequest::new(format!("http://{}/empty.txt", addr), Some(output.clone()), 4)
-                .with_allow_private(true),
+            DownloadRequest::new(
+                format!("http://{}/empty.txt", addr),
+                Some(output.clone()),
+                4,
+            )
+            .with_allow_private(true),
             CancellationToken::new(),
             crate::ui::silent(),
         )
@@ -416,19 +504,14 @@ mod tests {
                 let count = Arc::clone(&count);
                 async move {
                     match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-                        Some("bytes=0-0") => {
+                        Some(range) if range.starts_with("bytes=0-") => {
                             count.fetch_add(1, Ordering::SeqCst);
                             (
                                 StatusCode::PARTIAL_CONTENT,
-                                [(header::CONTENT_RANGE, "bytes 0-0/5")],
-                                "h",
+                                [(header::CONTENT_RANGE, "bytes 0-4/5")],
+                                "hello",
                             )
                         }
-                        Some("bytes=0-4") => (
-                            StatusCode::PARTIAL_CONTENT,
-                            [(header::CONTENT_RANGE, "bytes 0-4/5")],
-                            "hello",
-                        ),
                         _ => (
                             StatusCode::OK,
                             [(header::CONTENT_RANGE, "bytes 0-4/5")],
@@ -479,12 +562,16 @@ mod tests {
             get(move |headers: HeaderMap| {
                 let count = Arc::clone(&count);
                 async move {
-                    if headers.get(header::RANGE).and_then(|v| v.to_str().ok()) == Some("bytes=0-0") {
+                    if headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|range| range.starts_with("bytes=0-"))
+                    {
                         count.fetch_add(1, Ordering::SeqCst);
                         (
                             StatusCode::PARTIAL_CONTENT,
-                            [(header::CONTENT_RANGE, "bytes 0-0/5")],
-                            "h",
+                            [(header::CONTENT_RANGE, "bytes 0-4/5")],
+                            "hello",
                         )
                     } else {
                         (
@@ -547,8 +634,10 @@ mod tests {
                 get(move |headers: HeaderMap| {
                     let ranged_count = Arc::clone(&ranged_count);
                     async move {
-                        if headers.get(header::RANGE).and_then(|v| v.to_str().ok())
-                            == Some("bytes=0-0")
+                        if headers
+                            .get(header::RANGE)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("bytes=0-65535")
                         {
                             ranged_count.fetch_add(1, Ordering::SeqCst);
                             (StatusCode::METHOD_NOT_ALLOWED, "")
