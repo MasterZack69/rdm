@@ -1434,8 +1434,8 @@ mod tests {
         let encoded = URL_SAFE_NO_PAD.encode(raw);
         let key = decode_file_key(&encoded).unwrap();
 
-        for i in 0..16 {
-            assert_eq!(key.aes[i], (i as u8) ^ ((i + 16) as u8));
+        for (i, byte) in key.aes.iter().enumerate() {
+            assert_eq!(*byte, (i as u8) ^ ((i + 16) as u8));
         }
         assert_eq!(key.nonce, [16, 17, 18, 19, 20, 21, 22, 23]);
         assert_eq!(key.meta_mac, [24, 25, 26, 27, 28, 29, 30, 31]);
