@@ -212,15 +212,22 @@ where
                 .context("Initial response range has no progress counter")?;
             let previous = progress.load(Ordering::Relaxed);
             let first_len = first.end - first.start + 1;
+            // A saved layout may differ from the new probe plan. Never reset
+            // saved progress or write a probe body into a different interval.
+            let matches_saved = match response.status() {
+                reqwest::StatusCode::OK => first.start == 0 && first.end == ctx.file_size - 1,
+                reqwest::StatusCode::PARTIAL_CONTENT => {
+                    crate::inspect::initial_range(&response) == Some((first.start, first.end))
+                }
+                _ => false,
+            };
 
-            // A fully completed first range is already on disk and belongs to
-            // the validated resume state. The probe response is then discarded
-            // without touching those bytes.
-            if previous < first_len {
-                // The retained response always starts at byte zero and covers
-                // this whole first work unit. Restart its counter while that
-                // body is written so a short response cannot leave stale
-                // progress claiming bytes beyond what was just verified.
+            // Completed ranges and mismatched probes are left in the saved
+            // layout; remaining bytes are requested normally from the queue.
+            if matches_saved && previous < first_len {
+                // A matching response covers the whole first work unit.
+                // Restart its counter while rewriting that unit so a short
+                // response cannot leave stale progress claiming unwritten bytes.
                 progress.store(0, Ordering::Release);
                 match range_download::download_response(
                     response,
@@ -1038,6 +1045,100 @@ mod tests {
             last_modified: None,
         };
         download_parallel(&ctx, None::<fn(u64, u64)>).await
+    }
+
+    #[tokio::test]
+    async fn resume_ignores_probe_that_does_not_match_saved_first_range() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode, header},
+            routing::get,
+        };
+        let app = Router::new().route(
+            "/file",
+            get(|headers: HeaderMap| async move {
+                match headers.get(header::RANGE).unwrap().to_str().unwrap() {
+                    "bytes=0-3" => (
+                        StatusCode::PARTIAL_CONTENT,
+                        [
+                            (header::CONTENT_RANGE, "bytes 0-3/10"),
+                            (header::ETAG, "\"v1\""),
+                        ],
+                        "0123",
+                    ),
+                    "bytes=5-9" => (
+                        StatusCode::PARTIAL_CONTENT,
+                        [
+                            (header::CONTENT_RANGE, "bytes 5-9/10"),
+                            (header::ETAG, "\"v1\""),
+                        ],
+                        "56789",
+                    ),
+                    range => panic!("unexpected range {range}"),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{addr}/file");
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("download");
+        let output = output.to_str().unwrap();
+        let saved = vec![Chunk {
+            id: 1,
+            start: 0,
+            end: 9,
+        }];
+        let mut meta = resume::create_new(url.clone(), 10, &saved);
+        meta.etag = Some("\"v1\"".to_owned());
+        resume::update_progress(&mut meta, 1, 5);
+        resume::save_atomic(&ResumeMetadata::meta_path(output), &meta)
+            .await
+            .unwrap();
+        fs::write(format!("{output}.part"), b"01234\0\0\0\0\0")
+            .await
+            .unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        let response = client
+            .get(&url)
+            .header(header::RANGE, "bytes=0-3")
+            .send()
+            .await
+            .unwrap();
+        let requested = vec![
+            Chunk {
+                id: 1,
+                start: 0,
+                end: 3,
+            },
+            Chunk {
+                id: 2,
+                start: 4,
+                end: 9,
+            },
+        ];
+        let retry_config = RetryConfig::default();
+        let ctx = ParallelDownloadCtx {
+            client: &client,
+            url: &url,
+            fetch_url: &url,
+            output_path: output,
+            file_size: 10,
+            chunks: &requested,
+            retry_config: &retry_config,
+            cancel: CancellationToken::new(),
+            identity: None,
+            etag: Some("\"v1\"".to_owned()),
+            last_modified: None,
+        };
+        assert_eq!(
+            download_parallel_with_initial(&ctx, 2, Some(response), None::<fn(u64, u64)>)
+                .await
+                .unwrap(),
+            10
+        );
+        assert_eq!(fs::read(output).await.unwrap(), b"0123456789");
     }
 
     #[tokio::test]
