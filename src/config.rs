@@ -14,6 +14,10 @@ pub struct Config {
     pub max_retries: u32,
     pub queue_parallel: usize,
 
+    /// Use separate DNS sockets for IPv4 and IPv6 lookups on Linux with glibc.
+    #[serde(default)]
+    pub dns_single_request_reopen: bool,
+
     /// Parallel chunk workers for a MEGA download.
     #[serde(default = "default_mega_workers")]
     pub mega_workers: usize,
@@ -122,6 +126,7 @@ impl Default for Config {
             download_dir,
             max_retries: 6,
             queue_parallel: 3,
+            dns_single_request_reopen: false,
             mega_workers: default_mega_workers(),
             mega_verify_mac: true,
             mega_resume_on_ip_change: true,
@@ -272,6 +277,8 @@ impl Config {
         eprintln!("  Connections: {}", self.connections);
         eprintln!("  Max retries: {}", self.max_retries);
         eprintln!("  Queue par. : {}", self.queue_parallel);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        eprintln!("  DNS reopen : {}", self.dns_single_request_reopen);
         eprintln!("  MEGA slots : {}", self.mega_workers);
         eprintln!("  MEGA verify: {}", self.mega_verify_mac);
         eprintln!("  MEGA VPN   : {}", self.mega_resume_on_ip_change);
@@ -321,6 +328,7 @@ queue_parallel = 5
         assert_eq!(cfg.download_dir, "/tmp/dl");
         assert_eq!(cfg.max_retries, 69);
         assert_eq!(cfg.queue_parallel, 5);
+        assert!(!cfg.dns_single_request_reopen);
         assert_eq!(cfg.mega_workers, crate::mega::WORKERS_DEFAULT);
         assert!(cfg.mega_verify_mac);
         assert!(cfg.mega_resume_on_ip_change);
@@ -338,6 +346,17 @@ queue_parallel = 5
         assert!(cfg.gdrive_api_key.is_empty());
         assert_eq!(cfg.gdrive_doc_format, "pdf");
         assert!(cfg.pixeldrain_api_key.is_empty());
+    }
+
+    #[test]
+    fn dns_single_request_reopen_can_be_enabled() {
+        let cfg = Config {
+            dns_single_request_reopen: true,
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert!(back.dns_single_request_reopen);
     }
 
     /// Obsolete fields must not prevent an existing configuration from loading.

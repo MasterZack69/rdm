@@ -18,6 +18,19 @@ use rdm::{config, engine, mega, queue, scrape, secret_url, signal, sync};
 fn main() -> Result<()> {
     let args = Cli::parse();
     let cfg = config::Config::load()?;
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if cfg.dns_single_request_reopen {
+        let mut options = std::env::var_os("RES_OPTIONS").unwrap_or_default();
+        if !options.is_empty() {
+            options.push(" ");
+        }
+        options.push("single-request-reopen");
+        // SAFETY: CLI parsing and config loading above are synchronous and
+        // start no threads. Set the resolver option before dispatch can start
+        // Tokio or perform any lookups. Do not move this into the library or
+        // any command handler that may run with worker threads alive.
+        unsafe { std::env::set_var("RES_OPTIONS", options) };
+    }
     // One load per run: the engine reads retry and SFTP settings from the
     // same values, rather than re-reading (and possibly re-defaulting) them.
     engine::set_shared_config(cfg.clone());

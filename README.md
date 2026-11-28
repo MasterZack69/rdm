@@ -99,6 +99,9 @@ max_retries = 69
 # multi-file download at once
 queue_parallel = 5
 
+# Optional DNS workaround for Linux with glibc.
+dns_single_request_reopen = false
+
 # MEGA: chunk workers per file
 mega_workers = 6
 
@@ -135,6 +138,12 @@ pixeldrain_api_key = ""
 ```
 
 Everything in the config is optional as they have their own defaults.
+
+On Linux with glibc, set `dns_single_request_reopen = true` in `config.toml`
+if your DNS server stalls on paired IPv4 and IPv6 queries. RDM then appends
+`single-request-reopen` to `RES_OPTIONS` for its own process, preserving
+existing options and the usual address safety checks. Sequential queries can
+add a DNS round trip on a healthy resolver, so the setting defaults to `false`.
 
 # Environment
 
