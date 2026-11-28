@@ -139,11 +139,7 @@ pixeldrain_api_key = ""
 
 Everything in the config is optional as they have their own defaults.
 
-On Linux with glibc, set `dns_single_request_reopen = true` in `config.toml`
-if your DNS server stalls on paired IPv4 and IPv6 queries. RDM then appends
-`single-request-reopen` to `RES_OPTIONS` for its own process, preserving
-existing options and the usual address safety checks. Sequential queries can
-add a DNS round trip on a healthy resolver, so the setting defaults to `false`.
+Set `dns_single_request_reopen = true` in `config.toml` if your DNS server stalls on paired IPv4 and IPv6 queries. RDM then appends `single-request-reopen` to `RES_OPTIONS` for its own process, preserving existing options and the usual address safety checks. Sequential queries can add a DNS round trip on a healthy resolver, so the setting defaults to `false`.
 
 # Environment
 
